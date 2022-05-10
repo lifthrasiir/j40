@@ -49,6 +49,7 @@ typedef struct {
 	size_t bufsize;
 	uint32_t bits;
 	int nbits;
+	size_t bits_read;
 
 	int modular_16bit_buffers;
 	int num_extra_channels;
@@ -57,8 +58,11 @@ typedef struct {
 	int want_icc;
 } jxsml__st;
 
+////////////////////////////////////////////////////////////////////////////////
+// error handling macros
+
 #define JXSML__4(s) (int) (((uint32_t) s[0] << 24) | ((uint32_t) s[1] << 16) | ((uint32_t) s[2] << 8) | (uint32_t) s[3])
-#define JXSML__ERR(s) (st->err ? st->err : (st->err = JXSML__4(s)))
+#define JXSML__ERR(s) (st->err ? st->err : (st->err = JXSML__4(s), st->err == JXSML__4("!exp") ? abort() : (void) 0, st->err))
 #define JXSML__SHOULD(cond, s) do { if (st->err) goto error; else if (!(cond)) { st->err = JXSML__4(s); goto error; } } while (0)
 #define JXSML__RAISE(s) do { if (!st->err) st->err = JXSML__4(s); goto error; } while (0)
 #define JXSML__RAISE_DELAYED() do { if (st->err) goto error; } while (0)
@@ -71,25 +75,57 @@ typedef struct {
 #define JXSML__UNREACHABLE() (void) 0
 #endif
 
-int jxsml__always_refill(jxsml__st *st) {
+////////////////////////////////////////////////////////////////////////////////
+// bitstream
+
+int jxsml__always_refill(jxsml__st *st, int32_t n) {
 	size_t consumed = (size_t) ((32 - st->nbits) >> 3);
-	if (st->bufsize < consumed) return JXSML__ERR("shrt");
-	st->bufsize -= consumed;
-	do {
-		st->bits |= (uint32_t) *st->buf++ << st->nbits;
-		st->nbits += 8;
-	} while (st->nbits <= 24);
+	if (st->bufsize < consumed) {
+		while (st->bufsize > 0) {
+			st->bits |= (uint32_t) *st->buf++ << st->nbits;
+			st->nbits += 8;
+			--st->bufsize;
+		}
+		if (st->nbits > n) return JXSML__ERR("shrt");
+	} else {
+		st->bufsize -= consumed;
+		do {
+			st->bits |= (uint32_t) *st->buf++ << st->nbits;
+			st->nbits += 8;
+		} while (st->nbits <= 24);
+	}
 	return st->err;
 }
 
 // ensure st->nbits is at least n; otherwise pull as many bytes as possible into st->bits
-#define jxsml__refill(st, n) (st->nbits < (n) ? jxsml__always_refill(st) : st->err)
+#define jxsml__refill(st, n) (st->nbits < (n) ? jxsml__always_refill(st, n) : st->err)
 
 inline int jxsml__zero_pad_to_byte(jxsml__st *st) {
 	int32_t n = st->nbits & 7;
 	if (st->bits & ((1u << n) - 1)) return JXSML__ERR("pad0");
 	st->bits >>= n;
 	st->nbits -= n;
+	st->bits_read += (size_t) n;
+	return st->err;
+}
+
+int jxsml__skip(jxsml__st *st, uint64_t n) {
+	uint64_t bytes;
+	if ((uint64_t) st->nbits >= n) {
+		st->bits >>= (int32_t) n;
+		st->nbits -= (int32_t) n;
+	} else {
+		n -= (uint64_t) st->nbits;
+		st->bits = st->nbits = 0;
+	}
+	bytes = (uint64_t) (n >> 3);
+	if ((uint64_t) st->bufsize < bytes) return JXSML__ERR("shrt");
+	st->bufsize -= bytes;
+	st->buf += bytes;
+	n &= 7;
+	if (jxsml__always_refill(st, (int32_t) n)) return st->err;
+	st->bits >>= (int32_t) n;
+	st->nbits -= (int32_t) n;
 	return st->err;
 }
 
@@ -102,6 +138,7 @@ inline int32_t jxsml__u(jxsml__st *st, int32_t n) {
 	ret = (int32_t) (st->bits & ((1u << n) - 1));
 	st->bits >>= n;
 	st->nbits -= n;
+	st->bits_read += (size_t) n;
 	return ret;
 }
 
@@ -178,6 +215,9 @@ inline int32_t jxsml__at_most(jxsml__st *st, int32_t max) {
 	return v;
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// prefix code
+
 static const uint8_t JXSML__REV5[32] = {
 	0, 16, 8, 24, 4, 20, 12, 28, 2, 18, 10, 26, 6, 22, 14, 30,
 	1, 17, 9, 25, 5, 21, 13, 29, 3, 19, 11, 27, 7, 23, 15, 31,
@@ -205,6 +245,7 @@ int32_t jxsml__match_overflow(jxsml__st *st, int32_t fast_len, int32_t start, co
 	int32_t entry, code, code_len;
 	st->nbits -= fast_len;
 	st->bits >>= fast_len;
+	st->bits_read += (size_t) fast_len;
 	do {
 		entry = table[start++];
 		code = (entry >> 4) & 0xfff;
@@ -221,6 +262,7 @@ inline int32_t jxsml__prefix_code(jxsml__st *st, int32_t fast_len, int32_t max_l
 	code_len = entry & 15;
 	st->nbits -= code_len;
 	st->bits >>= code_len;
+	st->bits_read += (size_t) code_len;
 	return entry >> 16;
 }
 
@@ -321,7 +363,8 @@ int jxsml__init_prefix_code(jxsml__st *st, int32_t l2size, int32_t *out_fast_len
 				l2counts[prev] += rep - prev_rep;
 				for (; prev_rep < rep; ++prev_rep) l2lengths[i++] = prev;
 			} else { // code == 17: repeat zero 3+u(3) times
-				rep = (prev_rep < 0 ? 8 * prev_rep + 15 : -3) - jxsml__u(st, 3);
+				if (prev_rep > 0) prev_rep = 0;
+				rep = (prev_rep < 0 ? 8 * prev_rep + 13 : -3) - jxsml__u(st, 3);
 				for (; prev_rep > rep; --prev_rep) l2lengths[i++] = 0;
 			}
 			JXSML__RAISE_DELAYED();
@@ -397,10 +440,12 @@ error:
 	return st->err;
 }
 
-// hybrid integer encoding:
-// - token < 2^split_exp is interpreted as is.
-// - otherwise (token - 2^split_exp) is split into NNNHHHLLL where config determines H/L lengths.
-//   then MMM = u(NNN + split_exp) is read; the decoded value is 1HHHMMMLLL.
+////////////////////////////////////////////////////////////////////////////////
+// hybrid integer encoding
+
+// token < 2^split_exp is interpreted as is.
+// otherwise (token - 2^split_exp) is split into NNNHHHLLL where config determines H/L lengths.
+// then MMM = u(NNN + split_exp) is read; the decoded value is 1HHHMMMLLL.
 typedef struct { int8_t split_exp, msb_in_token, lsb_in_token; } jxsml__hybrid_int_config_t;
 
 int jxsml__hybrid_int_config(jxsml__st *st, int32_t log_alphabet_size, jxsml__hybrid_int_config_t *out) {
@@ -419,12 +464,15 @@ inline int32_t jxsml__hybrid_int(jxsml__st *st, int32_t token, const jxsml__hybr
 	if (token < split) return token;
 	midbits = config->split_exp + ((token - split) >> (config->msb_in_token + config->lsb_in_token));
 	// TODO midbits can overflow!
+	mid = jxsml__u(st, midbits);
 	top = (int32_t) 1 << config->msb_in_token;
 	lo = token & (((int32_t) 1 << config->lsb_in_token) - 1);
-	mid = jxsml__u(st, midbits);
 	hi = (token >> config->lsb_in_token) & (top - 1);
 	return ((top | hi) << (midbits + config->lsb_in_token)) | ((mid << config->lsb_in_token) | lo);
 }
+
+////////////////////////////////////////////////////////////////////////////////
+// rANS alias table
 
 enum { JXSML__MAX_DIST = 41 + 1 }; // includes a synthetic LZ77 length distribution
 enum { JXSML__DIST_BITS = 12 };
@@ -445,12 +493,12 @@ typedef struct { int16_t cutoff, offset, symbol; } jxsml__alias_bucket;
 jxsml__alias_bucket *jxsml__init_alias_map(jxsml__st *st, const int16_t *D, int32_t log_alphabet_size) {
 	int16_t log_bucket_size = (int16_t) (JXSML__DIST_BITS - log_alphabet_size);
 	int16_t bucket_size = (int16_t) 1 << log_bucket_size;
+	jxsml__alias_bucket *buckets;
 	// the underfull and overfull stacks are implicit linked lists; u/o resp. is the top index,
 	// buckets[u/o].next is the second-to-top index and so on. an index -1 indicates the bottom.
 	int16_t u = -1, o = -1, i, j;
 
-	jxsml__alias_bucket *buckets = malloc(sizeof(jxsml__alias_bucket) << log_alphabet_size);
-	if (!buckets) return NULL;
+	JXSML__SHOULD(buckets = malloc(sizeof(jxsml__alias_bucket) << log_alphabet_size), "!mem");
 
 	for (i = j = 0; i < (1 << log_alphabet_size); ++i) {
 		if (D[i] && ++j == 2) break;
@@ -488,12 +536,7 @@ jxsml__alias_bucket *jxsml__init_alias_map(jxsml__st *st, const int16_t *D, int3
 
 	while (o >= 0) {
 		int16_t by, tmp;
-#ifdef JXSML__DEBUG
-		if (u < 0) {
-			free(buckets);
-			return JXSML__ERR("!exp"), NULL;
-		}
-#endif
+		JXSML__ASSERT(u >= 0);
 		by = bucket_size - buckets[u].cutoff;
 		// move the input range [cutoff[o] - by, cutoff[o]] of the bucket o into
 		// the input range [cutoff[u], bucket_size] of the bucket u (which is settled after this)
@@ -516,9 +559,13 @@ jxsml__alias_bucket *jxsml__init_alias_map(jxsml__st *st, const int16_t *D, int3
 
 	(void) st;
 	return buckets;
+
+error:
+	free(buckets);
+	return NULL;
 }
 
-enum { JXSML__ANS_FINAL_STATE = 0x130000 };
+enum { JXSML__ANS_FINAL_STATE = 0x130000 }; // TODO check this at the end
 
 int32_t jxsml__ans_code(jxsml__st *st, uint32_t *state, int32_t log_bucket_size, const int16_t *D, const jxsml__alias_bucket *aliases) {
 	int32_t index = (int32_t) (*state & 0xfff);
@@ -531,9 +578,12 @@ int32_t jxsml__ans_code(jxsml__st *st, uint32_t *state, int32_t log_bucket_size,
 	return symbol;
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// clustered entropy code
+
 typedef union {
 	struct {
-		uint32_t state;
+		uint32_t state; // TODO initialize state
 		int32_t log_bucket_size;
 		int16_t *D;
 		jxsml__alias_bucket *aliases;
@@ -550,6 +600,9 @@ int jxsml__entropy_code_cluster(jxsml__st *st, int use_prefix_code, jxsml__entro
 		return jxsml__ans_code(st, &cluster->ans.state, cluster->ans.log_bucket_size, cluster->ans.D, cluster->ans.aliases);
 	}
 }
+
+////////////////////////////////////////////////////////////////////////////////
+// top-level entropy code
 
 typedef struct {
 	int32_t num_dist;
@@ -620,7 +673,7 @@ continue_lz77:
 
 int jxsml__init_entropy_code(jxsml__st *st, int32_t num_dist, jxsml__entropy_code_t *out) {
 	jxsml__hybrid_int_config_t configs[JXSML__MAX_DIST];
-	jxsml__entropy_code_cluster_t clusters[JXSML__MAX_DIST] = {0};
+	jxsml__entropy_code_cluster_t clusters[JXSML__MAX_DIST] = {{{0}}};
 	int32_t i, j;
 
 	JXSML__ASSERT(num_dist <= JXSML__MAX_DIST);
@@ -636,6 +689,8 @@ int jxsml__init_entropy_code(jxsml__st *st, int32_t num_dist, jxsml__entropy_cod
 		JXSML__TRY(jxsml__hybrid_int_config(st, 8, &out->lz_len_config));
 		++num_dist; // num_dist - 1 is a synthesized LZ77 length distribution
 		JXSML__SHOULD(out->window = malloc(sizeof(int32_t) << 20), "!mem");
+	} else {
+		out->min_symbol = out->min_length = 0x7fffffff;
 	}
 
 	// cluster_map: a mapping from non-clustered dist. to clustered dist.
@@ -791,6 +846,7 @@ int jxsml__init_entropy_code(jxsml__st *st, int32_t num_dist, jxsml__entropy_cod
 		out->configs[i] = configs[out->cluster_map[i]];
 		out->clusters[i] = clusters[out->cluster_map[i]];
 	}
+	out->num_dist = num_dist;
 	return 0;
 
 error:
@@ -810,6 +866,9 @@ error:
 
 void jxsml__free_entropy_code(jxsml__entropy_code_t *code) {
 }
+
+////////////////////////////////////////////////////////////////////////////////
+// image header
 
 int jxsml__size_header(jxsml__st *st, int32_t *outw, int32_t *outh) {
 	int32_t div8 = jxsml__u(st, 1);
@@ -859,19 +918,23 @@ int jxsml__customxy(jxsml__st *st, float xy[2]) {
 
 int jxsml__extensions(jxsml__st *st) {
 	uint64_t extensions = jxsml__u64(st);
-	//int32_t i;
-	JXSML__SHOULD(extensions == 0, "TODO: arbitrary skip required");
-	/*
+	uint64_t nbits = 0;
+	int32_t i;
 	for (i = 0; i < 64; ++i) {
-		if (extensions >> i & 1) nbits = jxsml__u64(st);
+		if (extensions >> i & 1) {
+			uint64_t n = jxsml__u64(st);
+			JXSML__RAISE_DELAYED();
+			if (nbits > UINT64_MAX - n) JXSML__RAISE("over");
+			nbits += n;
+		}
 	}
-	for (i = 0; i < 64; ++i) {
-	// read nbits
-	}
-	*/
+	return jxsml__skip(st, nbits);
 error:
 	return st->err;
 }
+
+////////////////////////////////////////////////////////////////////////////////
+// ICC
 
 int jxsml__icc(jxsml__st *st) {
 	size_t enc_size, index;
@@ -899,8 +962,9 @@ int jxsml__icc(jxsml__st *st) {
 		pprev = prev;
 		prev = byte;
 		byte = jxsml__entropy_code(st, ctx, 0, &entropy);
-		fprintf(stderr, "ctx=%d byte=%#x %c\n", ctx, (int)byte, 0x20 <= byte && byte < 0x7f ? byte : ' ');
+		//fprintf(stderr, "%zd/%zd ctx=%d byte=%#x %c\n", index, enc_size, ctx, (int)byte, 0x20 <= byte && byte < 0x7f ? byte : ' ');
 		JXSML__RAISE_DELAYED();
+		// TODO actually interpret them
 	}
 
 	//size_t output_size = jxsml__varint(st);
@@ -940,6 +1004,261 @@ error:
 	jxsml__free_entropy_code(&entropy);
 	return st->err;
 }
+
+////////////////////////////////////////////////////////////////////////////////
+// frame header
+
+enum { JXSML__MAX_PASSES = 11 };
+
+enum {
+	JXSML__BLEND_REPLACE = 0, // new
+	JXSML__BLEND_ADD = 1,     // old + new
+	JXSML__BLEND_BLEND = 2,   // new + old * (1 - new alpha) or equivalent, optionally clamped
+	JXSML__BLEND_MUL_ADD = 3, // old + new * alpha or equivalent, optionally clamped
+	JXSML__BLEND_MUL = 4,     // old * new, optionally clamped
+};
+typedef struct { int8_t mode, alpha_chan, clamp, src_ref_frame; } jxsml__blend_info;
+
+typedef struct {
+	int is_last;
+	enum { JXSML__FRAME_REGULAR = 0, JXSML__FRAME_LF = 1, JXSML__FRAME_REFONLY = 2, JXSML__FRAME_REGULAR_SKIPPROG = 3 } type;
+	int is_modular; // VarDCT if false
+	int has_noise, has_patches, has_splines, use_lf_frame, skip_adapt_lf_smooth;
+	int do_ycbcr;
+	int32_t jpeg_upsampling; // [0] | [1] << 2 | [2] << 4
+	int32_t upsampling, *ec_upsampling;
+	int32_t group_size_shift;
+	int32_t x_qm_scale, b_qm_scale;
+	int32_t num_passes;
+	int8_t shift[JXSML__MAX_PASSES];
+	int8_t log_ds[JXSML__MAX_PASSES + 1]; // pass i shift range is [log_ds[i+1], log_ds[i])
+	int32_t lf_level;
+	int32_t x0, y0, width, height;
+	int32_t duration, timecode;
+	jxsml__blend_info blend_info, *ec_blend_info;
+	int32_t save_as_ref;
+	int save_before_ct;
+	int32_t name_len;
+	char *name;
+	struct {
+		int enabled;
+		float weights[3 /*0=x, 1=y, 2=b*/][2 /*0=weight1, 1=weight2*/];
+	} gab;
+	struct {
+		int32_t iters;
+		float sharp_lut[8], channel_scale[3];
+		float quant_mul, pass0_sigma_circle, pass2_sigma_circle, border_sad_mul, sigma_for_modular;
+	} epf;
+} jxsml__frame_t;
+
+int jxsml__frame(jxsml__st *st, jxsml__frame_t *f) {
+	int full_frame, restoration_all_default;
+	int32_t num_groups, num_lf_groups;
+	int32_t i, j;
+
+	f->is_last = 1;
+	f->type = JXSML__FRAME_REGULAR;
+	f->is_modular = 0;
+	f->has_noise = f->has_patches = f->has_splines = f->use_lf_frame = f->skip_adapt_lf_smooth = 0;
+	f->do_ycbcr = 0;
+	f->jpeg_upsampling = 0;
+	f->upsampling = 1;
+	f->ec_upsampling = NULL;
+	f->group_size_shift = 8;
+	f->x_qm_scale = 3;
+	f->b_qm_scale = 2;
+	f->num_passes = 1;
+	f->shift[0] = 0; // last pass if default
+	f->log_ds[0] = 3; f->log_ds[1] = 0; // last pass if default
+	f->lf_level = 0;
+	f->x0 = f->y0 = 0;
+	f->width = st->out->width;
+	f->height = st->out->height;
+	f->duration = f->timecode = 0;
+	f->blend_info.mode = JXSML__BLEND_REPLACE;
+	f->blend_info.alpha_chan = 0; // XXX set to the actual alpha channel
+	f->blend_info.clamp = 0;
+	f->blend_info.src_ref_frame = 0;
+	f->ec_blend_info = NULL;
+	f->save_as_ref = 0;
+	f->save_before_ct = 1;
+	f->name_len = 0;
+	f->name = NULL;
+	f->gab.enabled = 1;
+	f->gab.weights[0][0] = f->gab.weights[1][0] = f->gab.weights[2][0] = 0.115169525f;
+	f->gab.weights[0][1] = f->gab.weights[1][1] = f->gab.weights[2][1] = 0.061248592f;
+	f->epf.iters = 2;
+	for (i = 0; i < 8; ++i) f->epf.sharp_lut[i] = (float) i / 7.0f;
+	f->epf.channel_scale[0] = 40.0f;
+	f->epf.channel_scale[1] = 5.0f;
+	f->epf.channel_scale[2] = 3.5f;
+	f->epf.quant_mul = 0.46f;
+	f->epf.pass0_sigma_circle = 0.9f;
+	f->epf.pass2_sigma_circle = 6.5f;
+	f->epf.border_sad_mul = 2.0f / 3.0f;
+	f->epf.sigma_for_modular = 1.0f;
+	full_frame = 1;
+
+	JXSML__TRY(jxsml__zero_pad_to_byte(st));
+
+	// FrameHeader
+	if (!jxsml__u(st, 1)) { // !all_default
+		uint64_t flags;
+		f->type = jxsml__u(st, 2);
+		f->is_modular = jxsml__u(st, 1);
+		flags = jxsml__u64(st);
+		f->has_noise = (int) (flags & 1);
+		f->has_patches = (int) (flags >> 1 & 1);
+		f->has_splines = (int) (flags >> 4 & 1);
+		f->use_lf_frame = (int) (flags >> 5 & 1);
+		f->skip_adapt_lf_smooth = (int) (flags >> 7 & 1);
+		if (!st->xyb_encoded) f->do_ycbcr = jxsml__u(st, 1);
+		if (!f->use_lf_frame) {
+			if (f->do_ycbcr) f->jpeg_upsampling = jxsml__u(st, 6); // yes, we are lazy
+			f->upsampling = 1 << jxsml__u(st, 2);
+			for (i = 0; i < st->num_extra_channels; ++i) {
+				(void) (1 << (int) jxsml__u(st, 2));
+				JXSML__RAISE("TODO: ec_upsampling");
+			}
+		}
+		if (f->is_modular) {
+			f->group_size_shift = 7 + jxsml__u(st, 2);
+		} else if (st->xyb_encoded) {
+			f->x_qm_scale = jxsml__u(st, 3);
+			f->b_qm_scale = jxsml__u(st, 3);
+		}
+		if (f->type != JXSML__FRAME_REFONLY) {
+			f->num_passes = jxsml__u32(st, 1, 0, 2, 0, 3, 0, 4, 3);
+			if (f->num_passes > 1) {
+				// this part is especially flaky and the spec and libjxl don't agree to each other;
+				// we do the most sensible thing that is still compatible to libjxl:
+				// - downsample should be decreasing (or stay same)
+				// - last_pass should be strictly increasing and last_pass[0] (if any) should be 0
+				int8_t log_ds[4];
+				int32_t ppass = 0, num_ds = jxsml__u32(st, 0, 0, 1, 0, 2, 0, 3, 1);
+				JXSML__SHOULD(num_ds < f->num_passes, "pass");
+				for (i = 0; i < f->num_passes - 1; ++i) f->shift[i] = (int8_t) jxsml__u(st, 2);
+				f->shift[f->num_passes - 1] = 0;
+				for (i = 0; i < num_ds; ++i) {
+					log_ds[i] = (int8_t) jxsml__u(st, 2);
+					JXSML__SHOULD(log_ds[i - 1] >= log_ds[i], "pass");
+				}
+				for (i = 0; i < num_ds; ++i) {
+					int32_t pass = jxsml__u32(st, 0, 0, 1, 0, 2, 0, 0, 3);
+					JXSML__SHOULD(i > 0 ? ppass < pass && pass < f->num_passes : pass == 0, "pass");
+					while (ppass < pass) f->log_ds[++ppass] = i > 0 ? log_ds[i - 1] : 3;
+				}
+				while (ppass < f->num_passes) f->log_ds[++ppass] = i > 0 ? log_ds[num_ds - 1] : 3;
+			}
+		}
+		if (f->type == JXSML__FRAME_LF) {
+			f->lf_level = jxsml__u(st, 2) + 1;
+		} else if (jxsml__u(st, 1)) { // have_crop
+			if (f->type != JXSML__FRAME_REFONLY) {
+				f->x0 = jxsml__u32(st, 0, 8, 256, 11, 2304, 14, 18688, 30);
+				f->y0 = jxsml__u32(st, 0, 8, 256, 11, 2304, 14, 18688, 30);
+			}
+			f->width = jxsml__u32(st, 0, 8, 256, 11, 2304, 14, 18688, 30);
+			f->height = jxsml__u32(st, 0, 8, 256, 11, 2304, 14, 18688, 30);
+			full_frame = f->x0 <= 0 && f->y0 <= 0 &&
+				f->width + f->x0 >= st->out->width && f->height + f->y0 >= st->out->height;
+		}
+		if (f->type == JXSML__FRAME_REGULAR || f->type == JXSML__FRAME_REGULAR_SKIPPROG) {
+			f->blend_info.mode = (int8_t) jxsml__u32(st, 0, 0, 1, 0, 2, 0, 3, 2);
+			if (!full_frame || f->blend_info.mode != JXSML__BLEND_REPLACE) {
+				f->blend_info.src_ref_frame = (int8_t) jxsml__u(st, 2);
+			}
+			for (i = 0; i < st->num_extra_channels; ++i) {
+				JXSML__RAISE("TODO: ec_blending_info");
+			}
+			if (st->out->anim_tps_denom) { // have_animation stored implicitly
+				f->duration = jxsml__u32(st, 0, 0, 1, 0, 0, 8, 0, 32); // TODO uh, u32?
+				if (st->out->anim_have_timecodes) {
+					f->timecode = jxsml__u(st, 32); // TODO uh, u32??
+				}
+			}
+			f->is_last = jxsml__u(st, 1);
+		} else {
+			f->is_last = 0;
+		}
+		if (f->type != JXSML__FRAME_LF) {
+			if (!f->is_last) f->save_as_ref = jxsml__u(st, 2);
+			f->save_before_ct = !(full_frame &&
+				(f->type == JXSML__FRAME_REGULAR || f->type == JXSML__FRAME_REGULAR_SKIPPROG) &&
+				f->blend_info.mode == JXSML__BLEND_REPLACE &&
+				(f->duration == 0 || f->save_as_ref != 0) &&
+				!f->is_last);
+		}
+		f->name_len = jxsml__u32(st, 0, 0, 0, 4, 16, 5, 48, 10);
+		if (f->name_len > 0) {
+			JXSML__SHOULD(f->name = malloc((size_t) f->name_len + 1), "!mem");
+			for (i = 0; i < f->name_len; ++i) {
+				f->name[i] = (char) jxsml__u(st, 8);
+				JXSML__RAISE_DELAYED();
+			}
+			f->name[f->name_len] = 0;
+			// TODO verify that f->name is UTF-8
+		}
+		restoration_all_default = jxsml__u(st, 1);
+		f->gab.enabled = restoration_all_default ? 1 : jxsml__u(st, 1);
+		if (f->gab.enabled) {
+			if (jxsml__u(st, 1)) { // gab_custom
+				for (i = 0; i < 3; ++i) for (j = 0; j < 2; ++j) f->gab.weights[i][j] = jxsml__f16(st);
+			}
+		}
+		f->epf.iters = restoration_all_default ? 2 : jxsml__u(st, 2);
+		if (f->epf.iters) {
+			if (!f->is_modular && jxsml__u(st, 1)) { // epf_sharp_custom
+				for (i = 0; i < 8; ++i) f->epf.sharp_lut[i] = jxsml__f16(st);
+			}
+			if (jxsml__u(st, 1)) { // epf_weight_custom
+				for (i = 0; i < 3; ++i) f->epf.channel_scale[i] = jxsml__f16(st);
+				JXSML__TRY(jxsml__skip(st, 32)); // ignored
+			}
+		}
+		JXSML__TRY(jxsml__extensions(st));
+	}
+	JXSML__RAISE_DELAYED();
+	if (st->xyb_encoded && st->want_icc) f->save_before_ct = 1; // ignores the decoded bit
+	num_groups = ((f->width + (1 << f->group_size_shift) - 1) >> f->group_size_shift) *
+		((f->height + (1 << f->group_size_shift) - 1) >> f->group_size_shift);
+	num_lf_groups = ((f->width + (8 << f->group_size_shift) - 1) >> (3 + f->group_size_shift)) *
+		((f->height + (8 << f->group_size_shift) - 1) >> (3 + f->group_size_shift));
+
+	// TOC
+	{
+		int32_t size = f->num_passes == 1 && f->num_groups == 1 ? 1 :
+			1 /*lf_global*/ + num_lf_groups /*lf_group*/ +
+			1 /*hf_global*/ + f->num_passes /*hf_pass*/ +
+			f->num_passes * num_groups /*group_pass*/;
+		int permuted = jxsml__u(st, 1);
+		if (permuted) {
+			int32_t end, lehmer[/*????*/1000];
+			jxsml__entropy_code entropy;
+			JXSML__TRY(jxsml__init_entropy_code(st, 8, &entropy));
+#define jxsml__toc_context(s) ((s) < 64 ? 32 - __builtin_clz((s) + 1) : 7)
+			end = jxsml__entropy_code(st, jxsml__toc_context(size), 0, &entropy);
+			for (i = 0; i < end; ++i) {
+				lehmer[i] = jxsml__entropy_code(st, i > 0 ? jxsml__toc_context(lehmer[i - 1]) : 0, 0, &entropy);
+			}
+		}
+		JXSML__TRY(jxsml__zero_pad_to_byte(st));
+		for (i = 0; i < size; ++i) {
+			toc[i] = jxsml__u32(0, 10, 1024, 14, 17408, 22, 4211712, 30);
+		}
+		// TODO permute
+		JXSML__TRY(jxsml__zero_pad_to_byte(st));
+	}
+
+	JXSML__RAISE("TODO: frame");
+	return 0;
+
+error:
+	free(f->name);
+	return st->err;
+}
+
+////////////////////////////////////////////////////////////////////////////////
 
 void end(const jxsml img, const jxsml__st st) {}
 
@@ -1104,12 +1423,19 @@ int jxsml_load_from_memory(jxsml *out, const void *buf, size_t bufsize) {
 		JXSML__TRY(jxsml__icc(st));
 	}
 
+	jxsml__frame_t frame;
+	do {
+		JXSML__TRY(jxsml__frame(st, &frame));
+	} while (!frame.is_last);
+
 	end(*st->out, st_);
 	return 0;
 
 error:
 	return st->err;
 }
+
+////////////////////////////////////////////////////////////////////////////////
 
 int main(int argc, char **argv) {
 	if (argc < 2) return 1;
