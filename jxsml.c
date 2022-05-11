@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <limits.h>
 
 #include <stdio.h>
 
@@ -45,8 +46,9 @@ typedef struct {
 	jxsml *out;
 	int err;
 
-	const uint8_t *buf;
-	size_t bufsize;
+	const uint8_t *buf, *container_buf;
+	size_t bufsize, container_bufsize;
+	int container_continued;
 	uint32_t bits;
 	int nbits;
 	size_t bits_read;
@@ -62,9 +64,9 @@ typedef struct {
 // error handling macros
 
 #define JXSML__4(s) (int) (((uint32_t) s[0] << 24) | ((uint32_t) s[1] << 16) | ((uint32_t) s[2] << 8) | (uint32_t) s[3])
-#define JXSML__ERR(s) (st->err ? st->err : (st->err = JXSML__4(s), st->err == JXSML__4("!exp") ? abort() : (void) 0, st->err))
-#define JXSML__SHOULD(cond, s) do { if (st->err) goto error; else if (!(cond)) { st->err = JXSML__4(s); goto error; } } while (0)
-#define JXSML__RAISE(s) do { if (!st->err) st->err = JXSML__4(s); goto error; } while (0)
+#define JXSML__ERR(s) jxsml__set_error(st, JXSML__4(s))
+#define JXSML__SHOULD(cond, s) do { if (st->err) goto error; else if (!(cond)) { jxsml__set_error(st, JXSML__4(s)); goto error; } } while (0)
+#define JXSML__RAISE(s) do { jxsml__set_error(st, JXSML__4(s)); goto error; } while (0)
 #define JXSML__RAISE_DELAYED() do { if (st->err) goto error; } while (0)
 #define JXSML__TRY(expr) do { if (expr) goto error; } while (0)
 #ifdef JXSML_DEBUG
@@ -75,25 +77,174 @@ typedef struct {
 #define JXSML__UNREACHABLE() (void) 0
 #endif
 
+int jxsml__set_error(jxsml__st *st, int err) {
+	if (!st->err) {
+		st->err = err;
+#ifdef JXSML__DEBUG
+		if (err == JXSML__4("!exp")) abort();
+#endif
+	}
+	return err;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// container
+
+int jxsml__container_u32(jxsml__st *st, uint32_t *v) {
+	JXSML__SHOULD(st->container_bufsize >= 4, "shrt");
+	*v = ((uint32_t) st->container_buf[0] << 24) | ((uint32_t) st->container_buf[1] << 16) |
+		((uint32_t) st->container_buf[2] << 8) | (uint32_t) st->container_buf[3];
+	st->container_buf += 4;
+	st->container_bufsize -= 4;
+error:
+	return st->err;
+}
+
+typedef struct { uint32_t type; const uint8_t *start; size_t size; int brotli; } jxsml__box_t;
+int jxsml__box(jxsml__st *st, jxsml__box_t *out) {
+	uint32_t size32;
+	JXSML__TRY(jxsml__container_u32(st, &size32));
+	JXSML__TRY(jxsml__container_u32(st, &out->type));
+	if (size32 == 0) {
+		out->size = st->container_bufsize;
+	} else if (size32 == 1) {
+		uint32_t sizehi, sizelo;
+		uint64_t size64;
+		JXSML__TRY(jxsml__container_u32(st, &sizehi));
+		JXSML__TRY(jxsml__container_u32(st, &sizelo));
+		size64 = ((uint64_t) sizehi << 32) | (uint64_t) sizelo;
+		JXSML__SHOULD(size64 >= 16, "boxx");
+		size64 -= 16;
+		JXSML__SHOULD(st->container_bufsize >= size64, "shrt");
+		out->size = (size_t) size64;
+	} else {
+		JXSML__SHOULD(size32 >= 8, "boxx");
+		size32 -= 8;
+		JXSML__SHOULD(st->container_bufsize >= size32, "shrt");
+		out->size = (size_t) size32;
+	}
+	out->brotli = (out->type == 0x62726f62 /*brob*/);
+	if (out->brotli) {
+		JXSML__SHOULD(out->size > (size_t) 4, "brot"); // Brotli stream is never empty so 4 is also out
+		JXSML__TRY(jxsml__container_u32(st, &out->type));
+		JXSML__SHOULD(out->type != 0x62726f62 /*brob*/ && (out->type >> 8) != 0x6a786c /*jxl*/, "brot");
+		out->size -= 4;
+	}
+	out->start = st->container_buf;
+	st->container_buf += out->size;
+	st->container_bufsize -= out->size;
+error:
+	return st->err;
+}
+
+int jxsml__init_container(jxsml__st *st, const void *buf, size_t bufsize) {
+	static const uint8_t JXL_BOX[12] = { // type `JXL `, value 0D 0A 87 0A
+		0x00, 0x00, 0x00, 0x0c, 0x4a, 0x58, 0x4c, 0x20, 0x0d, 0x0a, 0x87, 0x0a,
+	}, FTYP_BOX[20] = { // type `ftyp`, brand `jxl `, version 0, only compatible w/ brand `jxl `
+		0x00, 0x00, 0x00, 0x14, 0x66, 0x74, 0x79, 0x70, 0x6a, 0x78, 0x6c, 0x20,
+		0x00, 0x00, 0x00, 0x00, 0x6a, 0x78, 0x6c, 0x20,
+	};
+
+	st->buf = NULL;
+	st->bufsize = 0;
+	if (bufsize >= sizeof(JXL_BOX) && memcmp(buf, JXL_BOX, sizeof(JXL_BOX)) == 0) {
+		st->container_buf = (const uint8_t *) buf + sizeof(JXL_BOX);
+		st->container_bufsize = bufsize - sizeof(JXL_BOX);
+		JXSML__SHOULD(st->container_bufsize >= sizeof(FTYP_BOX), "shrt");
+		JXSML__SHOULD(memcmp(st->container_buf, FTYP_BOX, sizeof(FTYP_BOX)) == 0, "ftyp");
+		st->container_buf += sizeof(FTYP_BOX);
+		st->container_bufsize -= sizeof(FTYP_BOX);
+		while (st->container_bufsize > 0) {
+			jxsml__box_t box;
+			JXSML__TRY(jxsml__box(st, &box));
+			if (box.type == 0x6a786c6c /*jxll*/) {
+				// TODO do something with this
+			} else if (box.type == 0x6a786c63 /*jxlc*/) {
+				JXSML__ASSERT(!box.brotli);
+				st->container_continued = 0;
+				st->buf = box.start;
+				st->bufsize = box.size;
+				break;
+			} else if (box.type == 0x6a786c70 /*jxlp*/) {
+				JXSML__ASSERT(!box.brotli);
+				JXSML__SHOULD(box.size >= 4, "shrt");
+				// TODO the partial codestream index is ignored right now
+				st->container_continued = !(box.start[0] >> 7);
+				st->buf = box.start + 4;
+				st->bufsize = box.size - 4;
+				break;
+			}
+		}
+		JXSML__SHOULD(st->buf, "!box");
+	} else {
+		st->buf = (const uint8_t *) buf;
+		st->bufsize = bufsize;
+	}
+error:
+	return st->err;
+}
+
+int jxsml__refill_container(jxsml__st *st) {
+	jxsml__box_t box;
+	JXSML__ASSERT(st->container_continued);
+	do {
+		JXSML__TRY(jxsml__box(st, &box));
+		JXSML__SHOULD(
+			box.type != 0x6a786c63 /*jxlc*/ &&
+			box.type != 0x6a786c69 /*jxli*/,
+			"?box"); // some box is disallowed after jxlp
+	} while (box.type != 0x6a786c70 /*jxlp*/);
+	JXSML__ASSERT(!box.brotli);
+	JXSML__SHOULD(box.size >= 4, "shrt");
+	// TODO the partial codestream index is ignored right now
+	st->container_continued = !(box.start[0] >> 7);
+	st->buf = box.start + 4;
+	st->bufsize = box.size - 4;
+error:
+	return st->err;
+}
+
+int jxsml__finish_container(jxsml__st *st) {
+	JXSML__ASSERT(!st->container_continued);
+	while (st->container_bufsize > 0) {
+		jxsml__box_t box;
+		JXSML__TRY(jxsml__box(st, &box));
+		JXSML__SHOULD(
+			box.type != 0x6a786c63 /*jxlc*/ &&
+			box.type != 0x6a786c70 /*jxlp*/ &&
+			box.type != 0x6a786c69 /*jxli*/,
+			"?box"); // some box is disallowed after the last jxlp/jxlc
+	}
+error:
+	return st->err;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // bitstream
 
 int jxsml__always_refill(jxsml__st *st, int32_t n) {
-	size_t consumed = (size_t) ((32 - st->nbits) >> 3);
-	if (st->bufsize < consumed) {
-		while (st->bufsize > 0) {
-			st->bits |= (uint32_t) *st->buf++ << st->nbits;
-			st->nbits += 8;
-			--st->bufsize;
+	do {
+		size_t consumed = (size_t) ((32 - st->nbits) >> 3);
+		if (st->bufsize < consumed) {
+			while (st->bufsize > 0) {
+				st->bits |= (uint32_t) *st->buf++ << st->nbits;
+				st->nbits += 8;
+				--st->bufsize;
+			}
+			if (st->nbits > n) {
+				JXSML__SHOULD(st->container_continued, "shrt");
+				JXSML__TRY(jxsml__refill_container(st));
+				continue; // now we have possibly more bits to refill, try again
+			}
+		} else {
+			st->bufsize -= consumed;
+			do {
+				st->bits |= (uint32_t) *st->buf++ << st->nbits;
+				st->nbits += 8;
+			} while (st->nbits <= 24);
 		}
-		if (st->nbits > n) return JXSML__ERR("shrt");
-	} else {
-		st->bufsize -= consumed;
-		do {
-			st->bits |= (uint32_t) *st->buf++ << st->nbits;
-			st->nbits += 8;
-		} while (st->nbits <= 24);
-	}
+	} while (0);
+error:
 	return st->err;
 }
 
@@ -116,10 +267,11 @@ int jxsml__skip(jxsml__st *st, uint64_t n) {
 		st->nbits -= (int32_t) n;
 	} else {
 		n -= (uint64_t) st->nbits;
-		st->bits = st->nbits = 0;
+		st->bits = 0;
+		st->nbits = 0;
 	}
 	bytes = (uint64_t) (n >> 3);
-	if ((uint64_t) st->bufsize < bytes) return JXSML__ERR("shrt");
+	if (st->bufsize < bytes) return JXSML__ERR("shrt");
 	st->bufsize -= bytes;
 	st->buf += bytes;
 	n &= 7;
@@ -492,7 +644,7 @@ typedef struct { int16_t cutoff, offset, symbol; } jxsml__alias_bucket;
 
 jxsml__alias_bucket *jxsml__init_alias_map(jxsml__st *st, const int16_t *D, int32_t log_alphabet_size) {
 	int16_t log_bucket_size = (int16_t) (JXSML__DIST_BITS - log_alphabet_size);
-	int16_t bucket_size = (int16_t) 1 << log_bucket_size;
+	int16_t bucket_size = (int16_t) (1 << log_bucket_size);
 	jxsml__alias_bucket *buckets;
 	// the underfull and overfull stacks are implicit linked lists; u/o resp. is the top index,
 	// buckets[u/o].next is the second-to-top index and so on. an index -1 indicates the bottom.
@@ -506,7 +658,7 @@ jxsml__alias_bucket *jxsml__init_alias_map(jxsml__st *st, const int16_t *D, int3
 	if (j == 1) { // D[i] is the only non-zero probability
 		for (j = 0; j < (1 << log_alphabet_size); ++j) {
 			buckets[j].symbol = i;
-			buckets[j].offset = j << log_bucket_size;
+			buckets[j].offset = (int16_t) (j << log_bucket_size);
 			buckets[j].cutoff = 0;
 		}
 		return buckets;
@@ -1141,7 +1293,7 @@ int jxsml__frame(jxsml__st *st, jxsml__frame_t *f) {
 				f->shift[f->num_passes - 1] = 0;
 				for (i = 0; i < num_ds; ++i) {
 					log_ds[i] = (int8_t) jxsml__u(st, 2);
-					JXSML__SHOULD(log_ds[i - 1] >= log_ds[i], "pass");
+					if (i > 0) JXSML__SHOULD(log_ds[i - 1] >= log_ds[i], "pass");
 				}
 				for (i = 0; i < num_ds; ++i) {
 					int32_t pass = jxsml__u32(st, 0, 0, 1, 0, 2, 0, 0, 3);
@@ -1227,26 +1379,45 @@ int jxsml__frame(jxsml__st *st, jxsml__frame_t *f) {
 
 	// TOC
 	{
-		int32_t size = f->num_passes == 1 && f->num_groups == 1 ? 1 :
+		int32_t toc[/*???*/1000];
+		int32_t size = f->num_passes == 1 && num_groups == 1 ? 1 :
 			1 /*lf_global*/ + num_lf_groups /*lf_group*/ +
 			1 /*hf_global*/ + f->num_passes /*hf_pass*/ +
 			f->num_passes * num_groups /*group_pass*/;
 		int permuted = jxsml__u(st, 1);
+		fprintf(stderr, "toc size = %d\n", size);
 		if (permuted) {
 			int32_t end, lehmer[/*????*/1000];
-			jxsml__entropy_code entropy;
+			jxsml__entropy_code_t entropy;
 			JXSML__TRY(jxsml__init_entropy_code(st, 8, &entropy));
-#define jxsml__toc_context(s) ((s) < 64 ? 32 - __builtin_clz((s) + 1) : 7)
+#define jxsml__toc_context(s) ((s) < 64 ? 32 - __builtin_clz((unsigned) (s) + 1) : 7)
 			end = jxsml__entropy_code(st, jxsml__toc_context(size), 0, &entropy);
 			for (i = 0; i < end; ++i) {
 				lehmer[i] = jxsml__entropy_code(st, i > 0 ? jxsml__toc_context(lehmer[i - 1]) : 0, 0, &entropy);
+				fprintf(stderr, "lehmer[%d] = %d\n", i, lehmer[i]);
 			}
 		}
 		JXSML__TRY(jxsml__zero_pad_to_byte(st));
 		for (i = 0; i < size; ++i) {
-			toc[i] = jxsml__u32(0, 10, 1024, 14, 17408, 22, 4211712, 30);
+			toc[i] = jxsml__u32(st, 0, 10, 1024, 14, 17408, 22, 4211712, 30);
+			fprintf(stderr, "toc[%d] = %d", i, toc[i]);
+			j = i;
+			if (j < 1) {
+				fprintf(stderr, " for lf_global\n");
+			} else if ((j -= 1) < num_lf_groups) {
+				fprintf(stderr, " for lf_group %d\n", j);
+			} else if ((j -= num_lf_groups) < 1) {
+				fprintf(stderr, " for hf_global\n");
+			} else if ((j -= 1) < f->num_passes) {
+				fprintf(stderr, " for hf_pass %d\n", j);
+			} else {
+				j -= f->num_passes;
+				fprintf(stderr, " for pass_group %d of pass %d\n", j % num_groups, j / num_groups);
+			}
 		}
-		// TODO permute
+		if (permuted) {
+			JXSML__RAISE("TODO: permuted");
+		}
 		JXSML__TRY(jxsml__zero_pad_to_byte(st));
 	}
 
@@ -1259,42 +1430,16 @@ error:
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+// image metadata
 
-void end(const jxsml img, const jxsml__st st) {}
-
-int jxsml_load_from_memory(jxsml *out, const void *buf, size_t bufsize) {
+int jxsml__image_metadata(jxsml__st *st) {
 	static const float SRGB_CHROMA[4][2] = { // default chromacity (kD65, kSRGB)
 		{0.3127f, 0.3290f}, {0.639998686f, 0.330010138f},
 		{0.300003784f, 0.600003357f}, {0.150002046f, 0.059997204f},
 	};
 
-	jxsml__st st_ = {
-		.out = out,
-		.buf = (const uint8_t *) buf,
-		.bufsize = bufsize,
-		.modular_16bit_buffers = 1,
-		.xyb_encoded = 1,
-		.opsin_inv_mat = {
-			{11.031566901960783f, -9.866943921568629f, -0.16462299647058826f},
-			{-3.254147380392157f, 4.418770392156863f, -0.16462299647058826f},
-			{-3.6588512862745097f, 2.7129230470588235f, 1.9459282392156863f},
-		},
-		.opsin_bias = {-0.0037930732552754493f, -0.0037930732552754493f, -0.0037930732552754493f},
-		.quant_bias = {1-0.05465007330715401f, 1-0.07005449891748593f, 1-0.049935103337343655f},
-		.quant_bias_num = 0.145f,
-	};
-	jxsml__st *st = &st_;
-	int32_t i;
+	int32_t i, j;
 
-	JXSML__SHOULD(st->bufsize >= 2, "shrt");
-	JXSML__SHOULD(st->buf[0] == 0xff && st->buf[1] == 0x0a, "!jxl");
-	st->buf += 2;
-	st->bufsize -= 2;
-
-	// SizeHeader
-	JXSML__TRY(jxsml__size_header(st, &st->out->width, &st->out->height));
-
-	// ImageMetadata
 	st->out->orientation = JXSML_ORIENT_TL;
 	st->out->intr_width = 0;
 	st->out->intr_height = 0;
@@ -1398,7 +1543,7 @@ int jxsml_load_from_memory(jxsml *out, const void *buf, size_t bufsize) {
 		JXSML__TRY(jxsml__extensions(st));
 	}
 	if (!jxsml__u(st, 1)) { // !default_m
-		int32_t cw_mask, i, j;
+		int32_t cw_mask;
 		if (st->xyb_encoded) {
 			for (i = 0; i < 3; ++i) for (j = 0; j < 3; ++j) st->opsin_inv_mat[i][j] = jxsml__f16(st);
 			for (i = 0; i < 3; ++i) st->opsin_bias[i] = jxsml__f16(st);
@@ -1417,11 +1562,43 @@ int jxsml_load_from_memory(jxsml *out, const void *buf, size_t bufsize) {
 		}
 	}
 	JXSML__RAISE_DELAYED();
+	return 0;
 
-	// icc
-	if (st->want_icc) {
-		JXSML__TRY(jxsml__icc(st));
-	}
+error:
+	return st->err;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+void end(const jxsml img, const jxsml__st st) {}
+
+int jxsml_load_from_memory(jxsml *out, const void *buf, size_t bufsize) {
+	jxsml__st st_ = {
+		.out = out,
+		.modular_16bit_buffers = 1,
+		.xyb_encoded = 1,
+		.opsin_inv_mat = {
+			{11.031566901960783f, -9.866943921568629f, -0.16462299647058826f},
+			{-3.254147380392157f, 4.418770392156863f, -0.16462299647058826f},
+			{-3.6588512862745097f, 2.7129230470588235f, 1.9459282392156863f},
+		},
+		.opsin_bias = {-0.0037930732552754493f, -0.0037930732552754493f, -0.0037930732552754493f},
+		.quant_bias = {1-0.05465007330715401f, 1-0.07005449891748593f, 1-0.049935103337343655f},
+		.quant_bias_num = 0.145f,
+	};
+	jxsml__st *st = &st_;
+	int32_t i, j;
+
+	JXSML__TRY(jxsml__init_container(st, buf, bufsize));
+
+	JXSML__SHOULD(st->bufsize >= 2, "shrt");
+	JXSML__SHOULD(st->buf[0] == 0xff && st->buf[1] == 0x0a, "!jxl");
+	st->buf += 2;
+	st->bufsize -= 2;
+
+	JXSML__TRY(jxsml__size_header(st, &st->out->width, &st->out->height));
+	JXSML__TRY(jxsml__image_metadata(st));
+	if (st->want_icc) JXSML__TRY(jxsml__icc(st));
 
 	jxsml__frame_t frame;
 	do {
