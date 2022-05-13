@@ -11,6 +11,7 @@
 #include <stdio.h>
 
 #define JXSML_DEBUG
+#define inline // XXX
 
 enum {
 	JXSML_CHROMA_WHITE = 0, JXSML_CHROMA_RED = 1,
@@ -86,6 +87,28 @@ int jxsml__set_error(jxsml__st *st, int err) {
 	}
 	return err;
 }
+
+void *jxsml__realloc(jxsml__st *st, void *ptr, size_t itemsize, int32_t len, int32_t *cap) {
+	void *newptr;
+	uint32_t newcap;
+	JXSML__ASSERT(len >= 0);
+	if (len <= *cap) return ptr;
+	newcap = (uint32_t) *cap * 2;
+	if (newcap > (uint32_t) INT32_MAX) newcap = (uint32_t) INT32_MAX;
+	if (newcap < (uint32_t) len) newcap = (uint32_t) len;
+	JXSML__SHOULD(newcap <= SIZE_MAX / itemsize, "!mem");
+	JXSML__SHOULD(newptr = realloc(ptr, itemsize * newcap), "!mem");
+	*cap = (int32_t) newcap;
+	return newptr;
+error:
+	return NULL;
+}
+
+#define JXSML__TRY_REALLOC(ptr, itemsize, len, cap) \
+	do { \
+		void *newptr = jxsml__realloc(st, *(ptr), itemsize, len, cap); \
+		if (newptr) *(ptr) = newptr; else goto error; \
+	} while (0) \
 
 ////////////////////////////////////////////////////////////////////////////////
 // container
@@ -393,13 +416,13 @@ static const uint8_t JXSML__REV5[32] = {
 enum { JXSML__MAX_TYPICAL_FAST_LEN = 7 }; // limit fast_len for typical cases
 enum { JXSML__MAX_TABLE_GROWTH = 2 }; // we can afford 2x the table size if beneficial though
 
-int32_t jxsml__match_overflow(jxsml__st *st, int32_t fast_len, int32_t start, const int32_t *table) {
+int32_t jxsml__match_overflow(jxsml__st *st, int32_t fast_len, const int32_t *table) {
 	int32_t entry, code, code_len;
 	st->nbits -= fast_len;
 	st->bits >>= fast_len;
 	st->bits_read += (size_t) fast_len;
 	do {
-		entry = table[start++];
+		entry = *table++;
 		code = (entry >> 4) & 0xfff;
 		code_len = entry & 15;
 	} while (code != (int32_t) (st->bits & ((1u << code_len) - 1)));
@@ -410,7 +433,7 @@ inline int32_t jxsml__prefix_code(jxsml__st *st, int32_t fast_len, int32_t max_l
 	int32_t entry, code_len;
 	if (jxsml__refill(st, max_len)) return 0;
 	entry = table[st->bits & ((1u << fast_len) - 1)];
-	if (entry < 0 && fast_len < max_len) entry = jxsml__match_overflow(st, fast_len, -entry, table);
+	if (entry < 0 && fast_len < max_len) entry = jxsml__match_overflow(st, fast_len, table - entry);
 	code_len = entry & 15;
 	st->nbits -= code_len;
 	st->bits >>= code_len;
@@ -554,7 +577,9 @@ int jxsml__init_prefix_code(jxsml__st *st, int32_t l2size, int32_t *out_fast_len
 		}
 		l2overflows[fast_len + 1] = 1 << fast_len;
 		for (i = fast_len + 2; i <= *out_max_len; ++i) l2overflows[i] = l2overflows[i - 1] + l2counts[i - 1];
-		JXSML__SHOULD(l2table = malloc(sizeof(int32_t) * (size_t) size_used), "!mem");
+		JXSML__SHOULD(l2table = malloc(sizeof(int32_t) * (size_t) (size_used + 1)), "!mem");
+		// this entry should be unreachable, but should work as a stopper if there happens to be a logic bug
+		l2table[size_used] = 0;
 	}
 
 	// fill the layer 2 table
@@ -596,8 +621,8 @@ error:
 // hybrid integer encoding
 
 // token < 2^split_exp is interpreted as is.
-// otherwise (token - 2^split_exp) is split into NNNHHHLLL where config determines H/L lengths.
-// then MMM = u(NNN + split_exp) is read; the decoded value is 1HHHMMMLLL.
+// otherwise (token - 2^split_exp) is split into NNHHHLLL where config determines H/L lengths.
+// then MMMMM = u(NN + split_exp) is read; the decoded value is 1HHHMMMMMLLL.
 typedef struct { int8_t split_exp, msb_in_token, lsb_in_token; } jxsml__hybrid_int_config_t;
 
 int jxsml__hybrid_int_config(jxsml__st *st, int32_t log_alphabet_size, jxsml__hybrid_int_config_t *out) {
@@ -617,8 +642,8 @@ inline int32_t jxsml__hybrid_int(jxsml__st *st, int32_t token, const jxsml__hybr
 	midbits = config->split_exp + ((token - split) >> (config->msb_in_token + config->lsb_in_token));
 	// TODO midbits can overflow!
 	mid = jxsml__u(st, midbits);
-	top = (int32_t) 1 << config->msb_in_token;
-	lo = token & (((int32_t) 1 << config->lsb_in_token) - 1);
+	top = 1 << config->msb_in_token;
+	lo = token & ((1 << config->lsb_in_token) - 1);
 	hi = (token >> config->lsb_in_token) & (top - 1);
 	return ((top | hi) << (midbits + config->lsb_in_token)) | ((mid << config->lsb_in_token) | lo);
 }
@@ -640,9 +665,9 @@ enum { JXSML__DIST_BITS = 12 };
 // output symbol: |   i   |        symbol        | <- bucket i
 //                +------------------------------+
 //  output range: offset        offset+bucket_size
-typedef struct { int16_t cutoff, offset, symbol; } jxsml__alias_bucket;
+typedef struct { int16_t cutoff, offset, symbol_or_next; } jxsml__alias_bucket;
 
-jxsml__alias_bucket *jxsml__init_alias_map(jxsml__st *st, const int16_t *D, int32_t log_alphabet_size) {
+int jxsml__init_alias_map(jxsml__st *st, const int16_t *D, int32_t log_alphabet_size, jxsml__alias_bucket **out) {
 	int16_t log_bucket_size = (int16_t) (JXSML__DIST_BITS - log_alphabet_size);
 	int16_t bucket_size = (int16_t) (1 << log_bucket_size);
 	jxsml__alias_bucket *buckets;
@@ -657,11 +682,11 @@ jxsml__alias_bucket *jxsml__init_alias_map(jxsml__st *st, const int16_t *D, int3
 	}
 	if (j == 1) { // D[i] is the only non-zero probability
 		for (j = 0; j < (1 << log_alphabet_size); ++j) {
-			buckets[j].symbol = i;
+			buckets[j].symbol_or_next = i;
 			buckets[j].offset = (int16_t) (j << log_bucket_size);
 			buckets[j].cutoff = 0;
 		}
-		return buckets;
+		return 0;
 	}
 
 	// each bucket is either settled (fields fully set) or unsettled (only `cutoff` is set).
@@ -670,18 +695,17 @@ jxsml__alias_bucket *jxsml__init_alias_map(jxsml__st *st, const int16_t *D, int3
 	// unused, so `symbol` in settled buckets is aliased to `next` in unsettled buckets.
 	// when rearranging results in buckets with `cutoff == bucket_size`,
 	// final fields are set and they become settled; eventually every bucket has to be settled.
-	#define next symbol
 	for (i = 0; i < (1 << log_alphabet_size); ++i) {
 		int16_t cutoff = D[i];
 		buckets[i].cutoff = cutoff;
 		if (cutoff > bucket_size) {
-			buckets[i].next = o;
+			buckets[i].symbol_or_next = o;
 			o = i;
 		} else if (cutoff < bucket_size) {
-			buckets[i].next = u;
+			buckets[i].symbol_or_next = u;
 			u = i;
 		} else { // immediately settled
-			buckets[i].symbol = i;
+			buckets[i].symbol_or_next = i;
 			buckets[i].offset = 0;
 		}
 	}
@@ -692,51 +716,58 @@ jxsml__alias_bucket *jxsml__init_alias_map(jxsml__st *st, const int16_t *D, int3
 		by = bucket_size - buckets[u].cutoff;
 		// move the input range [cutoff[o] - by, cutoff[o]] of the bucket o into
 		// the input range [cutoff[u], bucket_size] of the bucket u (which is settled after this)
-		tmp = buckets[u].next;
+		tmp = buckets[u].symbol_or_next;
 		buckets[o].cutoff -= by;
-		buckets[u].symbol = o;
+		buckets[u].symbol_or_next = o;
 		buckets[u].offset = buckets[o].cutoff - buckets[u].cutoff;
 		u = tmp;
 		if (buckets[o].cutoff < bucket_size) { // o is now underfull, move to the underfull stack
 			tmp = o;
-			buckets[tmp].next = u;
-			o = buckets[tmp].next;
+			o = buckets[tmp].symbol_or_next;
+			buckets[tmp].symbol_or_next = u;
 			u = tmp;
 		} else if (buckets[o].cutoff == bucket_size) { // o is also settled
 			buckets[o].offset = 0;
-			o = buckets[o].next;
+			o = buckets[o].symbol_or_next;
 		}
 	}
-	#undef next
 
-	(void) st;
-	return buckets;
+	*out = buckets;
+	return 0;
 
 error:
 	free(buckets);
-	return NULL;
+	return st->err;
 }
 
 enum { JXSML__ANS_FINAL_STATE = 0x130000 }; // TODO check this at the end
 
-int32_t jxsml__ans_code(jxsml__st *st, uint32_t *state, int32_t log_bucket_size, const int16_t *D, const jxsml__alias_bucket *aliases) {
-	int32_t index = (int32_t) (*state & 0xfff);
-	int32_t i = index >> log_bucket_size;
-	int32_t pos = index & ((1 << log_bucket_size) - 1);
-	const jxsml__alias_bucket *bucket = &aliases[i];
-	int32_t symbol = pos < bucket->offset ? i : bucket->symbol;
-	*state = (uint32_t) D[symbol] * (*state >> 12) + (uint32_t) bucket->offset + (uint32_t) pos;
-	if (*state < (1u << 16)) *state = (*state << 16) | (uint32_t) jxsml__u(st, 16);
-	return symbol;
+int32_t jxsml__ans_code(
+	jxsml__st *st, uint32_t *state, int32_t log_bucket_size,
+	const int16_t *D, const jxsml__alias_bucket *aliases
+) {
+	if (*state == 0) {
+		*state = (uint32_t) jxsml__u(st, 16);
+		*state |= (uint32_t) jxsml__u(st, 16) << 16;
+	}
+	{
+		int32_t index = (int32_t) (*state & 0xfff);
+		int32_t i = index >> log_bucket_size;
+		int32_t pos = index & ((1 << log_bucket_size) - 1);
+		const jxsml__alias_bucket *bucket = &aliases[i];
+		int32_t symbol = pos < bucket->offset ? i : bucket->symbol_or_next;
+		*state = (uint32_t) D[symbol] * (*state >> 12) + (uint32_t) bucket->offset + (uint32_t) pos;
+		if (*state < (1u << 16)) *state = (*state << 16) | (uint32_t) jxsml__u(st, 16);
+		return symbol;
+	}
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// clustered entropy code
+// entropy code
 
 typedef union {
 	struct {
-		uint32_t state; // TODO initialize state
-		int32_t log_bucket_size;
+		uint32_t state; // 0 if uninitialized
 		int16_t *D;
 		jxsml__alias_bucket *aliases;
 	} ans; // if parent use_prefix_code is false
@@ -745,21 +776,11 @@ typedef union {
 	} prefix; // if parent use_prefix_code is true
 } jxsml__entropy_code_cluster_t;
 
-int jxsml__entropy_code_cluster(jxsml__st *st, int use_prefix_code, jxsml__entropy_code_cluster_t *cluster) {
-	if (use_prefix_code) {
-		return jxsml__prefix_code(st, cluster->prefix.fast_len, cluster->prefix.max_len, cluster->prefix.table);
-	} else {
-		return jxsml__ans_code(st, &cluster->ans.state, cluster->ans.log_bucket_size, cluster->ans.D, cluster->ans.aliases);
-	}
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// top-level entropy code
-
 typedef struct {
 	int32_t num_dist;
 	int lz77_enabled, use_prefix_code;
 	int32_t min_symbol, min_length;
+	int32_t log_alphabet_size;
 	int32_t num_clusters; // in [1, num_dist]
 	int8_t cluster_map[JXSML__MAX_DIST]; // each in [0, num_clusters)
 
@@ -771,6 +792,18 @@ typedef struct {
 	int32_t num_to_copy, copy_pos, num_decoded;
 	int32_t *window;
 } jxsml__entropy_code_t;
+
+int jxsml__entropy_code_cluster(
+	jxsml__st *st, int use_prefix_code, int32_t log_alphabet_size,
+	jxsml__entropy_code_cluster_t *cluster
+) {
+	if (use_prefix_code) {
+		return jxsml__prefix_code(st, cluster->prefix.fast_len, cluster->prefix.max_len, cluster->prefix.table);
+	} else {
+		return jxsml__ans_code(st, &cluster->ans.state, JXSML__DIST_BITS - log_alphabet_size,
+			cluster->ans.D, cluster->ans.aliases);
+	}
+}
 
 // aka DecodeHybridVarLenUint
 int jxsml__entropy_code(jxsml__st *st, int32_t ctx, int32_t dist_mult, jxsml__entropy_code_t *code) {
@@ -785,10 +818,12 @@ continue_lz77:
 #ifdef JXSML__DEBUG
 	if (ctx >= code->num_dist) return JXSML__ERR("!exp"), 0;
 #endif
-	token = jxsml__entropy_code_cluster(st, code->use_prefix_code, &code->clusters[ctx]);
+	token = jxsml__entropy_code_cluster(st, code->use_prefix_code,
+		code->log_alphabet_size, &code->clusters[ctx]);
 	if (token >= code->min_symbol) { // this is large enough if lz77_enabled is false
 		code->num_to_copy = jxsml__hybrid_int(st, token - code->min_symbol, &code->lz_len_config) + code->min_length;
-		token = jxsml__entropy_code_cluster(st, code->use_prefix_code, &code->clusters[code->num_dist - 1]);
+		token = jxsml__entropy_code_cluster(st, code->use_prefix_code,
+			code->log_alphabet_size, &code->clusters[code->num_dist - 1]);
 		distance = jxsml__hybrid_int(st, token, &code->configs[code->num_dist - 1]);
 		if (st->err) return 0;
 		if (!dist_mult) {
@@ -832,6 +867,7 @@ int jxsml__init_entropy_code(jxsml__st *st, int32_t num_dist, jxsml__entropy_cod
 
 	out->use_prefix_code = 0;
 	out->window = NULL;
+	memset(out, 0, sizeof(jxsml__entropy_code_t));
 
 	// LZ77Params
 	out->lz77_enabled = jxsml__u(st, 1);
@@ -895,18 +931,22 @@ int jxsml__init_entropy_code(jxsml__st *st, int32_t num_dist, jxsml__entropy_cod
 		}
 	} else {
 		enum { DISTBITS = JXSML__DIST_BITS, DISTSUM = 1 << DISTBITS };
+
 		int32_t log_alphabet_size = 5 + jxsml__u(st, 2);
 		for (i = 0; i < out->num_clusters; ++i) {
 			JXSML__TRY(jxsml__hybrid_int_config(st, log_alphabet_size, &out->configs[i]));
 		}
+		out->log_alphabet_size = log_alphabet_size;
 
 		for (i = 0; i < out->num_clusters; ++i) {
 			int32_t table_size = 1 << log_alphabet_size;
-			int32_t D[table_size]; // TODO eliminate VLA
-			for(j=0;j<table_size;++j)D[j]=0;
+			int16_t *D;
+			JXSML__SHOULD(D = malloc(sizeof(int16_t) << (size_t) log_alphabet_size), "!mem");
+			clusters[i].ans.D = D;
 
 			switch (jxsml__u(st, 2)) {
 			case 1: // one entry
+				memset(D, 0, sizeof(int16_t) * (size_t) table_size);
 				D[jxsml__u8(st)] = DISTSUM;
 				break;
 
@@ -914,16 +954,17 @@ int jxsml__init_entropy_code(jxsml__st *st, int32_t num_dist, jxsml__entropy_cod
 				int32_t v1 = jxsml__u8(st);
 				int32_t v2 = jxsml__u8(st);
 				JXSML__SHOULD(v1 != v2 && v1 < table_size && v2 < table_size, "ansd");
-				D[v1] = jxsml__u(st, DISTBITS);
-				D[v2] = DISTSUM - D[v1];
+				memset(D, 0, sizeof(int16_t) * (size_t) table_size);
+				D[v1] = (int16_t) jxsml__u(st, DISTBITS);
+				D[v2] = (int16_t) (DISTSUM - D[v1]);
 				break;
 			}
 
 			case 2: { // evenly distribute to first `alphabet_size` entries (false -> true)
 				int32_t alphabet_size = jxsml__u8(st) + 1;
-				int32_t d = DISTSUM / alphabet_size;
-				int32_t bias_size = DISTSUM - d * alphabet_size;
-				for (j = 0; j < bias_size; ++j) D[j] = d + 1;
+				int16_t d = (int16_t) (DISTSUM / alphabet_size);
+				int16_t bias_size = (int16_t) (DISTSUM - d * alphabet_size);
+				for (j = 0; j < bias_size; ++j) D[j] = (int16_t) (d + 1);
 				for (; j < alphabet_size; ++j) D[j] = d;
 				break;
 			}
@@ -939,10 +980,10 @@ int jxsml__init_entropy_code(jxsml__st *st, int32_t num_dist, jxsml__entropy_cod
 
 				omit_log = -1; // there should be at least one non-RLE code
 				for (j = ncodes = 0; j < alphabet_size; ) {
-					static const int32_t TABLE[] = {
+					static const int32_t TABLE[] = { // reinterpretation of kLogCountLut
 						0xa0003,     -16, 0x70003, 0x30004, 0x60003, 0x80003, 0x90003, 0x50004,
 						0xa0003, 0x40004, 0x70003, 0x10004, 0x60003, 0x80003, 0x90003, 0x20004,
-						0x00011, 0xb0022, 0xc0003, 0xd0000, // overflow for ...0001
+						0x00011, 0xb0022, 0xc0003, 0xd0043, // overflow for ...0001
 					};
 					code = jxsml__prefix_code(st, 4, 7, TABLE);
 					if (code < 13) {
@@ -960,27 +1001,31 @@ int jxsml__init_entropy_code(jxsml__st *st, int32_t num_dist, jxsml__entropy_cod
 				for (j = n = total = 0; j < ncodes; ++j) {
 					code = codes[j];
 					if (code < 0) { // repeat
-						int32_t prev = n > 0 ? D[n - 1] : 0;
+						int16_t prev = n > 0 ? D[n - 1] : 0;
 						JXSML__SHOULD(prev >= 0, "ansd"); // implicit D[n] followed by RLE
-						while (code++ < 0) total += D[n++] = prev;
+						total += (int32_t) prev * (int32_t) -code;
+						while (code++ < 0) D[n++] = prev;
 					} else if (code == omit_log) { // the first longest D[n] is "omitted" (implicit)
 						omit_pos = n;
 						omit_log = -1; // this branch runs at most once
 						D[n++] = -1;
 					} else if (code < 2) {
-						total += D[n++] = code;
+						total += code;
+						D[n++] = (int16_t) code;
 					} else {
 						int32_t bitcount;
 						--code;
 						bitcount = shift - ((DISTBITS - code) >> 1);
 						if (bitcount < 0) bitcount = 0;
 						if (bitcount > code) bitcount = code;
-						total += D[n++] = (1 << code) + (jxsml__u(st, bitcount) << (code - bitcount));
+						code = (1 << code) + (jxsml__u(st, bitcount) << (code - bitcount));
+						total += code;
+						D[n++] = (int16_t) code;
 					}
 				}
 				JXSML__ASSERT(omit_pos >= 0);
 				JXSML__SHOULD(total <= DISTSUM, "ansd");
-				D[omit_pos] = DISTSUM - total;
+				D[omit_pos] = (int16_t) (DISTSUM - total);
 				break;
 			}
 
@@ -990,7 +1035,9 @@ int jxsml__init_entropy_code(jxsml__st *st, int32_t num_dist, jxsml__entropy_cod
 			JXSML__RAISE_DELAYED();
 		}
 
-		JXSML__RAISE("TODO: alias mapping needed");
+		for (i = 0; i < out->num_clusters; ++i) {
+			JXSML__TRY(jxsml__init_alias_map(st, clusters[i].ans.D, log_alphabet_size, &clusters[i].ans.aliases));
+		}
 	}
 
 	// permute out->configs/clusters so that we don't need to consult out->cluster_map directly
@@ -1006,10 +1053,8 @@ error:
 		if (out->use_prefix_code) {
 			free(clusters[i].prefix.table);
 		} else {
-			/*
 			free(clusters[i].ans.D);
 			free(clusters[i].ans.aliases);
-			*/
 		}
 	}
 	free(out->window);
@@ -1058,13 +1103,13 @@ int jxsml__bit_depth(jxsml__st *st, int32_t *outbpp, int32_t *outexpbits) {
 	return st->err;
 }
 
-#define JXSML__TOSIGNED(u) ((u) & 1 ? -((u) + 1) / 2 : (u) / 2)
+#define JXSML__TO_SIGNED(u) ((u) & 1 ? -((u) + 1) / 2 : (u) / 2)
 
 int jxsml__customxy(jxsml__st *st, float xy[2]) {
 	int32_t ux = jxsml__u32(st, 0, 19, 0x80000, 19, 0x100000, 20, 0x200000, 21);
 	int32_t uy = jxsml__u32(st, 0, 19, 0x80000, 19, 0x100000, 20, 0x200000, 21);
-	xy[0] = (float) JXSML__TOSIGNED(ux) / 1000000.0f;
-	xy[1] = (float) JXSML__TOSIGNED(uy) / 1000000.0f;
+	xy[0] = (float) JXSML__TO_SIGNED(ux) / 1000000.0f;
+	xy[1] = (float) JXSML__TO_SIGNED(uy) / 1000000.0f;
 	return st->err;
 }
 
@@ -1158,6 +1203,162 @@ error:
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+// MA tree
+
+typedef union {
+	struct {
+		int32_t prop; // < 0, ~prop is 0 (channel index) through 15 (max_error)
+		int32_t value;
+		int32_t left, right;
+	} branch;
+	struct {
+		int32_t ctx; // >= 0
+		int32_t predictor;
+		int32_t offset, multiplier;
+	} leaf;
+} jxsml__ma_tree_t;
+
+int jxsml__ma_tree(jxsml__st *st, jxsml__ma_tree_t **t) {
+	jxsml__entropy_code_t entropy = {0};
+	int32_t tree_idx = 0, tree_cap = 8;
+	int32_t ctx_id = 0, nodes_left = 1;
+
+	*t = NULL;
+	JXSML__TRY(jxsml__init_entropy_code(st, 6, &entropy));
+	JXSML__SHOULD(*t = malloc(sizeof(jxsml__ma_tree_t) * (size_t) tree_cap), "!mem");
+	while (nodes_left > 0) {
+		jxsml__ma_tree_t *n;
+		int32_t prop = jxsml__entropy_code(st, 1, 0, &entropy), val, shift;
+		JXSML__TRY_REALLOC(t, sizeof(jxsml__ma_tree_t), tree_idx + 1, &tree_cap);
+		n = *t + tree_idx++;
+		if (prop >= 0) {
+			n->branch.prop = ~prop;
+			val = jxsml__entropy_code(st, 0, 0, &entropy);
+			n->branch.value = JXSML__TO_SIGNED(val);
+			n->branch.left = tree_idx + nodes_left++;
+			n->branch.right = tree_idx + nodes_left++;
+		} else {
+			n->leaf.ctx = ctx_id++;
+			n->leaf.predictor = jxsml__entropy_code(st, 2, 0, &entropy);
+			val = jxsml__entropy_code(st, 3, 0, &entropy);
+			n->leaf.offset = JXSML__TO_SIGNED(val);
+			shift = jxsml__entropy_code(st, 4, 0, &entropy);
+			val = jxsml__entropy_code(st, 5, 0, &entropy);
+			n->leaf.multiplier = (val + 1) << shift; // TODO overflow check
+		}
+		JXSML__RAISE_DELAYED();
+	}
+	return 0;
+
+error:
+	free(*t);
+	*t = NULL;
+	jxsml__free_entropy_code(&entropy);
+	return st->err;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// modular
+
+typedef union {
+	enum jxsml__transform_id {
+		JXSML__XF_RCT = 0, JXSML__XF_PALETTE = 1, JXSML__XF_SQUEEZE = 2
+	} tr;
+	struct {
+		enum jxsml__transform_id tr; // = JXSML__XF_RCT
+		int32_t begin_c, type;
+	} rct;
+	struct {
+		enum jxsml__transform_id tr; // = JXSML__XF_PALETTE
+		int32_t begin_c, num_c, nb_colours, nb_deltas, d_pred;
+	} pal;
+	// this is nested in the bitstream, but flattened here.
+	// nb_transforms get updated accordingly, but should be enough (the maximum is 80808)
+	struct {
+		enum jxsml__transform_id tr; // = JXSML__XF_SQUEEZE
+		int implicit; // if true, no explicit parameters given in the bitstream
+		int horizontal, in_place;
+		int32_t begin_c, num_c;
+	} sq;
+} jxsml__transform_t;
+
+typedef struct {
+	int use_global_tree;
+	int8_t wp_p1, wp_p2, wp_p3[5], wp_w[4]; 
+	int32_t nb_transforms;
+	jxsml__transform_t *transform;
+	jxsml__ma_tree_t *tree;
+} jxsml__modular_t;
+
+// m[0]..m[num_channels-1] should be accessible
+int jxsml__modular(jxsml__st *st, int32_t num_channels, jxsml__modular_t *m) {
+	int32_t transform_cap;
+	int32_t i, j;
+
+	m->transform = NULL;
+	m->use_global_tree = jxsml__u(st, 1);
+	{ // WPHeader
+		int default_wp = jxsml__u(st, 1);
+		m->wp_p1 = default_wp ? 16 : (int8_t) jxsml__u(st, 5);
+		m->wp_p2 = default_wp ? 10 : (int8_t) jxsml__u(st, 5);
+		for (i = 0; i < 5; ++i) m->wp_p3[i] = default_wp ? 7 * (i < 3) : (int8_t) jxsml__u(st, 5);
+		for (i = 0; i < 4; ++i) m->wp_w[i] = default_wp ? 12 + (i < 1) : (int8_t) jxsml__u(st, 4);
+	}
+	transform_cap = m->nb_transforms = jxsml__u32(st, 0, 0, 1, 0, 2, 4, 18, 8);
+	JXSML__SHOULD(m->transform = malloc(sizeof(jxsml__transform_t) * (size_t) transform_cap), "!mem");
+	for (i = 0; i < m->nb_transforms; ++i) {
+		jxsml__transform_t *xf = &m->transform[i];
+		int32_t num_sq;
+		xf->tr = jxsml__u(st, 2);
+		switch (xf->tr) {
+		case JXSML__XF_RCT:
+			xf->rct.begin_c = jxsml__u32(st, 0, 3, 8, 6, 72, 10, 1096, 13);
+			xf->rct.type = jxsml__u32(st, 6, 0, 0, 2, 2, 4, 10, 6);
+			break;
+		case JXSML__XF_PALETTE:
+			xf->pal.begin_c = jxsml__u32(st, 0, 3, 8, 6, 72, 10, 1096, 13);
+			xf->pal.num_c = jxsml__u32(st, 1, 0, 3, 0, 4, 0, 1, 13);
+			xf->pal.nb_colours = jxsml__u32(st, 0, 8, 256, 10, 1280, 12, 5376, 16);
+			xf->pal.nb_deltas = jxsml__u32(st, 0, 0, 1, 8, 257, 10, 1281, 16);
+			xf->pal.d_pred = jxsml__u(st, 4);
+			break;
+		case JXSML__XF_SQUEEZE:
+			num_sq = jxsml__u32(st, 0, 0, 1, 4, 9, 6, 41, 8);
+			if (num_sq == 0) {
+				xf->sq.implicit = 1;
+			} else {
+				JXSML__TRY_REALLOC(&m->transform, sizeof(jxsml__transform_t),
+					m->nb_transforms + num_sq - 1, &transform_cap);
+				for (j = 0; j < num_sq; ++j) {
+					xf = &m->transform[i + j];
+					xf->sq.tr = JXSML__XF_SQUEEZE;
+					xf->sq.implicit = 0;
+					xf->sq.horizontal = jxsml__u(st, 1);
+					xf->sq.in_place = jxsml__u(st, 1);
+					xf->sq.begin_c = jxsml__u32(st, 0, 3, 8, 6, 72, 10, 1096, 13);
+					xf->sq.num_c = jxsml__u32(st, 1, 0, 2, 0, 3, 0, 4, 4);
+				}
+				i += num_sq - 1;
+				m->nb_transforms += num_sq - 1;
+			}
+			break;
+		default: JXSML__RAISE("xfm?");
+		}
+		JXSML__RAISE_DELAYED();
+	}
+	if (!m->use_global_tree) {
+		JXSML__RAISE("TODO: local ma tree");
+		//JXSML__TRY(jxsml__ma_tree(st, ...));
+	}
+	JXSML__RAISE("TODO: channel decoding");
+	return 0;
+
+error:
+	free(m->transform);
+	return st->err;
+}
+
+////////////////////////////////////////////////////////////////////////////////
 // frame header
 
 enum { JXSML__MAX_PASSES = 11 };
@@ -1194,13 +1395,15 @@ typedef struct {
 	char *name;
 	struct {
 		int enabled;
-		float weights[3 /*0=x, 1=y, 2=b*/][2 /*0=weight1, 1=weight2*/];
+		float weights[3 /*xyb*/][2 /*0=weight1, 1=weight2*/];
 	} gab;
 	struct {
 		int32_t iters;
 		float sharp_lut[8], channel_scale[3];
 		float quant_mul, pass0_sigma_circle, pass2_sigma_circle, border_sad_mul, sigma_for_modular;
 	} epf;
+	float m_lf_unscaled[3 /*xyb*/];
+	jxsml__ma_tree_t *global_tree;
 } jxsml__frame_t;
 
 int jxsml__frame(jxsml__st *st, jxsml__frame_t *f) {
@@ -1249,6 +1452,10 @@ int jxsml__frame(jxsml__st *st, jxsml__frame_t *f) {
 	f->epf.pass2_sigma_circle = 6.5f;
 	f->epf.border_sad_mul = 2.0f / 3.0f;
 	f->epf.sigma_for_modular = 1.0f;
+	f->m_lf_unscaled[0] = 4096.0f;
+	f->m_lf_unscaled[1] = 512.0f;
+	f->m_lf_unscaled[2] = 256.0f;
+	f->global_tree = NULL;
 	full_frame = 1;
 
 	JXSML__TRY(jxsml__zero_pad_to_byte(st));
@@ -1379,11 +1586,11 @@ int jxsml__frame(jxsml__st *st, jxsml__frame_t *f) {
 
 	// TOC
 	{
-		int32_t toc[/*???*/1000];
 		int32_t size = f->num_passes == 1 && num_groups == 1 ? 1 :
 			1 /*lf_global*/ + num_lf_groups /*lf_group*/ +
 			1 /*hf_global*/ + f->num_passes /*hf_pass*/ +
 			f->num_passes * num_groups /*group_pass*/;
+		int32_t toc[size]; // TODO eliminate VLA
 		int permuted = jxsml__u(st, 1);
 		fprintf(stderr, "toc size = %d\n", size);
 		if (permuted) {
@@ -1392,6 +1599,7 @@ int jxsml__frame(jxsml__st *st, jxsml__frame_t *f) {
 			JXSML__TRY(jxsml__init_entropy_code(st, 8, &entropy));
 #define jxsml__toc_context(s) ((s) < 64 ? 32 - __builtin_clz((unsigned) (s) + 1) : 7)
 			end = jxsml__entropy_code(st, jxsml__toc_context(size), 0, &entropy);
+			// TODO end should be somehow bounded
 			for (i = 0; i < end; ++i) {
 				lehmer[i] = jxsml__entropy_code(st, i > 0 ? jxsml__toc_context(lehmer[i - 1]) : 0, 0, &entropy);
 				fprintf(stderr, "lehmer[%d] = %d\n", i, lehmer[i]);
@@ -1416,9 +1624,35 @@ int jxsml__frame(jxsml__st *st, jxsml__frame_t *f) {
 			}
 		}
 		if (permuted) {
-			JXSML__RAISE("TODO: permuted");
+			JXSML__RAISE("TODO: toc permutation");
 		}
 		JXSML__TRY(jxsml__zero_pad_to_byte(st));
+	}
+
+	// LfGlobal
+	{
+		int32_t num_channels;
+		if (f->has_patches) JXSML__RAISE("TODO: patches");
+		if (f->has_splines) JXSML__RAISE("TODO: splines");
+		if (f->has_noise) JXSML__RAISE("TODO: noise");
+		if (!jxsml__u(st, 1)) { // LfChannelDequantization.all_default
+			for (i = 0; i < 3; ++i) f->m_lf_unscaled[i] = jxsml__f16(st);
+		}
+		if (!f->is_modular) {
+			JXSML__RAISE("TODO: VarDCT params in LfGlobal");
+		}
+		if (jxsml__u(st, 1)) { // global tree present
+			JXSML__TRY(jxsml__ma_tree(st, &f->global_tree));
+		}
+		num_channels = st->num_extra_channels;
+		if (!f->is_modular) {
+			if (!f->do_ycbcr && !st->xyb_encoded && st->out->cspace != JXSML_CS_GREY) {
+				num_channels += 1;
+			} else {
+				num_channels += 3;
+			}
+		}
+		JXSML__RAISE("TODO: modular subbitstream");
 	}
 
 	JXSML__RAISE("TODO: frame");
