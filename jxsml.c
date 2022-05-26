@@ -259,7 +259,7 @@ int jxsml__always_refill(jxsml__st *st, int32_t n) {
 				st->nbits += 8;
 				--st->bufsize;
 			}
-			if (st->nbits > n) {
+			if (st->nbits < n) {
 				JXSML__SHOULD(st->container_continued, "shrt");
 				JXSML__TRY(jxsml__refill_container(st));
 				continue; // now we have possibly more bits to refill, try again
@@ -621,7 +621,7 @@ int32_t jxsml__match_overflow(jxsml__st *st, int32_t fast_len, const int32_t *ta
 
 inline int32_t jxsml__prefix_code(jxsml__st *st, int32_t fast_len, int32_t max_len, const int32_t *table) {
 	int32_t entry, code_len;
-	if (jxsml__refill(st, max_len)) return 0;
+	if (st->nbits < max_len && jxsml__always_refill(st, 0)) return 0;
 	entry = table[st->bits & ((1u << fast_len) - 1)];
 	if (entry < 0 && fast_len < max_len) entry = jxsml__match_overflow(st, fast_len, table - entry);
 	code_len = entry & 15;
@@ -729,13 +729,13 @@ int jxsml__init_alias_map(jxsml__st *st, const int16_t *D, int32_t log_alphabet_
 	while (o >= 0) {
 		int16_t by, tmp;
 		JXSML__ASSERT(u >= 0);
-		by = bucket_size - buckets[u].cutoff;
+		by = (int16_t) (bucket_size - buckets[u].cutoff);
 		// move the input range [cutoff[o] - by, cutoff[o]] of the bucket o into
 		// the input range [cutoff[u], bucket_size] of the bucket u (which is settled after this)
 		tmp = buckets[u].offset_or_next /*next*/;
-		buckets[o].cutoff -= by;
+		buckets[o].cutoff = (int16_t) (buckets[o].cutoff - by);
 		buckets[u].symbol = o;
-		buckets[u].offset_or_next /*offset*/ = buckets[o].cutoff - buckets[u].cutoff;
+		buckets[u].offset_or_next /*offset*/ = (int16_t) (buckets[o].cutoff - buckets[u].cutoff);
 		u = tmp;
 		if (buckets[o].cutoff < bucket_size) { // o is now underfull, move to the underfull stack
 			tmp = buckets[o].offset_or_next /*next*/;
@@ -803,7 +803,7 @@ typedef union {
 		int16_t fast_len, max_len;
 		int32_t *table;
 	} prefix; // if parent use_prefix_code is true
-} jxsml__entropy_code_cluster_t;
+} jxsml__code_cluster_t;
 
 typedef struct {
 	int32_t num_dist;
@@ -813,23 +813,27 @@ typedef struct {
 	int32_t num_clusters; // in [1, min(num_dist, 256)]
 	uint8_t *cluster_map; // each in [0, num_clusters)
 	jxsml__hybrid_int_config_t lz_len_config;
-	jxsml__entropy_code_cluster_t *clusters;
+	jxsml__code_cluster_t *clusters;
+} jxsml__code_spec_t;
 
+typedef struct {
+	const jxsml__code_spec_t *spec;
 	// LZ77 states
 	int32_t num_to_copy, copy_pos, num_decoded;
-	int32_t *window;
-
+	int32_t window_cap, *window;
 	// ANS state
 	uint32_t ans_state; // 0 if uninitialized
-} jxsml__entropy_code_t;
+} jxsml__code_t;
 
-int jxsml__init_entropy_code(jxsml__st *, int32_t, jxsml__entropy_code_t *);
-int jxsml__entropy_code(jxsml__st *, int32_t, int32_t, jxsml__entropy_code_t *);
-void jxsml__free_entropy_code(jxsml__entropy_code_t *);
-int jxsml__finish_entropy_code(jxsml__st *, jxsml__entropy_code_t *);
+int jxsml__code_spec(jxsml__st *, int32_t, jxsml__code_spec_t *);
+int jxsml__code(jxsml__st *, int32_t, int32_t, jxsml__code_t *);
+int jxsml__finish_and_free_code(jxsml__st *, jxsml__code_t *);
+void jxsml__free_code(jxsml__code_t *);
+void jxsml__free_code_spec(jxsml__code_spec_t *);
 
 int jxsml__cluster_map(jxsml__st *st, int32_t num_dist, int32_t max_allowed, int32_t *num_clusters, uint8_t *map) {
-	jxsml__entropy_code_t ec = {0}; // cluster map might be recursively coded
+	jxsml__code_spec_t codespec = {0}; // cluster map might be recursively coded
+	jxsml__code_t code = { .spec = &codespec };
 	uint32_t seen[8] = {0};
 	int32_t i, j;
 
@@ -853,13 +857,14 @@ int jxsml__cluster_map(jxsml__st *st, int32_t num_dist, int32_t max_allowed, int
 		int use_mtf = jxsml__u(st, 1);
 
 		// num_dist=1 prevents further recursion
-		JXSML__TRY(jxsml__init_entropy_code(st, 1, &ec));
+		JXSML__TRY(jxsml__code_spec(st, 1, &codespec));
 		for (i = 0; i < num_dist; ++i) {
-			int32_t index = jxsml__entropy_code(st, 0, 0, &ec);
+			int32_t index = jxsml__code(st, 0, 0, &code);
 			JXSML__SHOULD(index < max_allowed, "clst");
 			map[i] = (uint8_t) index;
 		}
-		JXSML__TRY(jxsml__finish_entropy_code(st, &ec));
+		JXSML__TRY(jxsml__finish_and_free_code(st, &code));
+		jxsml__free_code_spec(&codespec);
 
 		if (use_mtf) {
 			uint8_t mtf[256], moved;
@@ -884,53 +889,52 @@ int jxsml__cluster_map(jxsml__st *st, int32_t num_dist, int32_t max_allowed, int
 	return 0;
 
 error:
-	jxsml__free_entropy_code(&ec);
+	jxsml__free_code(&code);
+	jxsml__free_code_spec(&codespec);
 	return st->err;
 }
 
-int jxsml__init_entropy_code(jxsml__st *st, int32_t num_dist, jxsml__entropy_code_t *out) {
+int jxsml__code_spec(jxsml__st *st, int32_t num_dist, jxsml__code_spec_t *spec) {
 	int32_t i, j;
 
-	out->cluster_map = NULL;
-	out->clusters = NULL;
-	out->window = NULL;
+	spec->cluster_map = NULL;
+	spec->clusters = NULL;
 
 	// LZ77Params
-	out->lz77_enabled = jxsml__u(st, 1);
-	if (out->lz77_enabled) {
-		out->min_symbol = jxsml__u32(st, 224, 0, 512, 0, 4096, 0, 8, 15);
-		out->min_length = jxsml__u32(st, 3, 0, 4, 0, 5, 2, 9, 8);
-		JXSML__TRY(jxsml__hybrid_int_config(st, 8, &out->lz_len_config));
+	spec->lz77_enabled = jxsml__u(st, 1);
+	if (spec->lz77_enabled) {
+		spec->min_symbol = jxsml__u32(st, 224, 0, 512, 0, 4096, 0, 8, 15);
+		spec->min_length = jxsml__u32(st, 3, 0, 4, 0, 5, 2, 9, 8);
+		JXSML__TRY(jxsml__hybrid_int_config(st, 8, &spec->lz_len_config));
 		++num_dist; // num_dist - 1 is a synthesized LZ77 length distribution
-		JXSML__SHOULD(out->window = malloc(sizeof(int32_t) << 20), "!mem"); // TODO too large!
 	} else {
-		out->min_symbol = out->min_length = 0x7fffffff;
+		spec->min_symbol = spec->min_length = 0x7fffffff;
 	}
 
 	// cluster_map: a mapping from context IDs to actual distributions
-	JXSML__SHOULD(out->cluster_map = malloc(sizeof(uint8_t) * (size_t) num_dist), "!mem");
-	JXSML__TRY(jxsml__cluster_map(st, num_dist, 256, &out->num_clusters, out->cluster_map));
+	JXSML__SHOULD(spec->cluster_map = malloc(sizeof(uint8_t) * (size_t) num_dist), "!mem");
+	JXSML__TRY(jxsml__cluster_map(st, num_dist, 256, &spec->num_clusters, spec->cluster_map));
 
-	JXSML__SHOULD(out->clusters = calloc((size_t) out->num_clusters, sizeof(jxsml__entropy_code_cluster_t)), "!mem");
+	JXSML__SHOULD(spec->clusters = calloc((size_t) spec->num_clusters, sizeof(jxsml__code_cluster_t)), "!mem");
 
-	out->use_prefix_code = jxsml__u(st, 1);
-	if (out->use_prefix_code) {
-		for (i = 0; i < out->num_clusters; ++i) {
-			JXSML__TRY(jxsml__hybrid_int_config(st, 15, &out->clusters[i].config));
+	spec->use_prefix_code = jxsml__u(st, 1);
+	if (spec->use_prefix_code) {
+		for (i = 0; i < spec->num_clusters; ++i) {
+			JXSML__TRY(jxsml__hybrid_int_config(st, 15, &spec->clusters[i].config));
 		}
 
-		for (i = 0; i < out->num_clusters; ++i) {
+		for (i = 0; i < spec->num_clusters; ++i) {
 			if (jxsml__u(st, 1)) {
 				int32_t n = jxsml__u(st, 4);
-				out->clusters[i].init.count = 1 + (1 << n) + jxsml__u(st, n);
-				JXSML__SHOULD(out->clusters[i].init.count <= (1 << 15), "hufd");
+				spec->clusters[i].init.count = 1 + (1 << n) + jxsml__u(st, n);
+				JXSML__SHOULD(spec->clusters[i].init.count <= (1 << 15), "hufd");
 			} else {
-				out->clusters[i].init.count = 1;
+				spec->clusters[i].init.count = 1;
 			}
 		}
 
-		for (i = 0; i < out->num_clusters; ++i) {
-			jxsml__entropy_code_cluster_t *c = &out->clusters[i];
+		for (i = 0; i < spec->num_clusters; ++i) {
+			jxsml__code_cluster_t *c = &spec->clusters[i];
 			int32_t fast_len, max_len;
 			JXSML__TRY(jxsml__init_prefix_code(st, c->init.count, &fast_len, &max_len, &c->prefix.table));
 			c->prefix.fast_len = (int16_t) fast_len;
@@ -939,16 +943,16 @@ int jxsml__init_entropy_code(jxsml__st *st, int32_t num_dist, jxsml__entropy_cod
 	} else {
 		enum { DISTBITS = JXSML__DIST_BITS, DISTSUM = 1 << DISTBITS };
 
-		out->log_alphabet_size = 5 + jxsml__u(st, 2);
-		for (i = 0; i < out->num_clusters; ++i) {
-			JXSML__TRY(jxsml__hybrid_int_config(st, out->log_alphabet_size, &out->clusters[i].config));
+		spec->log_alphabet_size = 5 + jxsml__u(st, 2);
+		for (i = 0; i < spec->num_clusters; ++i) {
+			JXSML__TRY(jxsml__hybrid_int_config(st, spec->log_alphabet_size, &spec->clusters[i].config));
 		}
 
-		for (i = 0; i < out->num_clusters; ++i) {
-			int32_t table_size = 1 << out->log_alphabet_size;
+		for (i = 0; i < spec->num_clusters; ++i) {
+			int32_t table_size = 1 << spec->log_alphabet_size;
 			int16_t *D;
 			JXSML__SHOULD(D = malloc(sizeof(int16_t) * (size_t) table_size), "!mem");
-			out->clusters[i].ans.D = D;
+			spec->clusters[i].ans.D = D;
 
 			switch (jxsml__u(st, 2)) {
 			case 1: // one entry
@@ -1039,21 +1043,21 @@ int jxsml__init_entropy_code(jxsml__st *st, int32_t num_dist, jxsml__entropy_cod
 			default: JXSML__UNREACHABLE();
 			}
 
-			JXSML__TRY(jxsml__init_alias_map(st, D, out->log_alphabet_size, &out->clusters[i].ans.aliases));
+			JXSML__TRY(jxsml__init_alias_map(st, D, spec->log_alphabet_size, &spec->clusters[i].ans.aliases));
 		}
 	}
 
-	out->num_dist = num_dist;
+	spec->num_dist = num_dist;
 	return 0;
 
 error:
-	jxsml__free_entropy_code(out);
+	jxsml__free_code_spec(spec);
 	return st->err;
 }
 
 int jxsml__entropy_code_cluster(
 	jxsml__st *st, int use_prefix_code, int32_t log_alphabet_size,
-	jxsml__entropy_code_cluster_t *cluster, uint32_t *ans_state
+	jxsml__code_cluster_t *cluster, uint32_t *ans_state
 ) {
 	if (use_prefix_code) {
 		return jxsml__prefix_code(st, cluster->prefix.fast_len, cluster->prefix.max_len, cluster->prefix.table);
@@ -1063,9 +1067,10 @@ int jxsml__entropy_code_cluster(
 }
 
 // aka DecodeHybridVarLenUint
-int jxsml__entropy_code(jxsml__st *st, int32_t ctx, int32_t dist_mult, jxsml__entropy_code_t *code) {
+int jxsml__code(jxsml__st *st, int32_t ctx, int32_t dist_mult, jxsml__code_t *code) {
+	const jxsml__code_spec_t *spec = code->spec;
 	int32_t token, distance, log_alphabet_size;
-	jxsml__entropy_code_cluster_t *cluster;
+	jxsml__code_cluster_t *cluster;
 	int use_prefix_code;
 
 	if (code->num_to_copy > 0) {
@@ -1075,15 +1080,15 @@ continue_lz77:
 	}
 
 #ifdef JXSML_DEBUG
-	if (ctx >= code->num_dist) return JXSML__ERR("!exp"), 0;
+	if (ctx >= spec->num_dist) return JXSML__ERR("!exp"), 0;
 #endif
-	use_prefix_code = code->use_prefix_code;
-	log_alphabet_size = code->log_alphabet_size;
-	cluster = &code->clusters[code->cluster_map[ctx]];
+	use_prefix_code = spec->use_prefix_code;
+	log_alphabet_size = spec->log_alphabet_size;
+	cluster = &spec->clusters[spec->cluster_map[ctx]];
 	token = jxsml__entropy_code_cluster(st, use_prefix_code, log_alphabet_size, cluster, &code->ans_state);
-	if (token >= code->min_symbol) { // this is large enough if lz77_enabled is false
-		jxsml__entropy_code_cluster_t *lz_cluster = &code->clusters[code->cluster_map[code->num_dist - 1]];
-		code->num_to_copy = jxsml__hybrid_int(st, token - code->min_symbol, code->lz_len_config) + code->min_length;
+	if (token >= spec->min_symbol) { // this is large enough if lz77_enabled is false
+		jxsml__code_cluster_t *lz_cluster = &spec->clusters[spec->cluster_map[spec->num_dist - 1]];
+		code->num_to_copy = jxsml__hybrid_int(st, token - spec->min_symbol, spec->lz_len_config) + spec->min_length;
 		token = jxsml__entropy_code_cluster(st, use_prefix_code, log_alphabet_size, lz_cluster, &code->ans_state);
 		distance = jxsml__hybrid_int(st, token, lz_cluster->config);
 		if (st->err) return 0;
@@ -1115,40 +1120,50 @@ continue_lz77:
 
 	token = jxsml__hybrid_int(st, token, cluster->config);
 	if (st->err) return 0;
-	if (code->lz77_enabled) code->window[code->num_decoded++ & 0xfffff] = token;
+	if (spec->lz77_enabled) {
+		if (!code->window) { // XXX should be dynamically resized
+			code->window = malloc(sizeof(int32_t) << 20);
+			if (!code->window) return JXSML__ERR("!mem"), 0;
+		}
+		code->window[code->num_decoded++ & 0xfffff] = token;
+	}
 	return token;
 }
 
-void jxsml__free_entropy_code(jxsml__entropy_code_t *code) {
-	int32_t i;
-	if (code->clusters) {
-		for (i = 0; i < code->num_clusters; ++i) {
-			if (code->use_prefix_code) {
-				free(code->clusters[i].prefix.table);
-			} else {
-				free(code->clusters[i].ans.D);
-				free(code->clusters[i].ans.aliases);
-			}
-		}
-		free(code->clusters);
-		code->clusters = NULL;
-	}
+void jxsml__free_code(jxsml__code_t *code) {
 	free(code->window);
-	free(code->cluster_map);
 	code->window = NULL;
-	code->cluster_map = NULL;
+	code->window_cap = 0;
 }
 
-int jxsml__finish_entropy_code(jxsml__st *st, jxsml__entropy_code_t *code) {
-	if (!code->use_prefix_code) JXSML__SHOULD(code->ans_state == JXSML__ANS_INIT_STATE, "ans?");
-	if (code->lz77_enabled) JXSML__SHOULD(code->num_to_copy == 0, "lz7?");
+int jxsml__finish_and_free_code(jxsml__st *st, jxsml__code_t *code) {
+	if (!code->spec->use_prefix_code) JXSML__SHOULD(code->ans_state == JXSML__ANS_INIT_STATE, "ans?");
+	if (code->spec->lz77_enabled) JXSML__SHOULD(code->num_to_copy == 0, "lz7?");
 error:
-	jxsml__free_entropy_code(code);
+	jxsml__free_code(code);
 	return st->err;
 }
 
+void jxsml__free_code_spec(jxsml__code_spec_t *spec) {
+	int32_t i;
+	if (spec->clusters) {
+		for (i = 0; i < spec->num_clusters; ++i) {
+			if (spec->use_prefix_code) {
+				free(spec->clusters[i].prefix.table);
+			} else {
+				free(spec->clusters[i].ans.D);
+				free(spec->clusters[i].ans.aliases);
+			}
+		}
+		free(spec->clusters);
+		spec->clusters = NULL;
+	}
+	free(spec->cluster_map);
+	spec->cluster_map = NULL;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
-// image header
+// image header & metadata
 
 int jxsml__size_header(jxsml__st *st, int32_t *outw, int32_t *outh) {
 	int32_t div8 = jxsml__u(st, 1);
@@ -1219,16 +1234,153 @@ error:
 	return st->err;
 }
 
+int jxsml__image_metadata(jxsml__st *st) {
+	static const float SRGB_CHROMA[4][2] = { // default chromacity (kD65, kSRGB)
+		{0.3127f, 0.3290f}, {0.639998686f, 0.330010138f},
+		{0.300003784f, 0.600003357f}, {0.150002046f, 0.059997204f},
+	};
+
+	int32_t i, j;
+
+	st->out->orientation = JXSML_ORIENT_TL;
+	st->out->intr_width = 0;
+	st->out->intr_height = 0;
+	st->out->bpp = 8;
+	st->out->exp_bits = 0;
+	st->out->anim_tps_num = 0;
+	st->out->anim_tps_denom = 0;
+	st->out->anim_nloops = 0;
+	st->out->anim_have_timecodes = 0;
+	st->out->icc = NULL;
+	st->out->iccsize = 0;
+	st->out->cspace = JXSML_CS_CHROMA;
+	memcpy(st->out->cpoints, SRGB_CHROMA, sizeof SRGB_CHROMA);
+	st->out->gamma_or_tf = JXSML_TF_SRGB;
+	st->out->render_intent = JXSML_INTENT_REL;
+	if (!jxsml__u(st, 1)) { // !all_default
+		int32_t extra_fields = jxsml__u(st, 1);
+		if (extra_fields) {
+			st->out->orientation = jxsml__u(st, 3) + 1;
+			if (jxsml__u(st, 1)) { // have_intr_size
+				JXSML__TRY(jxsml__size_header(st, &st->out->intr_width, &st->out->intr_height));
+			}
+			if (jxsml__u(st, 1)) { // have_preview
+				JXSML__RAISE("TODO: preview");
+			}
+			if (jxsml__u(st, 1)) { // have_animation
+				st->out->anim_tps_num = jxsml__u32(st, 100, 0, 1000, 0, 1, 10, 1, 30);
+				st->out->anim_tps_denom = jxsml__u32(st, 1, 0, 1001, 0, 1, 8, 1, 10);
+				st->out->anim_nloops = jxsml__u32(st, 0, 0, 0, 3, 0, 16, 0, 32);
+				st->out->anim_have_timecodes = jxsml__u(st, 1);
+			}
+		}
+		JXSML__TRY(jxsml__bit_depth(st, &st->out->bpp, &st->out->exp_bits));
+		st->modular_16bit_buffers = jxsml__u(st, 1);
+		st->num_extra_channels = jxsml__u32(st, 0, 0, 1, 0, 2, 4, 1, 12);
+		for (i = 0; i < st->num_extra_channels; ++i) {
+			JXSML__RAISE("TODO: ec_info");
+		}
+		st->xyb_encoded = jxsml__u(st, 1);
+		if (!jxsml__u(st, 1)) { // ColourEncoding.all_default
+			enum { CS_RGB = 0, CS_GREY = 1, CS_XYB = 2, CS_UNKNOWN = 3 } cspace;
+			enum { WP_D65 = 1, WP_CUSTOM = 2, WP_E = 10, WP_DCI = 11 };
+			enum { PR_SRGB = 1, PR_CUSTOM = 2, PR_2100 = 9, PR_P3 = 11 };
+			st->want_icc = jxsml__u(st, 1);
+			cspace = jxsml__enum(st);
+			switch (cspace) {
+			case CS_RGB: case CS_UNKNOWN: st->out->cspace = JXSML_CS_CHROMA; break;
+			case CS_GREY: st->out->cspace = JXSML_CS_GREY; break;
+			case CS_XYB: st->out->cspace = JXSML_CS_XYB; break;
+			default: JXSML__RAISE("csp?");
+			}
+			// TODO: should verify cspace grayness with ICC grayness
+			if (!st->want_icc) {
+				if (cspace != CS_XYB) {
+					static const float E[2] = {1/3.f, 1/3.f}, DCI[2] = {0.314f, 0.351f},
+						BT2100[3][2] = {{0.708f, 0.292f}, {0.170f, 0.797f}, {0.131f, 0.046f}},
+						P3[3][2] = {{0.680f, 0.320f}, {0.265f, 0.690f}, {0.150f, 0.060f}};
+					switch (jxsml__enum(st)) {
+					case WP_D65: break; // default
+					case WP_CUSTOM: JXSML__TRY(jxsml__customxy(st, st->out->cpoints[JXSML_CHROMA_WHITE])); break;
+					case WP_E: memcpy(st->out->cpoints + JXSML_CHROMA_WHITE, E, sizeof E); break;
+					case WP_DCI: memcpy(st->out->cpoints + JXSML_CHROMA_WHITE, DCI, sizeof DCI); break;
+					default: JXSML__RAISE("wpt?");
+					}
+					if (cspace != CS_GREY) {
+						switch (jxsml__enum(st)) {
+						case PR_SRGB: break; // default
+						case PR_CUSTOM:
+							JXSML__TRY(jxsml__customxy(st, st->out->cpoints[JXSML_CHROMA_RED]));
+							JXSML__TRY(jxsml__customxy(st, st->out->cpoints[JXSML_CHROMA_GREEN]));
+							JXSML__TRY(jxsml__customxy(st, st->out->cpoints[JXSML_CHROMA_BLUE]));
+							break;
+						case PR_2100: memcpy(st->out->cpoints + JXSML_CHROMA_RED, BT2100, sizeof BT2100); break;
+						case PR_P3: memcpy(st->out->cpoints + JXSML_CHROMA_RED, P3, sizeof P3); break;
+						default: JXSML__RAISE("prm?");
+						}
+					}
+				}
+				if (jxsml__u(st, 1)) { // have_gamma
+					st->out->gamma_or_tf = jxsml__u(st, 24);
+					JXSML__SHOULD(st->out->gamma_or_tf > 0 && st->out->gamma_or_tf <= JXSML_GAMMA_MAX, "gama");
+					if (cspace == CS_XYB) JXSML__SHOULD(st->out->gamma_or_tf == 3333333, "gama");
+				} else {
+					st->out->gamma_or_tf = -jxsml__enum(st);
+					JXSML__SHOULD((
+						1 << -JXSML_TF_709 | 1 << -JXSML_TF_UNKNOWN | 1 << -JXSML_TF_LINEAR |
+						1 << -JXSML_TF_SRGB | 1 << -JXSML_TF_PQ | 1 << -JXSML_TF_DCI |
+						1 << -JXSML_TF_HLG
+					) >> -st->out->gamma_or_tf & 1, "tfn?");
+				}
+				st->out->render_intent = jxsml__enum(st);
+				JXSML__SHOULD((
+					1 << JXSML_INTENT_PERC | 1 << JXSML_INTENT_REL |
+					1 << JXSML_INTENT_SAT | 1 << JXSML_INTENT_ABS
+				) >> st->out->render_intent & 1, "itt?");
+			}
+		}
+		if (extra_fields) {
+			JXSML__RAISE("TODO: tone_mapping");
+		}
+		JXSML__TRY(jxsml__extensions(st));
+	}
+	if (!jxsml__u(st, 1)) { // !default_m
+		int32_t cw_mask;
+		if (st->xyb_encoded) {
+			for (i = 0; i < 3; ++i) for (j = 0; j < 3; ++j) st->opsin_inv_mat[i][j] = jxsml__f16(st);
+			for (i = 0; i < 3; ++i) st->opsin_bias[i] = jxsml__f16(st);
+			for (i = 0; i < 3; ++i) st->quant_bias[i] = jxsml__f16(st);
+			st->quant_bias_num = jxsml__f16(st);
+		}
+		cw_mask = jxsml__u(st, 3);
+		if (cw_mask & 1) {
+			JXSML__RAISE("TODO: up2_weight");
+		}
+		if (cw_mask & 2) {
+			JXSML__RAISE("TODO: up4_weight");
+		}
+		if (cw_mask & 4) {
+			JXSML__RAISE("TODO: up8_weight");
+		}
+	}
+	JXSML__RAISE_DELAYED();
+	return 0;
+
+error:
+	return st->err;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // ICC
 
 int jxsml__icc(jxsml__st *st) {
 	size_t enc_size, index;
-	jxsml__entropy_code_t ec = {0};
+	jxsml__code_spec_t codespec = {0};
+	jxsml__code_t code = { .spec = &codespec };
 	int32_t byte = 0, prev = 0, pprev = 0, ctx;
 
 	enc_size = jxsml__u64(st);
-	JXSML__TRY(jxsml__init_entropy_code(st, 41, &ec));
+	JXSML__TRY(jxsml__code_spec(st, 41, &codespec));
 
 	for (index = 0; index < enc_size; ++index) {
 		pprev = prev;
@@ -1246,12 +1398,13 @@ int jxsml__icc(jxsml__st *st) {
 			else if (pprev == 44 || pprev == 46 || (48 <= pprev && pprev < 58)) ctx += 1 * 8;
 			else ctx += 4 * 8;
 		}
-		byte = jxsml__entropy_code(st, ctx, 0, &ec);
+		byte = jxsml__code(st, ctx, 0, &code);
 		//fprintf(stderr, "%zd/%zd: %zd ctx=%d byte=%#x %c\n", index, enc_size, st->bits_read, ctx, (int)byte, 0x20 <= byte && byte < 0x7f ? byte : ' ');
 		JXSML__RAISE_DELAYED();
 		// TODO actually interpret them
 	}
-	JXSML__TRY(jxsml__finish_entropy_code(st, &ec));
+	JXSML__TRY(jxsml__finish_and_free_code(st, &code));
+	jxsml__free_code_spec(&codespec);
 
 	//size_t output_size = jxsml__varint(st);
 	//size_t commands_size = jxsml__varint(st);
@@ -1287,7 +1440,8 @@ int jxsml__icc(jxsml__st *st) {
 	return 0;
 
 error:
-	jxsml__free_entropy_code(&ec);
+	jxsml__free_code(&code);
+	jxsml__free_code_spec(&codespec);
 	return st->err;
 }
 
@@ -1309,45 +1463,48 @@ typedef union {
 	} leaf;
 } jxsml__ma_tree_t;
 
-int jxsml__ma_tree(jxsml__st *st, jxsml__ma_tree_t **tree, jxsml__entropy_code_t *code) {
+int jxsml__ma_tree(jxsml__st *st, jxsml__ma_tree_t **tree, jxsml__code_spec_t *codespec) {
+	jxsml__code_t code = { .spec = codespec };
 	jxsml__ma_tree_t *t = NULL;
 	int32_t tree_idx = 0, tree_cap = 8;
 	int32_t ctx_id = 0, nodes_left = 1;
 
-	JXSML__TRY(jxsml__init_entropy_code(st, 6, code));
+	JXSML__TRY(jxsml__code_spec(st, 6, codespec));
 	JXSML__SHOULD(t = malloc(sizeof(jxsml__ma_tree_t) * (size_t) tree_cap), "!mem");
 	while (nodes_left-- > 0) { // depth-first, left-to-right ordering
 		jxsml__ma_tree_t *n;
-		int32_t prop = jxsml__entropy_code(st, 1, 0, code), val, shift;
+		int32_t prop = jxsml__code(st, 1, 0, &code), val, shift;
 		JXSML__TRY_REALLOC(&t, sizeof(jxsml__ma_tree_t), tree_idx + 1, &tree_cap);
 		n = &t[tree_idx++];
 		if (prop > 0) {
 			n->branch.prop = -prop;
-			val = jxsml__entropy_code(st, 0, 0, code);
+			val = jxsml__code(st, 0, 0, &code);
 			n->branch.value = JXSML__TO_SIGNED(val);
 			n->branch.leftoff = ++nodes_left;
 			n->branch.rightoff = ++nodes_left;
 		} else {
 			n->leaf.ctx = ctx_id++;
-			n->leaf.predictor = jxsml__entropy_code(st, 2, 0, code);
+			n->leaf.predictor = jxsml__code(st, 2, 0, &code);
 			JXSML__SHOULD(n->leaf.predictor < JXSML__NUM_PRED, "tree");
-			val = jxsml__entropy_code(st, 3, 0, code);
+			val = jxsml__code(st, 3, 0, &code);
 			n->leaf.offset = JXSML__TO_SIGNED(val);
-			shift = jxsml__entropy_code(st, 4, 0, code);
-			val = jxsml__entropy_code(st, 5, 0, code);
+			shift = jxsml__code(st, 4, 0, &code);
+			val = jxsml__code(st, 5, 0, &code);
 			n->leaf.multiplier = (val + 1) << shift; // TODO overflow check
 		}
 		JXSML__SHOULD(tree_idx + nodes_left <= (1 << 26), "tree");
 	}
-	JXSML__TRY(jxsml__finish_entropy_code(st, code));
-	memset(code, 0, sizeof(*code));
-	JXSML__TRY(jxsml__init_entropy_code(st, ctx_id, code));
+	JXSML__TRY(jxsml__finish_and_free_code(st, &code));
+	jxsml__free_code_spec(codespec);
+	memset(codespec, 0, sizeof(*codespec)); // XXX is it required?
+	JXSML__TRY(jxsml__code_spec(st, ctx_id, codespec));
 	*tree = t;
 	return 0;
 
 error:
 	free(t);
-	jxsml__free_entropy_code(code);
+	jxsml__free_code(&code);
+	jxsml__free_code_spec(codespec);
 	return st->err;
 }
 
@@ -1388,17 +1545,21 @@ typedef struct {
 	int32_t nb_transforms;
 	jxsml__transform_t *transform;
 	jxsml__ma_tree_t *tree; // owned only if use_global_tree is false
-	jxsml__entropy_code_t tree_code;
+	jxsml__code_spec_t codespec;
+	jxsml__code_t code;
 	int32_t num_channels, nb_meta_channels;
 	jxsml__modular_channel_t *channel;
 	int32_t max_width; // aka dist_multiplier, excludes meta channels
 } jxsml__modular_t;
 
+void jxsml__free_modular(jxsml__modular_t *);
+
 void jxsml__init_modular_common(jxsml__modular_t *m) {
 	m->transform = NULL;
 	m->tree = NULL;
-	memset(&m->tree_code, 0, sizeof(jxsml__entropy_code_t));
-	m->max_width = 0;
+	memset(&m->codespec, 0, sizeof(jxsml__code_spec_t));
+	memset(&m->code, 0, sizeof(jxsml__code_t));
+	m->code.spec = &m->codespec;
 }
 
 int jxsml__init_modular_for_global(
@@ -1423,7 +1584,7 @@ error:
 }
 
 int jxsml__init_modular_for_pass_group(
-	jxsml__st *st, int32_t num_gm_channels, int32_t gy, int32_t gx, int32_t group_size_shift,
+	jxsml__st *st, int32_t num_gm_channels, int32_t gy, int32_t gx, int32_t group_size,
 	int32_t minshift, int32_t maxshift, const jxsml__modular_t *gm, jxsml__modular_t *m
 ) {
 	int32_t i;
@@ -1437,11 +1598,10 @@ int jxsml__init_modular_for_pass_group(
 		if (gc->hshift < 3 || gc->vshift < 3) {
 			int32_t gx0, gx1, gy0, gy1;
 			JXSML__ASSERT(gc->hshift >= 0 && gc->vshift >= 0);
+			(void) minshift; (void) maxshift;
 			// TODO check minshift/maxshift!!!
-			gx0 = gx << group_size_shift >> gc->hshift;
-			gy0 = gy << group_size_shift >> gc->vshift;
-			gx1 = (gx + 1) << group_size_shift >> gc->hshift;
-			gy1 = (gy + 1) << group_size_shift >> gc->vshift;
+			gx0 = gx >> gc->hshift; gx1 = (gx + group_size) >> gc->hshift;
+			gy0 = gy >> gc->vshift; gy1 = (gy + group_size) >> gc->vshift;
 			if (gx0 > gc->width) gx0 = gc->width;
 			if (gx1 > gc->width) gx1 = gc->width;
 			if (gy0 > gc->height) gy0 = gc->height;
@@ -1457,8 +1617,49 @@ error:
 	return st->err;
 }
 
+int jxsml__combine_modular_from_pass_group(
+	jxsml__st *st, int32_t num_gm_channels, int32_t gy, int32_t gx,
+	int32_t minshift, int32_t maxshift, const jxsml__modular_t *gm, jxsml__modular_t *m
+) {
+	size_t pixel_size = st->modular_16bit_buffers ? sizeof(int16_t) : sizeof(int32_t);
+	int32_t gcidx, cidx, y, gx0, gy0;
+	for (gcidx = num_gm_channels, cidx = 0; gcidx < gm->num_channels; ++gcidx) {
+		jxsml__modular_channel_t *gc = &gm->channel[gcidx], *c = &m->channel[cidx];
+		if (gc->hshift < 3 || gc->vshift < 3) {
+			(void) minshift; (void) maxshift;
+			// TODO check minshift/maxshift!!!
+			JXSML__ASSERT(gc->hshift == c->hshift && gc->vshift == c->vshift);
+			gx0 = gx >> gc->hshift;
+			gy0 = gy >> gc->vshift;
+			JXSML__ASSERT(gx0 + c->width <= gc->width && gy0 + c->height <= gc->height);
+			for (y = 0; y < c->height; ++y) {
+				memcpy(
+					(char*) gc->pixels + pixel_size * (size_t) ((gy0 + y) * gc->width + gx0),
+					(char*) c->pixels + pixel_size * (size_t) (y * c->width),
+					pixel_size * (size_t) c->width);
+			}
+			fprintf(stderr, "combined channel %d with w=%d h=%d to channel %d with w=%d h=%d gx0=%d gy0=%d\n", cidx, c->width, c->height, gcidx, gc->width, gc->height, gx0, gy0);
+			++cidx;
+		}
+	}
+	JXSML__ASSERT(cidx == m->num_channels);
+error:
+	return st->err;
+}
+
+int jxsml__is_modular_channel_equal_sized(const jxsml__modular_t *m, int32_t begin, int32_t end) {
+	int32_t w, h;
+	if (begin >= end) return 0; // do not allow edge cases
+	w = m->channel[begin].width;
+	h = m->channel[begin].height;
+	while (++begin < end) {
+		if (w != m->channel[begin].width || h != m->channel[begin].height) return 0;
+	}
+	return 1;
+}
+
 int jxsml__modular_header(
-	jxsml__st *st, jxsml__ma_tree_t *global_tree, jxsml__entropy_code_t *global_tree_code,
+	jxsml__st *st, jxsml__ma_tree_t *global_tree, const jxsml__code_spec_t *global_codespec,
 	jxsml__modular_t *m
 ) {
 	jxsml__modular_channel_t *channel = m->channel;
@@ -1491,11 +1692,7 @@ int jxsml__modular_header(
 			JXSML__SHOULD(type < 42, "rctt");
 			JXSML__SHOULD(begin_c + 3 <= num_channels, "rctc");
 			JXSML__SHOULD(begin_c >= nb_meta_channels || begin_c + 3 <= nb_meta_channels, "rctc");
-			JXSML__SHOULD( // all input channels have the same dimensions
-				channel[begin_c].width == channel[begin_c + 1].width &&
-				channel[begin_c].width == channel[begin_c + 2].width &&
-				channel[begin_c].height == channel[begin_c + 1].height &&
-				channel[begin_c].height == channel[begin_c + 2].height, "rctd");
+			JXSML__SHOULD(jxsml__is_modular_channel_equal_sized(m, begin_c, begin_c + 3), "rtcd");
 			break;
 		}
 
@@ -1516,12 +1713,10 @@ int jxsml__modular_header(
 			} else { // num_c color channels -> 1 meta channel (palette) + 1 color channel (index)
 				nb_meta_channels += 1;
 			}
+			JXSML__SHOULD(jxsml__is_modular_channel_equal_sized(m, begin_c, end_c), "pald");
+			JXSML__TRY_REALLOC(&channel, sizeof(*channel), num_channels + 1 - num_c, &channel_cap);
 			input_width = channel[begin_c].width;
 			input_height = channel[begin_c].height;
-			for (j = begin_c + 1; j < end_c; ++j) { // all input channels have the same dimensions
-				JXSML__SHOULD(channel[j].width == input_width && channel[j].height == input_height, "pald");
-			}
-			JXSML__TRY_REALLOC(&channel, sizeof(*channel), num_channels + 1 - num_c, &channel_cap);
 			memmove(channel + 1, channel, sizeof(*channel) * (size_t) begin_c);
 			memmove(channel + begin_c + 1, channel + end_c, sizeof(*channel) * (size_t) (num_channels - end_c));
 			channel[0].width = nb_colours;
@@ -1564,15 +1759,16 @@ int jxsml__modular_header(
 	}
 	if (m->use_global_tree) {
 		m->tree = global_tree;
-		memcpy(&m->tree_code, global_tree_code, sizeof(jxsml__entropy_code_t));
+		memcpy(&m->codespec, global_codespec, sizeof(jxsml__code_spec_t));
 	} else {
-		JXSML__TRY(jxsml__ma_tree(st, &m->tree, &m->tree_code));
+		JXSML__TRY(jxsml__ma_tree(st, &m->tree, &m->codespec));
 	}
 
 	m->channel = channel;
 	m->num_channels = num_channels;
 	m->nb_meta_channels = nb_meta_channels;
-	for (i = 0; i < m->num_channels; ++i) {
+	m->max_width = 0;
+	for (i = 0; i < num_channels; ++i) {
 		channel[i].pixels = NULL;
 		if (i >= nb_meta_channels && m->max_width < channel[i].width) m->max_width = channel[i].width;
 	}
@@ -1582,11 +1778,22 @@ error:
 	free(m->transform);
 	if (!m->use_global_tree) {
 		free(m->tree);
-		jxsml__free_entropy_code(&m->tree_code);
+		jxsml__free_code_spec(&m->codespec);
 	}
 	m->transform = NULL;
 	m->tree = NULL;
-	memset(&m->tree_code, 0, sizeof(jxsml__entropy_code_t));
+	memset(&m->codespec, 0, sizeof(jxsml__code_spec_t));
+	return st->err;
+}
+
+int jxsml__allocate_modular(jxsml__st *st, jxsml__modular_t *m) {
+	size_t pixel_size = st->modular_16bit_buffers ? sizeof(int16_t) : sizeof(int32_t);
+	int32_t i;
+	for (i = 0; i < m->num_channels; ++i) {
+		jxsml__modular_channel_t *c = &m->channel[i];
+		JXSML__SHOULD(c->pixels = malloc(pixel_size * (size_t) (c->width * c->height)), "!mem");
+	}
+error:
 	return st->err;
 }
 
@@ -1602,21 +1809,22 @@ int32_t jxsml__gradient32(int32_t w, int32_t n, int32_t nw) {
 	return g;
 }
 
-// TODO also implement jxsml__modular_channel32
 int jxsml__modular_channel16(jxsml__st *st, jxsml__modular_t *m, int32_t cidx, int32_t sidx) {
+	typedef int16_t stored_pixel_t;
 	typedef int32_t pixel_t;
 
 	jxsml__modular_channel_t *c = &m->channel[cidx];
-	int16_t *pixels;
 	int32_t width = c->width, height = c->height;
-	int32_t y, x, i;
+	int32_t y, x;
 
 	JXSML__ASSERT(st->modular_16bit_buffers);
 	JXSML__ASSERT(m->tree); // caller should set this to the global tree if not given
-	JXSML__ASSERT(!c->pixels);
+	JXSML__ASSERT(c->pixels);
 
-	JXSML__SHOULD(pixels = c->pixels = malloc(sizeof(int16_t) * (size_t) (width * height)), "!mem");
 	for (y = 0; y < height; ++y) {
+		stored_pixel_t *nnline = (stored_pixel_t*) c->pixels + (y - 2) * c->width;
+		stored_pixel_t *nline = (stored_pixel_t*) c->pixels + (y - 1) * c->width;
+		stored_pixel_t *line = (stored_pixel_t*) c->pixels + y * c->width;
 		pixel_t pnn;
 		pixel_t pnww, pnw, pn, pne, pnee;
 		pixel_t pww, pw;
@@ -1625,20 +1833,32 @@ int jxsml__modular_channel16(jxsml__st *st, jxsml__modular_t *m, int32_t cidx, i
 			jxsml__ma_tree_t *n = m->tree;
 			pixel_t val;
 
+			/*            NN
+			 *             |
+			 *             v
+			 * NWW  NW   _ N <- NE <- NEE
+			 *  |    |   /|
+			 *  v    v |/ 
+			 * WW -> W  `  C
+			 *
+			 * A -> B means that if A doesn't exist B is used instead.
+			 * if the pixel at the end of this chain doesn't exist as well, 0 is used.
+			 */
+
 			// TODO really have to optimize this
-			pw = x > 0 ? pixels[y * c->width + (x - 1)] : y > 0 ? pixels[(y - 1) * c->width + x] : 0;
-			pn = y > 0 ? pixels[(y - 1) * c->width + x] : pw;
-			pnw = x > 0 && y > 0 ? pixels[(y - 1) * c->width + (x - 1)] : pw;
-			pne = x + 1 < c->width && y > 0 ? pixels[(y - 1) * c->width + (x + 1)] : pn;
-			pnn = y > 1 ? pixels[(y - 2) * c->width + x] : pn;
-			pnee = x + 1 < c->width && y > 0 ? pixels[(y - 1) * c->width + (x + 2)] : pne;
-			pww = x > 1 ? pixels[y * c->width + (x - 2)] : pw;
-			pnww = x > 1 && y > 0 ? pixels[(y - 1) * c->width + (x - 2)] : pww; // TODO verify
+			pw = x > 0 ? line[x - 1] : y > 0 ? nline[x] : 0;
+			pn = y > 0 ? nline[x] : pw;
+			pnw = x > 0 && y > 0 ? nline[x - 1] : pw;
+			pne = x + 1 < c->width && y > 0 ? nline[x + 1] : pn;
+			pnn = y > 1 ? nnline[x] : pn;
+			pnee = x + 1 < c->width && y > 0 ? nline[x + 2] : pne;
+			pww = x > 1 ? line[x - 2] : pw;
+			pnww = x > 1 && y > 0 ? nline[x - 2] : pww;
 
 			while (n->branch.prop < 0) {
 				int32_t refcidx;
 				jxsml__modular_channel_t *refc;
-				int16_t *refpixels;
+				stored_pixel_t *refpixels;
 
 				switch (~n->branch.prop) {
 				case 0: val = cidx; break;
@@ -1656,7 +1876,7 @@ int jxsml__modular_channel16(jxsml__st *st, jxsml__modular_t *m, int32_t cidx, i
 				case 12: val = pn - pne; break;
 				case 13: val = pn - pnn; break;
 				case 14: val = pw - pww; break;
-				case 15: fprintf(stderr, "(%d,%d)", x,y); val=0; break;//JXSML__RAISE("TODO: max_error"); break;
+				case 15: JXSML__RAISE("TODO: max_error"); break;
 				default:
 					refcidx = cidx - (~n->branch.prop - 16) / 4 - 1;
 					JXSML__SHOULD(refcidx >= 0, "trec");
@@ -1677,7 +1897,7 @@ int jxsml__modular_channel16(jxsml__st *st, jxsml__modular_t *m, int32_t cidx, i
 				n += val > n->branch.value ? n->branch.leftoff : n->branch.rightoff;
 			}
 
-			val = jxsml__entropy_code(st, n->leaf.ctx, n->leaf.multiplier, &m->tree_code);
+			val = jxsml__code(st, n->leaf.ctx, n->leaf.multiplier, &m->code);
 			val = JXSML__TO_SIGNED(val) + n->leaf.offset;
 			switch (n->leaf.predictor) {
 			case 0: break;
@@ -1686,7 +1906,7 @@ int jxsml__modular_channel16(jxsml__st *st, jxsml__modular_t *m, int32_t cidx, i
 			case 3: val += (pw + pn) / 2; break;
 			case 4: val += (pn > pnw ? pn - pnw : pnw - pn) < (pw > pnw ? pw - pnw : pnw - pw) ? pw : pn; break;
 			case 5: val += jxsml__gradient32(pw, pn, pnw); break;
-			case 6: fprintf(stderr, "{%d,%d}", x,y);break;// JXSML__RAISE("TODO: self-correcting predictor"); break;
+			case 6: JXSML__RAISE("TODO: self-correcting predictor"); break;
 			case 7: val += pne; break;
 			case 8: val += pnw; break;
 			case 9: val += pww; break;
@@ -1698,23 +1918,123 @@ int jxsml__modular_channel16(jxsml__st *st, jxsml__modular_t *m, int32_t cidx, i
 			}
 
 			JXSML__SHOULD(INT16_MIN <= val && val <= INT16_MAX, "povf");
-			pixels[y * c->width + x] = (int16_t) val;
+			line[x] = (stored_pixel_t) val;
 		}
 	}
 
 	return 0;
 
 error:
-	free(pixels);
+	free(c->pixels);
 	c->pixels = NULL;
 	return st->err;
 }
 
+int jxsml__modular_channel(jxsml__st *st, jxsml__modular_t *m, int32_t cidx, int32_t sidx) {
+	if (st->modular_16bit_buffers) {
+		return jxsml__modular_channel16(st, m, cidx, sidx);
+	} else {
+		return JXSML__ERR("TODO: jxsml__modular_channel32");
+	}
+}
+
+int jxsml__finish_modular16(jxsml__st *st, jxsml__modular_t *m) {
+	typedef int16_t stored_pixel_t;
+	typedef int32_t pixel_t;
+
+	int32_t i, j, k;
+
+	JXSML__TRY(jxsml__finish_and_free_code(st, &m->code));
+
+	for (i = m->nb_transforms - 1; i >= 0; --i) {
+		jxsml__transform_t *tr = &m->transform[i];
+
+		switch (tr->tr) {
+		case JXSML__TR_RCT: {
+			static const uint8_t PERMUTATIONS[6][3] = {{0,1,2},{1,2,0},{2,0,1},{0,2,1},{1,0,2},{2,1,0}};
+			stored_pixel_t *p[3];
+			int32_t begin_c = tr->rct.begin_c, npixels;
+			// TODO use stored_pixel_t for intermediate results as well, for increased throughput
+
+			JXSML__ASSERT(jxsml__is_modular_channel_equal_sized(m, begin_c, begin_c + 3));
+			npixels = m->channel[begin_c].width * m->channel[begin_c].height;
+			for (j = 0; j < 3; ++j) p[j] = m->channel[begin_c + j].pixels;
+			switch (tr->rct.type % 7) {
+			case 0: break;
+			case 1:
+				for (j = 0; j < npixels; ++j) p[2][j] = (stored_pixel_t) (p[2][j] + p[0][j]);
+				break;
+			case 2:
+				for (j = 0; j < npixels; ++j) p[1][j] = (stored_pixel_t) (p[1][j] + p[0][j]);
+				break;
+			case 3:
+				for (j = 0; j < npixels; ++j) {
+					p[1][j] = (stored_pixel_t) (p[1][j] + p[0][j]);
+					p[2][j] = (stored_pixel_t) (p[2][j] + p[0][j]);
+				}
+				break;
+			case 4:
+				for (j = 0; j < npixels; ++j) {
+					p[1][j] = (stored_pixel_t) ((pixel_t) p[1][j] + (((pixel_t) p[0][j] + (pixel_t) p[2][j]) >> 1));
+				}
+				break;
+			case 5:
+				for (j = 0; j < npixels; ++j) {
+					p[1][j] = (stored_pixel_t) ((pixel_t) p[1][j] + (((pixel_t) p[0][j] + (pixel_t) p[2][j]) >> 1));
+					p[2][j] = (stored_pixel_t) (p[2][j] + p[0][j]);
+				}
+				break;
+			case 6: // YCgCo
+				for (j = 0; j < npixels; ++j) {
+					pixel_t tmp = (pixel_t) p[0][j] - ((pixel_t) p[2][j] >> 1);
+					pixel_t p1 = (pixel_t) p[2][j] + tmp;
+					pixel_t p2 = tmp - ((pixel_t) p[1][j] >> 1);
+					p[0][j] = (stored_pixel_t) (p2 + (pixel_t) p[1][j]);
+					p[1][j] = (stored_pixel_t) p1;
+					p[2][j] = (stored_pixel_t) p2;
+				}
+				break;
+			default: JXSML__UNREACHABLE();
+			}
+			for (j = 0; j < 3; ++j) {
+				m->channel[begin_c + (int32_t) PERMUTATIONS[tr->rct.type / 7][j]].pixels = p[j];
+			}
+			// TODO detect overflow
+			break;
+		}
+
+		case JXSML__TR_PALETTE: {
+			JXSML__RAISE("TODO: palette inverse transformation");
+			break;
+		}
+
+		case JXSML__TR_SQUEEZE: {
+			JXSML__RAISE("TODO: squeeze inverse transformation");
+			break;
+		}
+
+		default: JXSML__UNREACHABLE();
+		}
+	}
+
+error:
+	return st->err;
+}
+
+int jxsml__finish_modular(jxsml__st *st, jxsml__modular_t *m) {
+	if (st->modular_16bit_buffers) {
+		return jxsml__finish_modular16(st, m);
+	} else {
+		return JXSML__ERR("TODO: jxsml__finish_modular32");
+	}
+}
+
 void jxsml__free_modular(jxsml__modular_t *m) {
 	int32_t i;
-	if (m->use_global_tree) {
+	jxsml__free_code(&m->code);
+	if (!m->use_global_tree) {
 		free(m->tree);
-		jxsml__free_entropy_code(&m->tree_code);
+		jxsml__free_code_spec(&m->codespec);
 	}
 	for (i = 0; i < m->num_channels; ++i) {
 		free(m->channel[i].pixels);
@@ -1723,7 +2043,7 @@ void jxsml__free_modular(jxsml__modular_t *m) {
 	free(m->channel);
 	m->use_global_tree = 0;
 	m->tree = NULL;
-	memset(&m->tree_code, 0, sizeof(jxsml__entropy_code));
+	memset(&m->codespec, 0, sizeof(jxsml__code_spec_t));
 	m->transform = NULL;
 	m->num_channels = 0;
 	m->channel = NULL;
@@ -1775,7 +2095,7 @@ typedef struct {
 	} epf;
 	float m_lf_unscaled[3 /*xyb*/];
 	jxsml__ma_tree_t *global_tree;
-	jxsml__entropy_code_t global_tree_code;
+	jxsml__code_spec_t global_codespec;
 
 	jxsml__modular_t modular;
 } jxsml__frame_t;
@@ -1832,12 +2152,12 @@ int jxsml__frame(jxsml__st *st, jxsml__frame_t *f) {
 	f->m_lf_unscaled[1] = 512.0f;
 	f->m_lf_unscaled[2] = 256.0f;
 	f->global_tree = NULL;
-	memset(&f->global_tree_code, 0, sizeof(jxsml__entropy_code_t));
+	memset(&f->global_codespec, 0, sizeof(jxsml__code_spec_t));
 	memset(&f->modular, 0, sizeof(jxsml__modular_t));
 	full_frame = 1;
 
 	JXSML__TRY(jxsml__zero_pad_to_byte(st));
-	fprintf(stderr, "frame starts at %zd\n", st->bits_read);
+	fprintf(stderr, "frame starts at %d\n", (int32_t) st->bits_read);
 
 	// FrameHeader
 	if (!jxsml__u(st, 1)) { // !all_default
@@ -1985,19 +2305,21 @@ int jxsml__frame(jxsml__st *st, jxsml__frame_t *f) {
 		fprintf(stderr, "toc size = %d\n", size);
 		if (permuted) {
 			int32_t end, lehmer[/*????*/1000];
-			jxsml__entropy_code_t ec;
-			JXSML__TRY(jxsml__init_entropy_code(st, 8, &ec));
+			jxsml__code_spec_t codespec;
+			jxsml__code_t code = { .spec = &codespec };
+			JXSML__TRY(jxsml__code_spec(st, 8, &codespec));
 #define jxsml__toc_context(s) ((s) < 64 ? 32 - __builtin_clz((unsigned) (s) + 1) : 7)
-			end = jxsml__entropy_code(st, jxsml__toc_context(size), 0, &ec);
+			end = jxsml__code(st, jxsml__toc_context(size), 0, &code);
 			// TODO end should be somehow bounded
 			for (i = 0; i < end; ++i) {
-				lehmer[i] = jxsml__entropy_code(st, i > 0 ? jxsml__toc_context(lehmer[i - 1]) : 0, 0, &ec);
+				lehmer[i] = jxsml__code(st, i > 0 ? jxsml__toc_context(lehmer[i - 1]) : 0, 0, &code);
 				fprintf(stderr, "lehmer[%d] = %d\n", i, lehmer[i]);
 			}
+			// TODO free codespec & code
 		}
 		JXSML__TRY(jxsml__zero_pad_to_byte(st));
 		for (i = 0; i < size; ++i) {
-			fprintf(stderr, "{%zd} ", st->bits_read);
+			fprintf(stderr, "{%d} ", (int32_t) st->bits_read);
 			toc[i] = jxsml__u32(st, 0, 10, 1024, 14, 17408, 22, 4211712, 30);
 			fprintf(stderr, "toc[%d] = %d", i, toc[i]);
 			j = i;
@@ -2017,7 +2339,7 @@ int jxsml__frame(jxsml__st *st, jxsml__frame_t *f) {
 		}
 		JXSML__TRY(jxsml__zero_pad_to_byte(st));
 	}
-	fprintf(stderr, "LfGlobal starts at %zd\n", st->bits_read);
+	fprintf(stderr, "LfGlobal starts at %d\n", (int32_t) st->bits_read);
 
 	// LfGlobal
 	{
@@ -2031,17 +2353,18 @@ int jxsml__frame(jxsml__st *st, jxsml__frame_t *f) {
 			JXSML__RAISE("TODO: VarDCT params in LfGlobal");
 		}
 		if (jxsml__u(st, 1)) { // global tree present
-			JXSML__TRY(jxsml__ma_tree(st, &f->global_tree, &f->global_tree_code));
+			JXSML__TRY(jxsml__ma_tree(st, &f->global_tree, &f->global_codespec));
 		}
 		JXSML__TRY(jxsml__init_modular_for_global(st, f->is_modular, f->do_ycbcr, f->width, f->height, &f->modular));
-		JXSML__TRY(jxsml__modular_header(st, f->global_tree, &f->global_tree_code, &f->modular));
+		JXSML__TRY(jxsml__modular_header(st, f->global_tree, &f->global_codespec, &f->modular));
+		JXSML__TRY(jxsml__allocate_modular(st, &f->modular));
 		if (f->width <= (1 << f->group_size_shift) && f->height <= (1 << f->group_size_shift)) {
 			num_gm_channels = f->modular.num_channels;
 		} else {
 			num_gm_channels = f->modular.nb_meta_channels;
 		}
 		for (i = 0; i < num_gm_channels; ++i) {
-			JXSML__TRY(jxsml__modular_channel16(st, &f->modular, i, 0));
+			JXSML__TRY(jxsml__modular_channel(st, &f->modular, i, 0));
 		}
 	}
 
@@ -2078,24 +2401,28 @@ int jxsml__frame(jxsml__st *st, jxsml__frame_t *f) {
 		sidx = 1 + 3 * num_lf_groups + /*TODO # dequant tables + */ i * num_groups;
 		for (gy = 0; gy < f->height; gy += 1 << f->group_size_shift) {
 			for (gx = 0; gx < f->width; gx += 1 << f->group_size_shift, ++sidx) {
+				fprintf(stderr, "pass %d gx %d gy %d\n", i, gx, gy);
 				JXSML__TRY(jxsml__zero_pad_to_byte(st));
 				if (!f->is_modular) {
 					JXSML__RAISE("TODO: HF coefficients in PassGroup");
 				}
 
 				JXSML__TRY(jxsml__init_modular_for_pass_group(
-					st, num_gm_channels, gy, gx, f->group_size_shift, 0, 3, &f->modular, &mgroup));
-				JXSML__TRY(jxsml__modular_header(st, f->global_tree, &f->global_tree_code, &mgroup));
-				for (i = 0; i < mgroup.num_channels; ++i) {
-					JXSML__TRY(jxsml__modular_channel16(st, &mgroup, i, sidx));
+					st, num_gm_channels, gy, gx, 1 << f->group_size_shift, 0, 3, &f->modular, &mgroup));
+				JXSML__TRY(jxsml__modular_header(st, f->global_tree, &f->global_codespec, &mgroup));
+				JXSML__TRY(jxsml__allocate_modular(st, &mgroup));
+				for (j = 0; j < mgroup.num_channels; ++j) {
+					JXSML__TRY(jxsml__modular_channel(st, &mgroup, j, sidx));
 				}
-
-				JXSML__RAISE("TODO: combine...");
+				JXSML__TRY(jxsml__finish_modular(st, &mgroup));
+				JXSML__TRY(jxsml__combine_modular_from_pass_group(
+					st, num_gm_channels, gy, gx, 0, 3, &f->modular, &mgroup));
+				jxsml__free_modular(&mgroup);
 			}
 		}
 	}
 
-	JXSML__RAISE("TODO: frame");
+	JXSML__TRY(jxsml__finish_modular(st, &f->modular));
 	return 0;
 
 error:
@@ -2105,147 +2432,21 @@ error:
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// image metadata
-
-int jxsml__image_metadata(jxsml__st *st) {
-	static const float SRGB_CHROMA[4][2] = { // default chromacity (kD65, kSRGB)
-		{0.3127f, 0.3290f}, {0.639998686f, 0.330010138f},
-		{0.300003784f, 0.600003357f}, {0.150002046f, 0.059997204f},
-	};
-
-	int32_t i, j;
-
-	st->out->orientation = JXSML_ORIENT_TL;
-	st->out->intr_width = 0;
-	st->out->intr_height = 0;
-	st->out->bpp = 8;
-	st->out->exp_bits = 0;
-	st->out->anim_tps_num = 0;
-	st->out->anim_tps_denom = 0;
-	st->out->anim_nloops = 0;
-	st->out->anim_have_timecodes = 0;
-	st->out->icc = NULL;
-	st->out->iccsize = 0;
-	st->out->cspace = JXSML_CS_CHROMA;
-	memcpy(st->out->cpoints, SRGB_CHROMA, sizeof SRGB_CHROMA);
-	st->out->gamma_or_tf = JXSML_TF_SRGB;
-	st->out->render_intent = JXSML_INTENT_REL;
-	if (!jxsml__u(st, 1)) { // !all_default
-		int32_t extra_fields = jxsml__u(st, 1);
-		if (extra_fields) {
-			st->out->orientation = jxsml__u(st, 3) + 1;
-			if (jxsml__u(st, 1)) { // have_intr_size
-				JXSML__TRY(jxsml__size_header(st, &st->out->intr_width, &st->out->intr_height));
-			}
-			if (jxsml__u(st, 1)) { // have_preview
-				JXSML__RAISE("TODO: preview");
-			}
-			if (jxsml__u(st, 1)) { // have_animation
-				st->out->anim_tps_num = jxsml__u32(st, 100, 0, 1000, 0, 1, 10, 1, 30);
-				st->out->anim_tps_denom = jxsml__u32(st, 1, 0, 1001, 0, 1, 8, 1, 10);
-				st->out->anim_nloops = jxsml__u32(st, 0, 0, 0, 3, 0, 16, 0, 32);
-				st->out->anim_have_timecodes = jxsml__u(st, 1);
-			}
-		}
-		JXSML__TRY(jxsml__bit_depth(st, &st->out->bpp, &st->out->exp_bits));
-		st->modular_16bit_buffers = jxsml__u(st, 1);
-		st->num_extra_channels = jxsml__u32(st, 0, 0, 1, 0, 2, 4, 1, 12);
-		for (i = 0; i < st->num_extra_channels; ++i) {
-			JXSML__RAISE("TODO: ec_info");
-		}
-		st->xyb_encoded = jxsml__u(st, 1);
-		if (!jxsml__u(st, 1)) { // ColourEncoding.all_default
-			enum { CS_RGB = 0, CS_GREY = 1, CS_XYB = 2, CS_UNKNOWN = 3 } cspace;
-			enum { WP_D65 = 1, WP_CUSTOM = 2, WP_E = 10, WP_DCI = 11 };
-			enum { PR_SRGB = 1, PR_CUSTOM = 2, PR_2100 = 9, PR_P3 = 11 };
-			st->want_icc = jxsml__u(st, 1);
-			cspace = jxsml__enum(st);
-			switch (cspace) {
-			case CS_RGB: case CS_UNKNOWN: st->out->cspace = JXSML_CS_CHROMA; break;
-			case CS_GREY: st->out->cspace = JXSML_CS_GREY; break;
-			case CS_XYB: st->out->cspace = JXSML_CS_XYB; break;
-			default: JXSML__RAISE("csp?");
-			}
-			// TODO: should verify cspace grayness with ICC grayness
-			if (!st->want_icc) {
-				if (cspace != CS_XYB) {
-					static const float E[2] = {1/3.f, 1/3.f}, DCI[2] = {0.314f, 0.351f},
-						BT2100[3][2] = {{0.708f, 0.292f}, {0.170f, 0.797f}, {0.131f, 0.046f}},
-						P3[3][2] = {{0.680f, 0.320f}, {0.265f, 0.690f}, {0.150f, 0.060f}};
-					switch (jxsml__enum(st)) {
-					case WP_D65: break; // default
-					case WP_CUSTOM: JXSML__TRY(jxsml__customxy(st, st->out->cpoints[JXSML_CHROMA_WHITE])); break;
-					case WP_E: memcpy(st->out->cpoints + JXSML_CHROMA_WHITE, E, sizeof E); break;
-					case WP_DCI: memcpy(st->out->cpoints + JXSML_CHROMA_WHITE, DCI, sizeof DCI); break;
-					default: JXSML__RAISE("wpt?");
-					}
-					if (cspace != CS_GREY) {
-						switch (jxsml__enum(st)) {
-						case PR_SRGB: break; // default
-						case PR_CUSTOM:
-							JXSML__TRY(jxsml__customxy(st, st->out->cpoints[JXSML_CHROMA_RED]));
-							JXSML__TRY(jxsml__customxy(st, st->out->cpoints[JXSML_CHROMA_GREEN]));
-							JXSML__TRY(jxsml__customxy(st, st->out->cpoints[JXSML_CHROMA_BLUE]));
-							break;
-						case PR_2100: memcpy(st->out->cpoints + JXSML_CHROMA_RED, BT2100, sizeof BT2100); break;
-						case PR_P3: memcpy(st->out->cpoints + JXSML_CHROMA_RED, P3, sizeof P3); break;
-						default: JXSML__RAISE("prm?");
-						}
-					}
-				}
-				if (jxsml__u(st, 1)) { // have_gamma
-					st->out->gamma_or_tf = jxsml__u(st, 24);
-					JXSML__SHOULD(st->out->gamma_or_tf > 0 && st->out->gamma_or_tf <= JXSML_GAMMA_MAX, "gama");
-					if (cspace == CS_XYB) JXSML__SHOULD(st->out->gamma_or_tf == 3333333, "gama");
-				} else {
-					st->out->gamma_or_tf = -jxsml__enum(st);
-					JXSML__SHOULD((
-						1 << -JXSML_TF_709 | 1 << -JXSML_TF_UNKNOWN | 1 << -JXSML_TF_LINEAR |
-						1 << -JXSML_TF_SRGB | 1 << -JXSML_TF_PQ | 1 << -JXSML_TF_DCI |
-						1 << -JXSML_TF_HLG
-					) >> -st->out->gamma_or_tf & 1, "tfn?");
-				}
-				st->out->render_intent = jxsml__enum(st);
-				JXSML__SHOULD((
-					1 << JXSML_INTENT_PERC | 1 << JXSML_INTENT_REL |
-					1 << JXSML_INTENT_SAT | 1 << JXSML_INTENT_ABS
-				) >> st->out->render_intent & 1, "itt?");
-			}
-		}
-		if (extra_fields) {
-			JXSML__RAISE("TODO: tone_mapping");
-		}
-		JXSML__TRY(jxsml__extensions(st));
-	}
-	if (!jxsml__u(st, 1)) { // !default_m
-		int32_t cw_mask;
-		if (st->xyb_encoded) {
-			for (i = 0; i < 3; ++i) for (j = 0; j < 3; ++j) st->opsin_inv_mat[i][j] = jxsml__f16(st);
-			for (i = 0; i < 3; ++i) st->opsin_bias[i] = jxsml__f16(st);
-			for (i = 0; i < 3; ++i) st->quant_bias[i] = jxsml__f16(st);
-			st->quant_bias_num = jxsml__f16(st);
-		}
-		cw_mask = jxsml__u(st, 3);
-		if (cw_mask & 1) {
-			JXSML__RAISE("TODO: up2_weight");
-		}
-		if (cw_mask & 2) {
-			JXSML__RAISE("TODO: up4_weight");
-		}
-		if (cw_mask & 4) {
-			JXSML__RAISE("TODO: up8_weight");
-		}
-	}
-	JXSML__RAISE_DELAYED();
-	return 0;
-
-error:
-	return st->err;
-}
-
-////////////////////////////////////////////////////////////////////////////////
 
 void end(const jxsml img, const jxsml__st st) {}
+
+void update_cksum(uint8_t b, uint32_t *crc, uint32_t *adler) {
+	static const uint32_t TAB[16] = {
+		0x00000000,0x1DB71064,0x3B6E20C8,0x26D930AC,0x76DC4190,0x6B6B51F4,0x4DB26158,0x5005713C,
+		0xEDB88320,0xF00F9344,0xD6D6A3E8,0xCB61B38C,0x9B64C2B0,0x86D3D2D4,0xA00AE278,0xBDBDF21C,
+	};
+	uint32_t lo, hi;
+	*crc = TAB[(*crc ^ b) & 15] ^ (*crc >> 4);
+	*crc = TAB[(*crc ^ (b >> 4)) & 15] ^ (*crc >> 4);
+	lo = ((*adler & 0xffff) + b) % 65521;
+	hi = ((*adler >> 16) + lo) % 65521;
+	*adler = (hi << 16) | lo;
+}
 
 int jxsml_load_from_memory(jxsml *out, const void *buf, size_t bufsize) {
 	jxsml__st st_ = {
@@ -2262,7 +2463,7 @@ int jxsml_load_from_memory(jxsml *out, const void *buf, size_t bufsize) {
 		.quant_bias_num = 0.145f,
 	};
 	jxsml__st *st = &st_;
-	int32_t i, j;
+	int32_t i, j, k;
 
 	JXSML__TRY(jxsml__init_container(st, buf, bufsize));
 
@@ -2279,6 +2480,44 @@ int jxsml_load_from_memory(jxsml *out, const void *buf, size_t bufsize) {
 	jxsml__frame_t frame;
 	do {
 		JXSML__TRY(jxsml__frame(st, &frame));
+
+		if (1) {
+			JXSML__ASSERT(frame.modular.num_channels == 3 && st->modular_16bit_buffers && st->out->bpp == 8 && st->out->exp_bits == 0);
+			FILE *f = fopen("dump.png", "wb");
+			uint32_t crc, adler, unused = 0, idatsize;
+			uint8_t buf[32];
+			fwrite("\x89PNG\x0d\x0a\x1a\x0a" "\0\0\0\x0d", 12, 1, f);
+			memcpy(buf, "IHDR" "wwww" "hhhh" "\x08\x02\0\0\0" "crcc" "lenn" "IDAT" "\x78\x01", 31);
+			for (i = 0; i < 4; ++i) buf[i + 4] = (uint8_t) ((frame.width >> (24 - i * 8)) & 0xff);
+			for (i = 0; i < 4; ++i) buf[i + 8] = (uint8_t) ((frame.height >> (24 - i * 8)) & 0xff);
+			for (i = 0, crc = ~0u; i < 17; ++i) update_cksum(buf[i], &crc, &unused);
+			for (i = 0; i < 4; ++i) buf[i + 17] = (uint8_t) ((~crc >> (24 - i * 8)) & 0xff);
+			idatsize = (uint32_t) (6 + (3 * frame.width + 6) * frame.height);
+			for (i = 0; i < 4; ++i) buf[i + 21] = (uint8_t) ((idatsize >> (24 - i * 8)) & 0xff);
+			fwrite(buf, 31, 1, f);
+			for (i = 25, crc = ~0u; i < 31; ++i) update_cksum(buf[i], &crc, &unused);
+			adler = 1;
+			for (i = 0; i < frame.height; ++i) {
+				update_cksum(buf[0] = (i == frame.height - 1), &crc, &unused);
+				update_cksum(buf[1] = (uint8_t) ((3 * frame.width + 1) & 0xff), &crc, &unused);
+				update_cksum(buf[2] = (uint8_t) ((3 * frame.width + 1) >> 8), &crc, &unused);
+				update_cksum(buf[3] = (uint8_t) ~((3 * frame.width + 1) & 0xff), &crc, &unused);
+				update_cksum(buf[4] = (uint8_t) ~((3 * frame.width + 1) >> 8), &crc, &unused);
+				update_cksum(buf[5] = 0, &crc, &adler);
+				fwrite(buf, 6, 1, f);
+				for (j = 0; j < frame.width; ++j) {
+					for (k = 0; k < 3; ++k) {
+						update_cksum(buf[k] = (uint8_t) (((int16_t*)frame.modular.channel[k].pixels)[i * frame.width + j] & 0xff), &crc, &adler);
+					}
+					fwrite(buf, 3, 1, f);
+				}
+			}
+			for (i = 0; i < 4; ++i) update_cksum(buf[i] = (uint8_t) ((adler >> (24 - i * 8)) & 0xff), &crc, &unused);
+			for (i = 0; i < 4; ++i) buf[i + 4] = (uint8_t) ((~crc >> (24 - i * 8)) & 0xff);
+			memcpy(buf + 8, "\0\0\0\0" "IEND" "\xae\x42\x60\x82", 12);
+			fwrite(buf, 20, 1, f);
+			fclose(f);
+		}
 	} while (!frame.is_last);
 
 	end(*st->out, st_);
@@ -2312,3 +2551,5 @@ int main(int argc, char **argv) {
 	fprintf(stderr, "ok\n");
 	return 0;
 }
+
+#endif // !JXSML__RECURSING
