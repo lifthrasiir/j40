@@ -46,7 +46,24 @@ typedef struct {
 		JXSML_GAMMA_MAX = 10000000,
 	} gamma_or_tf; // gamma if > 0, transfer function if <= 0
 	enum { JXSML_INTENT_PERC = 0, JXSML_INTENT_REL = 1, JXSML_INTENT_SAT = 2, JXSML_INTENT_ABS = 3 } render_intent;
+	float intensity_target, min_nits; // 0 < min_nits <= intensity_target
+	float linear_below; // absolute (nits) if >= 0; a negated ratio of max display brightness if [-1,0]
 } jxsml;
+
+typedef struct {
+	enum {
+		JXSML_EC_ALPHA = 0, JXSML_EC_DEPTH = 1, JXSML_EC_SPOT_COLOUR = 2,
+		JXSML_EC_SELECTION_MASK = 3, JXSML_EC_BLACK = 4, JXSML_EC_CFA = 5,
+		JXSML_EC_THERMAL = 6, JXSML_EC_NON_OPTIONAL = 15, JXSML_EC_OPTIONAL = 16,
+	} type;
+	int32_t bpp, exp_bits, dim_shift, name_len;
+	char *name;
+	union {
+		int alpha_associated;
+		struct { float red, green, blue, solidity; } spot;
+		int32_t cfa_channel;
+	} data;
+} jxsml__ec_info;
 
 typedef struct {
 	jxsml *out;
@@ -61,6 +78,7 @@ typedef struct {
 
 	int modular_16bit_buffers;
 	int num_extra_channels;
+	jxsml__ec_info *ec_info;
 	int xyb_encoded;
 	float opsin_inv_mat[3][3], opsin_bias[3], quant_bias[3], quant_bias_num;
 	int want_icc;
@@ -249,6 +267,8 @@ error:
 
 ////////////////////////////////////////////////////////////////////////////////
 // bitstream
+
+#define JXSML__TO_SIGNED(u) ((u) & 1 ? -((u) + 1) / 2 : (u) / 2)
 
 int jxsml__always_refill(jxsml__st *st, int32_t n) {
 	do {
@@ -845,7 +865,6 @@ int jxsml__cluster_map(jxsml__st *st, int32_t num_dist, int32_t max_allowed, int
 		map[0] = 0;
 		return 0;
 	}
-	JXSML__TRY(jxsml__refill(st, 6));
 
 	if (jxsml__u(st, 1)) { // is_simple (# clusters < 8)
 		int32_t nbits = jxsml__u(st, 2);
@@ -1207,7 +1226,37 @@ error:
 	return st->err;
 }
 
-#define JXSML__TO_SIGNED(u) ((u) & 1 ? -((u) + 1) / 2 : (u) / 2)
+int jxsml__name(jxsml__st *st, int32_t *outlen, char **outbuf) {
+	char *buf = NULL;
+	int32_t i, c, cc, len;
+	len = jxsml__u32(st, 0, 0, 0, 4, 16, 5, 48, 10);
+	if (len > 0) {
+		JXSML__SHOULD(buf = malloc((size_t) len + 1), "!mem");
+		for (i = 0; i < len; ++i) {
+			buf[i] = (char) jxsml__u(st, 8);
+			JXSML__RAISE_DELAYED();
+		}
+		buf[len] = 0;
+		for (i = 0; i < len; ) { // UTF-8 verification
+			c = (uint8_t) buf[i++];
+			cc = (uint8_t) buf[i]; // always accessible thanks to null-termination
+			c = c < 0x80 ? 0 : c < 0xc2 ? -1 : c < 0xe0 ? 1 :
+				c < 0xf0 ? (c == 0xe0 ? cc >= 0xa0 : c == 0xed ? cc < 0xa0 : 1) ? 2 : -1 :
+				c < 0xf5 ? (c == 0xf0 ? cc >= 0x90 : c == 0xf4 ? cc < 0x90 : 1) ? 3 : -1 : -1;
+			JXSML__SHOULD(c >= 0 && i + c < len, "name");
+			while (c-- > 0) JXSML__SHOULD((buf[i++] & 0xc0) == 0x80, "name");
+		}
+		*outbuf = buf;
+	} else {
+		JXSML__RAISE_DELAYED();
+		*outbuf = NULL;
+	}
+	*outlen = len;
+	return 0;
+error:
+	free(buf);
+	return st->err;
+}
 
 int jxsml__customxy(jxsml__st *st, float xy[2]) {
 	int32_t ux = jxsml__u32(st, 0, 19, 0x80000, 19, 0x100000, 20, 0x200000, 21);
@@ -1257,6 +1306,10 @@ int jxsml__image_metadata(jxsml__st *st) {
 	memcpy(st->out->cpoints, SRGB_CHROMA, sizeof SRGB_CHROMA);
 	st->out->gamma_or_tf = JXSML_TF_SRGB;
 	st->out->render_intent = JXSML_INTENT_REL;
+	st->out->intensity_target = 255.0f;
+	st->out->min_nits = 0.0f;
+	st->out->linear_below = 0.0f;
+
 	if (!jxsml__u(st, 1)) { // !all_default
 		int32_t extra_fields = jxsml__u(st, 1);
 		if (extra_fields) {
@@ -1277,8 +1330,40 @@ int jxsml__image_metadata(jxsml__st *st) {
 		JXSML__TRY(jxsml__bit_depth(st, &st->out->bpp, &st->out->exp_bits));
 		st->modular_16bit_buffers = jxsml__u(st, 1);
 		st->num_extra_channels = jxsml__u32(st, 0, 0, 1, 0, 2, 4, 1, 12);
+		JXSML__SHOULD(st->ec_info = calloc((size_t) st->num_extra_channels, sizeof(jxsml__ec_info)), "!mem");
 		for (i = 0; i < st->num_extra_channels; ++i) {
-			JXSML__RAISE("TODO: ec_info");
+			jxsml__ec_info *ec = &st->ec_info[i];
+			if (jxsml__u(st, 1)) { // d_alpha
+				ec->type = JXSML_EC_ALPHA;
+				ec->bpp = 8;
+				ec->exp_bits = ec->dim_shift = ec->name_len = 0;
+				ec->name = NULL;
+				ec->data.alpha_associated = 0;
+			} else {
+				ec->type = jxsml__enum(st);
+				JXSML__TRY(jxsml__bit_depth(st, &ec->bpp, &ec->exp_bits));
+				ec->dim_shift = jxsml__u32(st, 0, 0, 3, 0, 4, 0, 1, 3);
+				JXSML__TRY(jxsml__name(st, &ec->name_len, &ec->name));
+				switch (ec->type) {
+				case JXSML_EC_ALPHA:
+					ec->data.alpha_associated = jxsml__u(st, 1);
+					break;
+				case JXSML_EC_SPOT_COLOUR:
+					ec->data.spot.red = jxsml__f16(st);
+					ec->data.spot.green = jxsml__f16(st);
+					ec->data.spot.blue = jxsml__f16(st);
+					ec->data.spot.solidity = jxsml__f16(st);
+					break;
+				case JXSML_EC_CFA:
+					ec->data.cfa_channel = jxsml__u32(st, 1, 0, 0, 2, 3, 4, 19, 8);
+					break;
+				case JXSML_EC_DEPTH: case JXSML_EC_SELECTION_MASK: case JXSML_EC_BLACK:
+				case JXSML_EC_THERMAL: case JXSML_EC_NON_OPTIONAL: case JXSML_EC_OPTIONAL:
+					break;
+				default: JXSML__RAISE("ect?");
+				}
+			}
+			JXSML__RAISE_DELAYED();
 		}
 		st->xyb_encoded = jxsml__u(st, 1);
 		if (!jxsml__u(st, 1)) { // ColourEncoding.all_default
@@ -1340,7 +1425,21 @@ int jxsml__image_metadata(jxsml__st *st) {
 			}
 		}
 		if (extra_fields) {
-			JXSML__RAISE("TODO: tone_mapping");
+			if (!jxsml__u(st, 1)) { // ToneMapping.all_default
+				int relative_to_max_display;
+				st->out->intensity_target = jxsml__f16(st);
+				JXSML__SHOULD(st->out->intensity_target > 0, "tone");
+				st->out->min_nits = jxsml__f16(st);
+				JXSML__SHOULD(0 < st->out->min_nits && st->out->min_nits <= st->out->intensity_target, "tone");
+				relative_to_max_display = jxsml__u(st, 1);
+				st->out->linear_below = jxsml__f16(st);
+				if (relative_to_max_display) {
+					JXSML__SHOULD(0 <= st->out->linear_below && st->out->linear_below <= 1, "tone");
+					st->out->linear_below *= -1.0f;
+				} else {
+					JXSML__SHOULD(0 <= st->out->linear_below, "tone");
+				}
+			}
 		}
 		JXSML__TRY(jxsml__extensions(st));
 	}
@@ -1560,26 +1659,40 @@ void jxsml__init_modular_common(jxsml__modular_t *m) {
 	memset(&m->codespec, 0, sizeof(jxsml__code_spec_t));
 	memset(&m->code, 0, sizeof(jxsml__code_t));
 	m->code.spec = &m->codespec;
+	m->channel = NULL;
 }
 
 int jxsml__init_modular_for_global(
-	jxsml__st *st, int is_modular, int do_ycbcr,
-	int32_t width, int32_t height, jxsml__modular_t *m
+	jxsml__st *st, int frame_is_modular, int frame_do_ycbcr,
+	int32_t frame_log_upsampling, const int32_t *frame_ec_log_upsampling,
+	int32_t frame_width, int32_t frame_height, jxsml__modular_t *m
 ) {
 	int32_t i;
 
 	jxsml__init_modular_common(m);
 	m->num_channels = st->num_extra_channels;
-	if (is_modular) {
-		m->num_channels += (!do_ycbcr && !st->xyb_encoded && st->out->cspace == JXSML_CS_GREY ? 1 : 3);
+	if (frame_is_modular) {
+		m->num_channels += (!frame_do_ycbcr && !st->xyb_encoded && st->out->cspace == JXSML_CS_GREY ? 1 : 3);
 	}
 	JXSML__SHOULD(m->channel = calloc((size_t) m->num_channels, sizeof(jxsml__modular_channel_t)), "!mem");
-	for (i = 0; i < m->num_channels; ++i) {
-		m->channel[i].width = width;
-		m->channel[i].height = height;
-		m->channel[i].hshift = m->channel[i].vshift = 0; // TODO extra channels have explicit shifts
+	for (i = 0; i < st->num_extra_channels; ++i) {
+		int32_t log_upsampling = (frame_ec_log_upsampling ? frame_ec_log_upsampling[i] : 0) + st->ec_info[i].dim_shift;
+		JXSML__SHOULD(log_upsampling >= frame_log_upsampling, "usmp");
+		JXSML__SHOULD(log_upsampling == 0, "TODO: upsampling is not yet supported");
+		m->channel[i].width = frame_width;
+		m->channel[i].height = frame_height;
+		m->channel[i].hshift = m->channel[i].vshift = 0;
 	}
+	for (; i < m->num_channels; ++i) {
+		m->channel[i].width = frame_width;
+		m->channel[i].height = frame_height;
+		m->channel[i].hshift = m->channel[i].vshift = 0;
+	}
+	return 0;
+
 error:
+	free(m->channel);
+	m->channel = NULL;
 	return st->err;
 }
 
@@ -2070,7 +2183,7 @@ typedef struct {
 	int has_noise, has_patches, has_splines, use_lf_frame, skip_adapt_lf_smooth;
 	int do_ycbcr;
 	int32_t jpeg_upsampling; // [0] | [1] << 2 | [2] << 4
-	int32_t upsampling, *ec_upsampling;
+	int32_t log_upsampling, *ec_log_upsampling;
 	int32_t group_size_shift;
 	int32_t x_qm_scale, b_qm_scale;
 	int32_t num_passes;
@@ -2113,8 +2226,8 @@ int jxsml__frame(jxsml__st *st, jxsml__frame_t *f) {
 	f->has_noise = f->has_patches = f->has_splines = f->use_lf_frame = f->skip_adapt_lf_smooth = 0;
 	f->do_ycbcr = 0;
 	f->jpeg_upsampling = 0;
-	f->upsampling = 1;
-	f->ec_upsampling = NULL;
+	f->log_upsampling = 0;
+	f->ec_log_upsampling = NULL;
 	f->group_size_shift = 8;
 	f->x_qm_scale = 3;
 	f->b_qm_scale = 2;
@@ -2173,10 +2286,12 @@ int jxsml__frame(jxsml__st *st, jxsml__frame_t *f) {
 		if (!st->xyb_encoded) f->do_ycbcr = jxsml__u(st, 1);
 		if (!f->use_lf_frame) {
 			if (f->do_ycbcr) f->jpeg_upsampling = jxsml__u(st, 6); // yes, we are lazy
-			f->upsampling = 1 << jxsml__u(st, 2);
+			f->log_upsampling = jxsml__u(st, 2);
+			JXSML__SHOULD(f->log_upsampling == 0, "TODO: upsampling is not yet implemented");
+			JXSML__SHOULD(f->ec_log_upsampling = malloc(sizeof(int32_t) * (size_t) st->num_extra_channels), "!mem");
 			for (i = 0; i < st->num_extra_channels; ++i) {
-				(void) (1 << (int) jxsml__u(st, 2));
-				JXSML__RAISE("TODO: ec_upsampling");
+				f->ec_log_upsampling[i] = jxsml__u(st, 2);
+				JXSML__SHOULD(f->ec_log_upsampling[i] == 0, "TODO: upsampling is not yet implemented");
 			}
 		}
 		if (f->is_modular) {
@@ -2224,12 +2339,21 @@ int jxsml__frame(jxsml__st *st, jxsml__frame_t *f) {
 				f->width + f->x0 >= st->out->width && f->height + f->y0 >= st->out->height;
 		}
 		if (f->type == JXSML__FRAME_REGULAR || f->type == JXSML__FRAME_REGULAR_SKIPPROG) {
-			f->blend_info.mode = (int8_t) jxsml__u32(st, 0, 0, 1, 0, 2, 0, 3, 2);
-			if (!full_frame || f->blend_info.mode != JXSML__BLEND_REPLACE) {
-				f->blend_info.src_ref_frame = (int8_t) jxsml__u(st, 2);
-			}
-			for (i = 0; i < st->num_extra_channels; ++i) {
-				JXSML__RAISE("TODO: ec_blending_info");
+			JXSML__SHOULD(f->ec_blend_info = malloc(sizeof(jxsml__blend_info) * (size_t) st->num_extra_channels), "!mem");
+			for (i = -1; i < st->num_extra_channels; ++i) {
+				jxsml__blend_info *blend = i < 0 ? &f->blend_info : &f->ec_blend_info[i];
+				blend->mode = (int8_t) jxsml__u32(st, 0, 0, 1, 0, 2, 0, 3, 2);
+				if (st->num_extra_channels > 0) {
+					if (blend->mode == JXSML__BLEND_BLEND || blend->mode == JXSML__BLEND_MUL_ADD) {
+						blend->alpha_chan = (int8_t) jxsml__u32(st, 0, 0, 1, 0, 2, 0, 3, 3);
+						blend->clamp = (int8_t) jxsml__u(st, 1);
+					} else if (blend->mode == JXSML__BLEND_MUL) {
+						blend->clamp = (int8_t) jxsml__u(st, 1);
+					}
+				}
+				if (!full_frame || blend->mode != JXSML__BLEND_REPLACE) {
+					blend->src_ref_frame = (int8_t) jxsml__u(st, 2);
+				}
 			}
 			if (st->out->anim_tps_denom) { // have_animation stored implicitly
 				f->duration = jxsml__u32(st, 0, 0, 1, 0, 0, 8, 0, 32); // TODO uh, u32?
@@ -2249,16 +2373,7 @@ int jxsml__frame(jxsml__st *st, jxsml__frame_t *f) {
 				(f->duration == 0 || f->save_as_ref != 0) &&
 				!f->is_last);
 		}
-		f->name_len = jxsml__u32(st, 0, 0, 0, 4, 16, 5, 48, 10);
-		if (f->name_len > 0) {
-			JXSML__SHOULD(f->name = malloc((size_t) f->name_len + 1), "!mem");
-			for (i = 0; i < f->name_len; ++i) {
-				f->name[i] = (char) jxsml__u(st, 8);
-				JXSML__RAISE_DELAYED();
-			}
-			f->name[f->name_len] = 0;
-			// TODO verify that f->name is UTF-8
-		}
+		JXSML__TRY(jxsml__name(st, &f->name_len, &f->name));
 		{ // RestorationFilter
 			restoration_all_default = jxsml__u(st, 1);
 			f->gab.enabled = restoration_all_default ? 1 : jxsml__u(st, 1);
@@ -2355,7 +2470,8 @@ int jxsml__frame(jxsml__st *st, jxsml__frame_t *f) {
 		if (jxsml__u(st, 1)) { // global tree present
 			JXSML__TRY(jxsml__ma_tree(st, &f->global_tree, &f->global_codespec));
 		}
-		JXSML__TRY(jxsml__init_modular_for_global(st, f->is_modular, f->do_ycbcr, f->width, f->height, &f->modular));
+		JXSML__TRY(jxsml__init_modular_for_global(st, f->is_modular, f->do_ycbcr,
+			f->log_upsampling, f->ec_log_upsampling, f->width, f->height, &f->modular));
 		JXSML__TRY(jxsml__modular_header(st, f->global_tree, &f->global_codespec, &f->modular));
 		JXSML__TRY(jxsml__allocate_modular(st, &f->modular));
 		if (f->width <= (1 << f->group_size_shift) && f->height <= (1 << f->group_size_shift)) {
@@ -2482,34 +2598,47 @@ int jxsml_load_from_memory(jxsml *out, const void *buf, size_t bufsize) {
 		JXSML__TRY(jxsml__frame(st, &frame));
 
 		if (1) {
-			JXSML__ASSERT(frame.modular.num_channels == 3 && st->modular_16bit_buffers && st->out->bpp == 8 && st->out->exp_bits == 0);
+			JXSML__ASSERT(st->modular_16bit_buffers && st->out->bpp == 8 && st->out->exp_bits == 0);
 			FILE *f = fopen("dump.png", "wb");
 			uint32_t crc, adler, unused = 0, idatsize;
+			int16_t *c[4];
+			int32_t nchan;
 			uint8_t buf[32];
+			nchan = (!frame.do_ycbcr && !st->xyb_encoded && st->out->cspace == JXSML_CS_GREY ? 1 : 3);
+			for (i = 0; i < nchan; ++i) c[i] = frame.modular.channel[i].pixels;
+			for (i = nchan; i < frame.modular.num_channels; ++i) {
+				jxsml__ec_info *ec = &st->ec_info[i - nchan];
+				if (ec->type == JXSML_EC_ALPHA) {
+					JXSML__ASSERT(ec->bpp == 8 && ec->exp_bits == 0 && ec->dim_shift == 0 && !ec->data.alpha_associated);
+					c[nchan++] = frame.modular.channel[i].pixels;
+					break;
+				}
+			}
 			fwrite("\x89PNG\x0d\x0a\x1a\x0a" "\0\0\0\x0d", 12, 1, f);
-			memcpy(buf, "IHDR" "wwww" "hhhh" "\x08\x02\0\0\0" "crcc" "lenn" "IDAT" "\x78\x01", 31);
+			memcpy(buf, "IHDR" "wwww" "hhhh" "\x08" "C" "\0\0\0" "crcc" "lenn" "IDAT" "\x78\x01", 31);
 			for (i = 0; i < 4; ++i) buf[i + 4] = (uint8_t) ((frame.width >> (24 - i * 8)) & 0xff);
 			for (i = 0; i < 4; ++i) buf[i + 8] = (uint8_t) ((frame.height >> (24 - i * 8)) & 0xff);
+			buf[13] = (uint8_t) ((nchan % 2 == 0 ? 4 : 0) | (nchan > 2 ? 2 : 0));
 			for (i = 0, crc = ~0u; i < 17; ++i) update_cksum(buf[i], &crc, &unused);
 			for (i = 0; i < 4; ++i) buf[i + 17] = (uint8_t) ((~crc >> (24 - i * 8)) & 0xff);
-			idatsize = (uint32_t) (6 + (3 * frame.width + 6) * frame.height);
+			idatsize = (uint32_t) (6 + (nchan * frame.width + 6) * frame.height);
 			for (i = 0; i < 4; ++i) buf[i + 21] = (uint8_t) ((idatsize >> (24 - i * 8)) & 0xff);
 			fwrite(buf, 31, 1, f);
 			for (i = 25, crc = ~0u; i < 31; ++i) update_cksum(buf[i], &crc, &unused);
 			adler = 1;
 			for (i = 0; i < frame.height; ++i) {
 				update_cksum(buf[0] = (i == frame.height - 1), &crc, &unused);
-				update_cksum(buf[1] = (uint8_t) ((3 * frame.width + 1) & 0xff), &crc, &unused);
-				update_cksum(buf[2] = (uint8_t) ((3 * frame.width + 1) >> 8), &crc, &unused);
-				update_cksum(buf[3] = (uint8_t) ~((3 * frame.width + 1) & 0xff), &crc, &unused);
-				update_cksum(buf[4] = (uint8_t) ~((3 * frame.width + 1) >> 8), &crc, &unused);
+				update_cksum(buf[1] = (uint8_t) ((nchan * frame.width + 1) & 0xff), &crc, &unused);
+				update_cksum(buf[2] = (uint8_t) ((nchan * frame.width + 1) >> 8), &crc, &unused);
+				update_cksum(buf[3] = (uint8_t) ~((nchan * frame.width + 1) & 0xff), &crc, &unused);
+				update_cksum(buf[4] = (uint8_t) ~((nchan * frame.width + 1) >> 8), &crc, &unused);
 				update_cksum(buf[5] = 0, &crc, &adler);
 				fwrite(buf, 6, 1, f);
 				for (j = 0; j < frame.width; ++j) {
-					for (k = 0; k < 3; ++k) {
-						update_cksum(buf[k] = (uint8_t) (((int16_t*)frame.modular.channel[k].pixels)[i * frame.width + j] & 0xff), &crc, &adler);
+					for (k = 0; k < nchan; ++k) {
+						update_cksum(buf[k] = (uint8_t) (c[k][i * frame.width + j] & 0xff), &crc, &adler);
 					}
-					fwrite(buf, 3, 1, f);
+					fwrite(buf, (size_t) nchan, 1, f);
 				}
 			}
 			for (i = 0; i < 4; ++i) update_cksum(buf[i] = (uint8_t) ((adler >> (24 - i * 8)) & 0xff), &crc, &unused);
