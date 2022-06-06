@@ -13,7 +13,6 @@
 #include <stdio.h>
 
 #define JXSML_DEBUG
-#define inline // XXX
 
 enum {
 	JXSML_CHROMA_WHITE = 0, JXSML_CHROMA_RED = 1,
@@ -96,7 +95,7 @@ typedef struct {
 
 #ifndef JXSML_ALWAYS_INLINE
 	#if JXSML__HAS_ATTR(always_inline) || defined(__GNUC__) || defined(__clang__)
-		#define JXSML_ALWAYS_INLINE __attribute__((always_inline)) inline
+		#define JXSML_ALWAYS_INLINE __attribute__((always_inline)) static inline
 	#elif defined(_MSC_VER)
 		#define JXSML_ALWAYS_INLINE __forceinline
 	#else
@@ -104,22 +103,66 @@ typedef struct {
 	#endif
 #endif // !defined JXSML_ALWAYS_INLINE
 
+// ----------------------------------------
+// recursion for bit-dependent math functions
+#define JXSML__RECURSING 100
+#define JXSML__N 16
+#include __FILE__
+#define JXSML__N 32
+#include __FILE__
+#define JXSML__N 64
+#include __FILE__
+#undef JXSML__RECURSING
+
+#endif // !JXSML__RECURSING
+#if 0+JXSML__RECURSING == 100
+	#define jxsml__intN_t JXSML__CONCAT3(int, JXSML__N, _t)
+	#define jxsml__uintN_t JXSML__CONCAT3(uint, JXSML__N, _t)
+// ----------------------------------------
+
 // same to `(a + b) >> 1` but doesn't overflow, useful for tight loops with autovectorization
 // https://devblogs.microsoft.com/oldnewthing/20220207-00/?p=106223
-JXSML_ALWAYS_INLINE int16_t jxsml__floor_avg16(int16_t x, int16_t y) {
-	return (int16_t) (x / 2 + y / 2 + (x & y & 1));
+JXSML_ALWAYS_INLINE jxsml__intN_t JXSML__CONCAT(jxsml__floor_avg, JXSML__N)(jxsml__intN_t x, jxsml__intN_t y) {
+	return (jxsml__intN_t) (x / 2 + y / 2 + (x & y & 1));
 }
 
-JXSML_ALWAYS_INLINE int32_t jxsml__abs32(int32_t x) { return x < 0 ? -x : x; }
-JXSML_ALWAYS_INLINE int32_t jxsml__min32(int32_t x, int32_t y) { return x < y ? x : y; }
-JXSML_ALWAYS_INLINE int32_t jxsml__max32(int32_t x, int32_t y) { return x > y ? x : y; }
+JXSML_ALWAYS_INLINE jxsml__intN_t JXSML__CONCAT(jxsml__abs, JXSML__N)(jxsml__intN_t x) {
+	return (jxsml__intN_t) (x < 0 ? -x : x);
+}
+JXSML_ALWAYS_INLINE jxsml__intN_t JXSML__CONCAT(jxsml__min, JXSML__N)(jxsml__intN_t x, jxsml__intN_t y) {
+	return (jxsml__intN_t) (x < y ? x : y);
+}
+JXSML_ALWAYS_INLINE jxsml__intN_t JXSML__CONCAT(jxsml__max, JXSML__N)(jxsml__intN_t x, jxsml__intN_t y) {
+	return (jxsml__intN_t) (x > y ? x : y);
+}
 
-#if UINT_MAX == UINT32_MAX
-JXSML_ALWAYS_INLINE int jxsml__floor_lg32(uint32_t x) { return 31 - __builtin_clz(x); }
-JXSML_ALWAYS_INLINE int jxsml__ceil_lg32(uint32_t x) { return 32 - __builtin_clz(x - 1); }
-#else
-#error "can't define jxsml__floor/ceil_lg32"
+#define JXSML__UINTN_MAX JXSML__CONCAT3(UINT, JXSML__N, _MAX)
+#if UINT_MAX == JXSML__UINTN_MAX
+	#define JXSML__CLZN __builtin_clz
+#elif ULONG_MAX == JXSML__UINTN_MAX
+	#define JXSML__CLZN __builtin_clzl
+#elif ULLONG_MAX == JXSML__UINTN_MAX
+	#define JXSML__CLZN __builtin_clzll
 #endif
+#undef JXSML__UINTN_MAX
+#ifdef JXSML__CLZN
+	JXSML_ALWAYS_INLINE int JXSML__CONCAT(jxsml__floor_lg, JXSML__N)(jxsml__uintN_t x) {
+		return JXSML__N - 1 - JXSML__CLZN(x);
+	}
+	JXSML_ALWAYS_INLINE int JXSML__CONCAT(jxsml__ceil_lg, JXSML__N)(jxsml__uintN_t x) {
+		return JXSML__N - JXSML__CLZN(x - 1);
+	}
+	#undef JXSML__CLZN
+#endif
+
+// ----------------------------------------
+// end of recursion
+	#undef jxsml__intN_t
+	#undef jxsml__uintN_t
+	#undef JXSML__N
+#endif // JXSML__RECURSING == 100
+#ifndef JXSML__RECURSING
+// ----------------------------------------
 
 ////////////////////////////////////////////////////////////////////////////////
 // error handling macros
@@ -339,7 +382,7 @@ error:
 // ensure st->nbits is at least n; otherwise pull as many bytes as possible into st->bits
 #define jxsml__refill(st, n) (st->nbits < (n) ? jxsml__always_refill(st, n) : st->err)
 
-inline int jxsml__zero_pad_to_byte(jxsml__st *st) {
+static inline int jxsml__zero_pad_to_byte(jxsml__st *st) {
 	int32_t n = st->nbits & 7;
 	if (st->bits & ((1u << n) - 1)) return JXSML__ERR("pad0");
 	st->bits >>= n;
@@ -369,7 +412,7 @@ int jxsml__skip(jxsml__st *st, uint64_t n) {
 	return st->err;
 }
 
-inline int32_t jxsml__u(jxsml__st *st, int32_t n) {
+static inline int32_t jxsml__u(jxsml__st *st, int32_t n) {
 	int32_t ret;
 #ifdef JXSML_DEBUG
 	if (n < 0 || n > 31) return JXSML__ERR("!exp"), 0;
@@ -383,7 +426,11 @@ inline int32_t jxsml__u(jxsml__st *st, int32_t n) {
 }
 
 // the maximum value U32() actually reads is 2^30 + 4211711, so int32_t should be enough
-inline int32_t jxsml__u32(jxsml__st *st, int32_t o0, int32_t n0, int32_t o1, int32_t n1, int32_t o2, int32_t n2, int32_t o3, int32_t n3) {
+static inline int32_t jxsml__u32(
+	jxsml__st *st,
+	int32_t o0, int32_t n0, int32_t o1, int32_t n1,
+	int32_t o2, int32_t n2, int32_t o3, int32_t n3
+) {
 	const int32_t o[4] = { o0, o1, o2, o3 };
 	const int32_t n[4] = { n0, n1, n2, n3 };
 	int32_t sel;
@@ -410,7 +457,7 @@ uint64_t jxsml__u64(jxsml__st *st) {
 	return ret;
 }
 
-inline int32_t jxsml__enum(jxsml__st *st) {
+static inline int32_t jxsml__enum(jxsml__st *st) {
 	int32_t ret = jxsml__u32(st, 0, 0, 1, 0, 2, 4, 18, 6);
 	// the spec says it should be 64, but the largest enum value in use is 18 (kHLG);
 	// we have to reject unknown enum values anyway so we use a smaller limit to avoid overflow
@@ -418,7 +465,7 @@ inline int32_t jxsml__enum(jxsml__st *st) {
 	return ret;
 }
 
-inline float jxsml__f16(jxsml__st *st) {
+static inline float jxsml__f16(jxsml__st *st) {
 	int32_t bits = jxsml__u(st, 16);
 	int32_t biased_exp = (bits >> 10) & 0x1f;
 	if (biased_exp == 31) return JXSML__ERR("!fin"), 0.0f;
@@ -438,7 +485,7 @@ uint64_t jxsml__varint(jxsml__st *st) { // ICC only
 	return JXSML__ERR("vint"), (uint64_t) 0;
 }
 
-inline int32_t jxsml__u8(jxsml__st *st) { // ANS distribution decoding only
+static inline int32_t jxsml__u8(jxsml__st *st) { // ANS distribution decoding only
 	if (jxsml__u(st, 1)) {
 		int32_t n = jxsml__u(st, 3);
 		return jxsml__u(st, n) + (1 << n);
@@ -448,7 +495,7 @@ inline int32_t jxsml__u8(jxsml__st *st) { // ANS distribution decoding only
 }
 
 // equivalent to u(ceil(log2(max + 1))), decodes [0, max] with the minimal number of bits
-inline int32_t jxsml__at_most(jxsml__st *st, int32_t max) {
+static inline int32_t jxsml__at_most(jxsml__st *st, int32_t max) {
 	// TODO: provide a portable version
 	int32_t v = max > 0 ? jxsml__u(st, jxsml__ceil_lg32((uint32_t) max + 1)) : 0;
 	if (v > max) return JXSML__ERR("rnge"), 0;
@@ -481,7 +528,7 @@ static const uint8_t JXSML__REV5[32] = {
 enum { JXSML__MAX_TYPICAL_FAST_LEN = 7 }; // limit fast_len for typical cases
 enum { JXSML__MAX_TABLE_GROWTH = 2 }; // we can afford 2x the table size if beneficial though
 
-inline int32_t jxsml__prefix_code(jxsml__st *, int32_t, int32_t, const int32_t *);
+static inline int32_t jxsml__prefix_code(jxsml__st *, int32_t, int32_t, const int32_t *);
 
 // read a prefix code tree, as specified in RFC 7932 section 3
 int jxsml__init_prefix_code(jxsml__st *st, int32_t l2size, int32_t *out_fast_len, int32_t *out_max_len, int32_t **out_table) {
@@ -682,7 +729,7 @@ int32_t jxsml__match_overflow(jxsml__st *st, int32_t fast_len, const int32_t *ta
 	return entry;
 }
 
-inline int32_t jxsml__prefix_code(jxsml__st *st, int32_t fast_len, int32_t max_len, const int32_t *table) {
+static inline int32_t jxsml__prefix_code(jxsml__st *st, int32_t fast_len, int32_t max_len, const int32_t *table) {
 	int32_t entry, code_len;
 	if (st->nbits < max_len && jxsml__always_refill(st, 0)) return 0;
 	entry = table[st->bits & ((1u << fast_len) - 1)];
@@ -713,7 +760,7 @@ int jxsml__hybrid_int_config(jxsml__st *st, int32_t log_alpha_size, jxsml__hybri
 	return st->err;
 }
 
-inline int32_t jxsml__hybrid_int(jxsml__st *st, int32_t token, jxsml__hybrid_int_config_t config) {
+static inline int32_t jxsml__hybrid_int(jxsml__st *st, int32_t token, jxsml__hybrid_int_config_t config) {
 	int32_t midbits, lo, mid, hi, top, bits_in_token, split = 1 << config.split_exp;
 	if (token < split) return token;
 	bits_in_token = config.msb_in_token + config.lsb_in_token;
@@ -1903,7 +1950,8 @@ int jxsml__modular_header(
 			memmove(channel + begin_c + 2, channel + end_c, sizeof(*channel) * (size_t) (num_channels - end_c));
 			channel[0].width = nb_colours;
 			channel[0].height = num_c;
-			channel[0].vshift = channel[0].hshift = -1;
+			channel[0].hshift = 0; // !!!
+			channel[0].vshift = -1;
 			channel[begin_c + 1] = input;
 			num_channels += 2 - num_c;
 			fprintf(stderr, "transform %d: palette [%d,%d) c%d d%d p%d\n", i, begin_c, end_c, nb_colours, tr->pal.nb_deltas, tr->pal.d_pred);
@@ -1981,11 +2029,6 @@ error:
 	return st->err;
 }
 
-int32_t jxsml__gradient32(int32_t w, int32_t n, int32_t nw) {
-	int32_t lo = jxsml__min32(w, n), hi = jxsml__max32(w, n);
-	return jxsml__min32(jxsml__max32(lo, w + n - nw), hi);
-}
-
 static const int32_t JXSML__24DIVP1[64] = { // [i] = floor(2^24 / (i+1))
 	0x1000000, 0x800000, 0x555555, 0x400000, 0x333333, 0x2aaaaa, 0x249249, 0x200000,
 	0x1c71c7, 0x199999, 0x1745d1, 0x155555, 0x13b13b, 0x124924, 0x111111, 0x100000,
@@ -1997,38 +2040,86 @@ static const int32_t JXSML__24DIVP1[64] = { // [i] = floor(2^24 / (i+1))
 	0x47dc1, 0x469ee, 0x456c7, 0x44444, 0x4325c, 0x42108, 0x41041, 0x40000,
 };
 
+#define JXSML__X(x,y,z) {x,y,z}, {-(x),-(y),-(z)}
+#define JXSML__XX(a,b,c,d,e,f) JXSML__X a, JXSML__X b, JXSML__X c, JXSML__X d, JXSML__X e, JXSML__X f
+static const int16_t JXSML__PALETTE_DELTAS[144][3] = { // the first entry is a duplicate and skipped
+	JXSML__XX((0, 0, 0), (4, 4, 4), (11, 0, 0), (0, 0, -13), (0, -12, 0), (-10, -10, -10)),
+	JXSML__XX((-18, -18, -18), (-27, -27, -27), (-18, -18, 0), (0, 0, -32), (-32, 0, 0), (-37, -37, -37)),
+	JXSML__XX((0, -32, -32), (24, 24, 45), (50, 50, 50), (-45, -24, -24), (-24, -45, -45), (0, -24, -24)),
+	JXSML__XX((-34, -34, 0), (-24, 0, -24), (-45, -45, -24), (64, 64, 64), (-32, 0, -32), (0, -32, 0)),
+	JXSML__XX((-32, 0, 32), (-24, -45, -24), (45, 24, 45), (24, -24, -45), (-45, -24, 24), (80, 80, 80)),
+	JXSML__XX((64, 0, 0), (0, 0, -64), (0, -64, -64), (-24, -24, 45), (96, 96, 96), (64, 64, 0)),
+	JXSML__XX((45, -24, -24), (34, -34, 0), (112, 112, 112), (24, -45, -45), (45, 45, -24), (0, -32, 32)),
+	JXSML__XX((24, -24, 45), (0, 96, 96), (45, -24, 24), (24, -45, -24), (-24, -45, 24), (0, -64, 0)),
+	JXSML__XX((96, 0, 0), (128, 128, 128), (64, 0, 64), (144, 144, 144), (96, 96, 0), (-36, -36, 36)),
+	JXSML__XX((45, -24, -45), (45, -45, -24), (0, 0, -96), (0, 128, 128), (0, 96, 0), (45, 24, -45)),
+	JXSML__XX((-128, 0, 0), (24, -45, 24), (-45, 24, -45), (64, 0, -64), (64, -64, -64), (96, 0, 96)),
+	JXSML__XX((45, -45, 24), (24, 45, -45), (64, 64, -64), (128, 128, 0), (0, 0, -128), (-24, 45, -45)),
+};
+#undef JXSML__X
+#undef JXSML__XX
+
+// ----------------------------------------
+// recursion for modular buffer sizes (16/32)
+#define JXSML__RECURSING 200
 #define JXSML__P 16
 #define JXSML__2P 32
-#define JXSML__WP
+#include __FILE__
+#define JXSML__P 32
+#define JXSML__2P 64
+#include __FILE__
+#undef JXSML__RECURSING
 
-#define jxsml__abs2P JXSML__CONCAT(jxsml__abs, JXSML__2P)
-#define jxsml__max2P JXSML__CONCAT(jxsml__max, JXSML__2P)
-#define jxsml__min2P JXSML__CONCAT(jxsml__min, JXSML__2P)
-#define jxsml__floor_lg2P JXSML__CONCAT(jxsml__floor_lg, JXSML__2P)
-#define jxsml__gradient2P JXSML__CONCAT(jxsml__gradient, JXSML__2P)
-#define jxsml__floor_avgP JXSML__CONCAT(jxsml__floor_avg, JXSML__P)
+#endif // !JXSML__RECURSING
+#if 0+JXSML__RECURSING == 200
+	#define jxsml__intP_t JXSML__CONCAT3(int, JXSML__P, _t)
+	#define jxsml__int2P_t JXSML__CONCAT3(int, JXSML__2P, _t)
+	#define jxsml__uint2P_t JXSML__CONCAT3(uint, JXSML__2P, _t)
+	#define jxsml__abs2P JXSML__CONCAT(jxsml__abs, JXSML__2P)
+	#define jxsml__max2P JXSML__CONCAT(jxsml__max, JXSML__2P)
+	#define jxsml__min2P JXSML__CONCAT(jxsml__min, JXSML__2P)
+	#define jxsml__floor_lg2P JXSML__CONCAT(jxsml__floor_lg, JXSML__2P)
+	#define jxsml__gradient2P JXSML__CONCAT(jxsml__gradient, JXSML__2P)
+	#define jxsml__floor_avgP JXSML__CONCAT(jxsml__floor_avg, JXSML__P)
+// ----------------------------------------
+
+jxsml__int2P_t jxsml__gradient2P(jxsml__int2P_t w, jxsml__int2P_t n, jxsml__int2P_t nw) {
+	jxsml__int2P_t lo = jxsml__min2P(w, n), hi = jxsml__max2P(w, n);
+	return jxsml__min2P(jxsml__max2P(lo, w + n - nw), hi);
+}
+
+#define JXSML__WP // TODO also parametrize over this
 
 int JXSML__CONCAT(jxsml__modular_channel, JXSML__P)(
 	jxsml__st *st, jxsml__modular_t *m, int32_t cidx, int32_t sidx
 ) {
-	typedef JXSML__CONCAT3(int, JXSML__P, _t) intP_t;
-	typedef JXSML__CONCAT3(int, JXSML__2P, _t) int2P_t;
-	typedef JXSML__CONCAT3(uint, JXSML__2P, _t) uint2P_t;
+	typedef jxsml__intP_t intP_t;
+	typedef jxsml__int2P_t int2P_t;
+	typedef jxsml__uint2P_t uint2P_t;
 
 	jxsml__modular_channel_t *c = &m->channel[cidx];
 	int32_t width = c->width, height = c->height;
 	int32_t y, x, i;
+	int32_t *refcmap = NULL, nrefcmap; // refcmap[i] is a channel index for properties (16..19)+4*i
 #ifdef JXSML__WP
-	int2P_t *errbuf;
+	int2P_t *errbuf = NULL;
 #endif
 
-	JXSML__ASSERT(st->modular_16bit_buffers);
 	JXSML__ASSERT(m->tree); // caller should set this to the global tree if not given
 	JXSML__ASSERT(c->pixels);
 
+	JXSML__SHOULD(refcmap = malloc(sizeof(int32_t) * (size_t) cidx), "!mem");
 #ifdef JXSML__WP
 	JXSML__SHOULD(errbuf = calloc((size_t) width * 10, sizeof(int2P_t)), "!mem");
 #endif
+
+	nrefcmap = 0;
+	for (i = cidx - 1; i >= 0; --i) {
+		jxsml__modular_channel_t *refc = &m->channel[i];
+		if (c->width != refc->width || c->height != refc->height) continue;
+		if (c->hshift != refc->hshift || c->vshift != refc->vshift) continue;
+		refcmap[nrefcmap++] = i;
+	}
 
 	for (y = 0; y < height; ++y) {
 		intP_t *nnline = (intP_t*) c->pixels + (y - 2) * c->width;
@@ -2147,12 +2238,11 @@ int JXSML__CONCAT(jxsml__modular_channel, JXSML__P)(
 #endif
 					break;
 				default:
-					refcidx = cidx - (~n->branch.prop - 16) / 4 - 1;
-					JXSML__SHOULD(refcidx >= 0, "trec");
-					refc = &m->channel[refcidx];
+					refcidx = (~n->branch.prop - 16) / 4;
+					JXSML__SHOULD(refcidx < nrefcmap, "trec");
+					refc = &m->channel[refcmap[refcidx]];
 					refpixels = refc->pixels;
-					JXSML__SHOULD(c->width == refc->width && c->height == refc->height &&
-						c->hshift == refc->hshift && c->vshift == refc->vshift, "tred");
+					JXSML__ASSERT(c->width == refc->width && c->height == refc->height);
 					val = refpixels[y * refc->width + x]; // rC
 					if (~n->branch.prop & 2) {
 						int2P_t rw = x > 0 ? refpixels[y * refc->width + (x - 1)] : 0;
@@ -2201,12 +2291,14 @@ int JXSML__CONCAT(jxsml__modular_channel, JXSML__P)(
 		}
 	}
 
+	free(refcmap);
 #ifdef JXSML__WP
 	free(errbuf);
 #endif
 	return 0;
 
 error:
+	free(refcmap);
 #ifdef JXSML__WP
 	free(errbuf);
 #endif
@@ -2215,19 +2307,11 @@ error:
 	return st->err;
 }
 
-int jxsml__modular_channel(jxsml__st *st, jxsml__modular_t *m, int32_t cidx, int32_t sidx) {
-	if (st->modular_16bit_buffers) {
-		return jxsml__modular_channel16(st, m, cidx, sidx);
-	} else {
-		return JXSML__ERR("TODO: jxsml__modular_channel32");
-	}
-}
-
 int JXSML__CONCAT(jxsml__inverse_rct, JXSML__P)(
 	jxsml__st *st, jxsml__modular_t *m, const jxsml__transform_t *tr
 ) {
-	typedef JXSML__CONCAT3(int, JXSML__P, _t) intP_t;
-	typedef JXSML__CONCAT3(int, JXSML__2P, _t) int2P_t;
+	typedef jxsml__intP_t intP_t;
+	typedef jxsml__int2P_t int2P_t;
 
 	static const uint8_t PERMUTATIONS[6][3] = {{0,1,2},{1,2,0},{2,0,1},{0,2,1},{1,0,2},{2,1,0}};
 
@@ -2289,30 +2373,11 @@ error:
 	return st->err;
 }
 
-#define JXSML__X(x,y,z) {x,y,z}, {-(x),-(y),-(z)}
-#define JXSML__XX(a,b,c,d,e,f) JXSML__X a, JXSML__X b, JXSML__X c, JXSML__X d, JXSML__X e, JXSML__X f
-static const int16_t JXSML__PALETTE_DELTAS[144][3] = { // the first entry is a duplicate and skipped
-	JXSML__XX((0, 0, 0), (4, 4, 4), (11, 0, 0), (0, 0, -13), (0, -12, 0), (-10, -10, -10)),
-	JXSML__XX((-18, -18, -18), (-27, -27, -27), (-18, -18, 0), (0, 0, -32), (-32, 0, 0), (-37, -37, -37)),
-	JXSML__XX((0, -32, -32), (24, 24, 45), (50, 50, 50), (-45, -24, -24), (-24, -45, -45), (0, -24, -24)),
-	JXSML__XX((-34, -34, 0), (-24, 0, -24), (-45, -45, -24), (64, 64, 64), (-32, 0, -32), (0, -32, 0)),
-	JXSML__XX((-32, 0, 32), (-24, -45, -24), (45, 24, 45), (24, -24, -45), (-45, -24, 24), (80, 80, 80)),
-	JXSML__XX((64, 0, 0), (0, 0, -64), (0, -64, -64), (-24, -24, 45), (96, 96, 96), (64, 64, 0)),
-	JXSML__XX((45, -24, -24), (34, -34, 0), (112, 112, 112), (24, -45, -45), (45, 45, -24), (0, -32, 32)),
-	JXSML__XX((24, -24, 45), (0, 96, 96), (45, -24, 24), (24, -45, -24), (-24, -45, 24), (0, -64, 0)),
-	JXSML__XX((96, 0, 0), (128, 128, 128), (64, 0, 64), (144, 144, 144), (96, 96, 0), (-36, -36, 36)),
-	JXSML__XX((45, -24, -45), (45, -45, -24), (0, 0, -96), (0, 128, 128), (0, 96, 0), (45, 24, -45)),
-	JXSML__XX((-128, 0, 0), (24, -45, 24), (-45, 24, -45), (64, 0, -64), (64, -64, -64), (96, 0, 96)),
-	JXSML__XX((45, -45, 24), (24, 45, -45), (64, 64, -64), (128, 128, 0), (0, 0, -128), (-24, 45, -45)),
-};
-#undef JXSML__X
-#undef JXSML__XX
-
 int JXSML__CONCAT(jxsml__inverse_palette, JXSML__P)(
 	jxsml__st *st, jxsml__modular_t *m, const jxsml__transform_t *tr
 ) {
-	typedef JXSML__CONCAT3(int, JXSML__P, _t) intP_t;
-	typedef JXSML__CONCAT3(int, JXSML__2P, _t) int2P_t;
+	typedef jxsml__intP_t intP_t;
+	typedef jxsml__int2P_t int2P_t;
 
 	// `first` is the index channel index; restored color channels will be at indices [first,last],
 	// where the original index channel is relocated to the index `last` and then repurposed.
@@ -2380,6 +2445,31 @@ error:
 	return st->err;
 }
 
+// ----------------------------------------
+// end of recursion
+	#undef jxsml__intP_t
+	#undef jxsml__int2P_t
+	#undef jxsml__uint2P_t
+	#undef jxsml__abs2P
+	#undef jxsml__max2P
+	#undef jxsml__min2P
+	#undef jxsml__floor_lg2P
+	#undef jxsml__gradient2P
+	#undef jxsml__floor_avgP
+	#undef JXSML__P
+	#undef JXSML__2P
+#endif // JXSML__RECURSING == 200
+#ifndef JXSML__RECURSING
+// ----------------------------------------
+
+int jxsml__modular_channel(jxsml__st *st, jxsml__modular_t *m, int32_t cidx, int32_t sidx) {
+	if (st->modular_16bit_buffers) {
+		return jxsml__modular_channel16(st, m, cidx, sidx);
+	} else {
+		return jxsml__modular_channel32(st, m, cidx, sidx);
+	}
+}
+
 int jxsml__finish_modular(jxsml__st *st, jxsml__modular_t *m) {
 	int32_t i;
 
@@ -2394,7 +2484,15 @@ int jxsml__finish_modular(jxsml__st *st, jxsml__modular_t *m) {
 			}
 		}
 	} else {
-		return JXSML__ERR("TODO: jxsml__inverse_*32");
+		for (i = m->nb_transforms - 1; i >= 0; --i) {
+			const jxsml__transform_t *tr = &m->transform[i];
+			switch (tr->tr) {
+			case JXSML__TR_RCT: JXSML__TRY(jxsml__inverse_rct32(st, m, tr)); break;
+			case JXSML__TR_PALETTE: JXSML__TRY(jxsml__inverse_palette32(st, m, tr)); break;
+			case JXSML__TR_SQUEEZE: JXSML__RAISE("TODO: squeeze inverse transformation"); break;
+			default: JXSML__UNREACHABLE();
+			}
+		}
 	}
 
 error:
@@ -2746,6 +2844,8 @@ int jxsml__frame(jxsml__st *st, jxsml__frame_t *f) {
 				JXSML__TRY(jxsml__modular_channel(st, &f->gmodular, i, 0));
 			}
 			JXSML__TRY(jxsml__finish_and_free_code(st, &f->gmodular.code));
+		} else {
+			num_gm_channels = 0;
 		}
 	}
 
@@ -2817,6 +2917,7 @@ error:
 
 ////////////////////////////////////////////////////////////////////////////////
 
+const char *dumppath = NULL;
 void end(const jxsml img, const jxsml__st st) {}
 
 void update_cksum(uint8_t b, uint32_t *crc, uint32_t *adler) {
@@ -2868,9 +2969,9 @@ int jxsml_load_from_memory(jxsml *out, const void *buf, size_t bufsize) {
 			(char*[]){"regular", "lf", "refonly", "regular-but-skip-progressive"}[frame.type],
 			frame.x0, frame.y0, frame.width, frame.height);
 
-		if (frame.type == JXSML__FRAME_REGULAR) {
+		if (dumppath && frame.type == JXSML__FRAME_REGULAR) {
 			JXSML__ASSERT(st->modular_16bit_buffers && st->out->bpp >= 8 && st->out->exp_bits == 0);
-			FILE *f = fopen("corpus/dump.png", "wb");
+			FILE *f = fopen(dumppath, "wb");
 			uint32_t crc, adler, unused = 0, idatsize;
 			int16_t *c[4];
 			int32_t nchan;
@@ -2934,6 +3035,7 @@ error:
 
 int main(int argc, char **argv) {
 	if (argc < 2) return 1;
+	if (argc > 2) dumppath = argv[2];
 	FILE *fp = fopen(argv[1], "rb");
 	if (!fp) return 2;
 	if (fseek(fp, 0, SEEK_END)) return 2;
