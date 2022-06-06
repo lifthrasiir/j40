@@ -757,7 +757,7 @@ int jxsml__init_alias_map(jxsml__st *st, const int16_t *D, int32_t log_alpha_siz
 	JXSML__SHOULD(buckets = malloc(sizeof(jxsml__alias_bucket) << log_alpha_size), "!mem");
 
 	for (i = 0; i < table_size && !D[i]; ++i);
-	for (j = i + 1; j < table_size && !D[j]; ++j);
+	for (j = (int16_t) (i + 1); j < table_size && !D[j]; ++j);
 	if (i < table_size && j >= table_size) { // D[i] is the only non-zero probability
 		for (j = 0; j < table_size; ++j) {
 			buckets[j].symbol = i;
@@ -1038,12 +1038,13 @@ int jxsml__code_spec(jxsml__st *st, int32_t num_dist, jxsml__code_spec_t *spec) 
 				int16_t bias_size = (int16_t) (DISTSUM - d * alpha_size);
 				for (j = 0; j < bias_size; ++j) D[j] = (int16_t) (d + 1);
 				for (; j < alpha_size; ++j) D[j] = d;
+				for (; j < table_size; ++j) D[j] = 0;
 				break;
 			}
 
 			case 0: { // bit counts + RLE (false -> false)
 				int32_t len, shift, alpha_size, omit_log, omit_pos, code, total, n;
-				int32_t ncodes, codes[259]; // # bits to read if >= 0, minus repeat count if < 0
+				int32_t ncodes, codes[259]; // exponents if >= 0, negated repeat count if < 0
 
 				len = jxsml__u(st, 1) ? jxsml__u(st, 1) ? jxsml__u(st, 1) ? 3 : 2 : 1 : 0;
 				shift = jxsml__u(st, len) + (1 << len) - 1;
@@ -1197,7 +1198,14 @@ void jxsml__free_code(jxsml__code_t *code) {
 }
 
 int jxsml__finish_and_free_code(jxsml__st *st, jxsml__code_t *code) {
-	if (!code->spec->use_prefix_code) JXSML__SHOULD(code->ans_state == JXSML__ANS_INIT_STATE, "ans?");
+	if (!code->spec->use_prefix_code) {
+		if (code->ans_state) {
+			JXSML__SHOULD(code->ans_state == JXSML__ANS_INIT_STATE, "ans?");
+		} else { // edge case: if no symbols have been read the state has to be read at this point
+			JXSML__SHOULD(jxsml__u(st, 16) == (JXSML__ANS_INIT_STATE & 0xffff), "ans?");
+			JXSML__SHOULD(jxsml__u(st, 16) == (JXSML__ANS_INIT_STATE >> 16), "ans?");
+		}
+	}
 	if (code->spec->lz77_enabled) JXSML__SHOULD(code->num_to_copy == 0, "lz7?");
 error:
 	jxsml__free_code(code);
@@ -1610,6 +1618,7 @@ int jxsml__ma_tree(jxsml__st *st, jxsml__ma_tree_t **tree, jxsml__code_spec_t *c
 	int32_t ctx_id = 0, nodes_left = 1;
 
 	JXSML__TRY(jxsml__code_spec(st, 6, codespec));
+	JXSML__TRY(jxsml__refill(st, 32));
 	JXSML__SHOULD(t = malloc(sizeof(jxsml__ma_tree_t) * (size_t) tree_cap), "!mem");
 	while (nodes_left-- > 0) { // depth-first, left-to-right ordering
 		jxsml__ma_tree_t *n;
@@ -1717,6 +1726,8 @@ int jxsml__init_modular_for_global(
 	if (frame_is_modular) {
 		m->num_channels += (!frame_do_ycbcr && !st->xyb_encoded && st->out->cspace == JXSML_CS_GREY ? 1 : 3);
 	}
+	if (m->num_channels == 0) return 0;
+
 	JXSML__SHOULD(m->channel = calloc((size_t) m->num_channels, sizeof(jxsml__modular_channel_t)), "!mem");
 	for (i = 0; i < st->num_extra_channels; ++i) {
 		int32_t log_upsampling = (frame_ec_log_upsampling ? frame_ec_log_upsampling[i] : 0) + st->ec_info[i].dim_shift;
@@ -1743,31 +1754,34 @@ int jxsml__init_modular_for_pass_group(
 	jxsml__st *st, int32_t num_gm_channels, int32_t gy, int32_t gx, int32_t group_size,
 	int32_t minshift, int32_t maxshift, const jxsml__modular_t *gm, jxsml__modular_t *m
 ) {
-	int32_t i;
+	int32_t i, max_channels;
 
 	jxsml__init_modular_common(m);
-	m->num_channels = gm->num_channels - num_gm_channels;
-	JXSML__ASSERT(m->num_channels >= 0);
-	JXSML__SHOULD(m->channel = calloc((size_t) m->num_channels, sizeof(jxsml__modular_channel_t)), "!mem");
-	for (i = num_gm_channels, m->num_channels = 0; i < gm->num_channels; ++i) {
+	m->num_channels = 0;
+	max_channels = gm->num_channels - num_gm_channels;
+	JXSML__ASSERT(max_channels >= 0);
+	JXSML__SHOULD(m->channel = calloc((size_t) max_channels, sizeof(jxsml__modular_channel_t)), "!mem");
+	for (i = num_gm_channels; i < gm->num_channels; ++i) {
 		jxsml__modular_channel_t *gc = &gm->channel[i], *c = &m->channel[m->num_channels];
 		if (gc->hshift < 3 || gc->vshift < 3) {
 			int32_t gx0, gx1, gy0, gy1;
 			JXSML__ASSERT(gc->hshift >= 0 && gc->vshift >= 0);
 			(void) minshift; (void) maxshift;
 			// TODO check minshift/maxshift!!!
-			gx0 = gx >> gc->hshift; gx1 = (gx + group_size) >> gc->hshift;
-			gy0 = gy >> gc->vshift; gy1 = (gy + group_size) >> gc->vshift;
-			if (gx0 > gc->width) gx0 = gc->width;
-			if (gx1 > gc->width) gx1 = gc->width;
-			if (gy0 > gc->height) gy0 = gc->height;
-			if (gy1 > gc->height) gy1 = gc->height;
+			gx0 = jxsml__min32(gx >> gc->hshift, gc->width);
+			gy0 = jxsml__min32(gy >> gc->vshift, gc->height);
+			gx1 = jxsml__min32((gx + group_size) >> gc->hshift, gc->width);
+			gy1 = jxsml__min32((gy + group_size) >> gc->vshift, gc->height);
 			c->hshift = gc->hshift;
 			c->vshift = gc->vshift;
 			c->width = gx1 - gx0;
 			c->height = gy1 - gy0;
 			++m->num_channels;
 		}
+	}
+	if (m->num_channels == 0) {
+		free(m->channel);
+		m->channel = NULL;
 	}
 error:
 	return st->err;
@@ -1803,15 +1817,17 @@ error:
 	return st->err;
 }
 
-int jxsml__is_modular_channel_equal_sized(jxsml__st *st, const jxsml__modular_t *m, int32_t begin, int32_t end) {
+int jxsml__is_modular_channel_equal_sized(jxsml__st *st,
+	const jxsml__modular_channel_t *begin, const jxsml__modular_channel_t *end
+) {
 	jxsml__modular_channel_t c;
 	if (begin >= end) return 0; // do not allow edge cases
-	c = m->channel[begin];
+	c = *begin;
 	while (++begin < end) {
-		if (c.width != m->channel[begin].width || c.height != m->channel[begin].height) return 0;
+		if (c.width != begin->width || c.height != begin->height) return 0;
 #ifdef JXSML_DEBUG
-		if (c.vshift >= 0 && c.hshift >= 0 && m->channel[begin].vshift >= 0 && m->channel[begin].hshift >= 0 &&
-			(c.vshift != m->channel[begin].vshift || c.hshift != m->channel[begin].hshift)
+		if (c.vshift >= 0 && c.hshift >= 0 && begin->vshift >= 0 && begin->hshift >= 0 &&
+			(c.vshift != begin->vshift || c.hshift != begin->hshift)
 		) {
 			return JXSML__ERR("!exp"), 0;
 		}
@@ -1831,9 +1847,10 @@ int jxsml__modular_header(
 	int32_t channel_cap = m->num_channels, transform_cap;
 	int32_t i, j;
 
-	if (num_channels <= 0) return 0;
+	JXSML__ASSERT(num_channels > 0);
 
 	m->use_global_tree = jxsml__u(st, 1);
+	JXSML__SHOULD(!m->use_global_tree || global_tree, "mtre");
 	{ // WPHeader
 		int default_wp = jxsml__u(st, 1);
 		m->wp_p1 = default_wp ? 16 : (int8_t) jxsml__u(st, 5);
@@ -1856,17 +1873,18 @@ int jxsml__modular_header(
 			JXSML__SHOULD(type < 42, "rctt");
 			JXSML__SHOULD(begin_c + 3 <= num_channels, "rctc");
 			JXSML__SHOULD(begin_c >= nb_meta_channels || begin_c + 3 <= nb_meta_channels, "rctc");
-			JXSML__SHOULD(jxsml__is_modular_channel_equal_sized(st, m, begin_c, begin_c + 3), "rtcd");
+			JXSML__SHOULD(jxsml__is_modular_channel_equal_sized(st, channel + begin_c, channel + begin_c + 3), "rtcd");
+			fprintf(stderr, "transform %d: rct type %d [%d,%d)\n", i, type, begin_c, begin_c + 3);
 			break;
 		}
 
 		// Palette: [begin_c, end_c) -> palette 0 (meta, nb_colours by num_c) + index begin_c+1
 		case JXSML__TR_PALETTE: {
+			jxsml__modular_channel_t input;
 			int32_t begin_c = tr->pal.begin_c = jxsml__u32(st, 0, 3, 8, 6, 72, 10, 1096, 13);
 			int32_t num_c = tr->pal.num_c = jxsml__u32(st, 1, 0, 3, 0, 4, 0, 1, 13);
 			int32_t end_c = begin_c + num_c;
 			int32_t nb_colours = tr->pal.nb_colours = jxsml__u32(st, 0, 8, 256, 10, 1280, 12, 5376, 16);
-			jxsml__modular_channel_t input;
 			tr->pal.nb_deltas = jxsml__u32(st, 0, 0, 1, 8, 257, 10, 1281, 16);
 			tr->pal.d_pred = jxsml__u(st, 4);
 			JXSML__SHOULD(tr->pal.d_pred < JXSML__NUM_PRED, "palp");
@@ -1877,15 +1895,18 @@ int jxsml__modular_header(
 			} else { // num_c color channels -> 1 meta channel (palette) + 1 color channel (index)
 				nb_meta_channels += 1;
 			}
-			JXSML__SHOULD(jxsml__is_modular_channel_equal_sized(st, m, begin_c, end_c), "pald");
-			JXSML__TRY_REALLOC(&channel, sizeof(*channel), num_channels + 1 - num_c, &channel_cap);
+			JXSML__SHOULD(jxsml__is_modular_channel_equal_sized(st, channel + begin_c, channel + end_c), "rtcd");
+			// inverse palette transform always requires one more channel slot
+			JXSML__TRY_REALLOC(&channel, sizeof(*channel), num_channels + 1, &channel_cap);
 			input = channel[begin_c];
 			memmove(channel + 1, channel, sizeof(*channel) * (size_t) begin_c);
-			memmove(channel + begin_c + 1, channel + end_c, sizeof(*channel) * (size_t) (num_channels - end_c));
+			memmove(channel + begin_c + 2, channel + end_c, sizeof(*channel) * (size_t) (num_channels - end_c));
 			channel[0].width = nb_colours;
 			channel[0].height = num_c;
 			channel[0].vshift = channel[0].hshift = -1;
 			channel[begin_c + 1] = input;
+			num_channels += 2 - num_c;
+			fprintf(stderr, "transform %d: palette [%d,%d) c%d d%d p%d\n", i, begin_c, end_c, nb_colours, tr->pal.nb_deltas, tr->pal.d_pred);
 			break;
 		}
 
@@ -1930,16 +1951,19 @@ int jxsml__modular_header(
 	m->max_width = 0;
 	for (i = 0; i < num_channels; ++i) {
 		channel[i].pixels = NULL;
-		if (i >= nb_meta_channels && m->max_width < channel[i].width) m->max_width = channel[i].width;
+		if (i >= nb_meta_channels) m->max_width = jxsml__max32(m->max_width, channel[i].width);
 	}
 	return 0;
 
 error:
+	free(channel);
 	free(m->transform);
 	if (!m->use_global_tree) {
 		free(m->tree);
 		jxsml__free_code_spec(&m->codespec);
 	}
+	m->num_channels = 0;
+	m->channel = NULL;
 	m->transform = NULL;
 	m->tree = NULL;
 	memset(&m->codespec, 0, sizeof(jxsml__code_spec_t));
@@ -1975,6 +1999,7 @@ static const int32_t JXSML__24DIVP1[64] = { // [i] = floor(2^24 / (i+1))
 
 #define JXSML__P 16
 #define JXSML__2P 32
+#define JXSML__WP
 
 #define jxsml__abs2P JXSML__CONCAT(jxsml__abs, JXSML__2P)
 #define jxsml__max2P JXSML__CONCAT(jxsml__max, JXSML__2P)
@@ -1991,30 +2016,38 @@ int JXSML__CONCAT(jxsml__modular_channel, JXSML__P)(
 	typedef JXSML__CONCAT3(uint, JXSML__2P, _t) uint2P_t;
 
 	jxsml__modular_channel_t *c = &m->channel[cidx];
-	int2P_t *errbuf;
 	int32_t width = c->width, height = c->height;
 	int32_t y, x, i;
+#ifdef JXSML__WP
+	int2P_t *errbuf;
+#endif
 
 	JXSML__ASSERT(st->modular_16bit_buffers);
 	JXSML__ASSERT(m->tree); // caller should set this to the global tree if not given
 	JXSML__ASSERT(c->pixels);
 
+#ifdef JXSML__WP
 	JXSML__SHOULD(errbuf = calloc((size_t) width * 10, sizeof(int2P_t)), "!mem");
+#endif
 
 	for (y = 0; y < height; ++y) {
 		intP_t *nnline = (intP_t*) c->pixels + (y - 2) * c->width;
 		intP_t *nline = (intP_t*) c->pixels + (y - 1) * c->width;
 		intP_t *line = (intP_t*) c->pixels + y * c->width;
 
+#ifdef JXSML__WP
 		int2P_t (*err)[4] = (void*) (errbuf + (y & 1 ? width * 4 : 0));
 		int2P_t (*nerr)[4] = (void*) (errbuf + (y & 1 ? 0 : width * 4));
 		int2P_t *trueerr = errbuf + (y & 1 ? width * 9 : width * 8);
 		int2P_t *ntrueerr = errbuf + (y & 1 ? width * 8 : width * 9);
+#endif
 
 		for (x = 0; x < width; ++x) {
 			jxsml__ma_tree_t *n = m->tree;
 			int2P_t pnn, pnww, pnw, pn, pne, pnee, pww, pw, val;
+#ifdef JXSML__WP
 			int2P_t trueerrw, trueerrn, trueerrnw, trueerrne, subpred6[4], pred6;
+#endif
 
 			/*            NN
 			 *             |
@@ -2034,36 +2067,38 @@ int JXSML__CONCAT(jxsml__modular_channel, JXSML__P)(
 			pnw = x > 0 && y > 0 ? nline[x - 1] : pw;
 			pne = x + 1 < c->width && y > 0 ? nline[x + 1] : pn;
 			pnn = y > 1 ? nnline[x] : pn;
-			pnee = x + 1 < c->width && y > 0 ? nline[x + 2] : pne;
+			pnee = x + 2 < c->width && y > 0 ? nline[x + 2] : pne;
 			pww = x > 1 ? line[x - 2] : pw;
 			pnww = x > 1 && y > 0 ? nline[x - 2] : pww;
 
-			trueerrw = x > 0 ? trueerr[x - 1] : y > 0 ? ntrueerr[x] : 0;
-			trueerrn = y > 0 ? ntrueerr[x] : trueerrw;
-			trueerrnw = x > 0 && y > 0 ? ntrueerr[x - 1] : trueerrw;
+#ifdef JXSML__WP
+			trueerrw = x > 0 ? trueerr[x - 1] : 0;
+			trueerrn = y > 0 ? ntrueerr[x] : 0;
+			trueerrnw = x > 0 && y > 0 ? ntrueerr[x - 1] : trueerrn;
 			trueerrne = x + 1 < c->width && y > 0 ? ntrueerr[x + 1] : trueerrn;
 
 			{ // weighted self-correcting predictor
 				static const int2P_t ZERO[4] = {0, 0, 0, 0};
 				int2P_t w[4], wsum, sum;
-				const int2P_t *errw = x > 0 ? err[x - 1] : y > 0 ? nerr[x] : ZERO;
-				const int2P_t *errn = y > 0 ? nerr[x] : errw;
-				const int2P_t *errnw = x > 0 && y > 0 ? nerr[x - 1] : errw;
+				const int2P_t *errw = x > 0 ? err[x - 1] : ZERO;
+				const int2P_t *errn = y > 0 ? nerr[x] : ZERO;
+				const int2P_t *errnw = x > 0 && y > 0 ? nerr[x - 1] : errn;
 				const int2P_t *errne = x + 1 < c->width && y > 0 ? nerr[x + 1] : errn;
-				const int2P_t *errww = x > 1 ? err[x - 2] : errw;
+				const int2P_t *errww = x > 1 ? err[x - 2] : ZERO;
+				const int2P_t *errw2 = x + 1 < c->width ? ZERO : errw; // what?
 				int32_t logw;
 
 				subpred6[0] = ((int2P_t) pw + pne - pn) << 3;
-				subpred6[1] = ((int2P_t) pn << 3) - (((trueerrw + trueerrn + trueerrne) * m->wp_p1) >> 5);
-				subpred6[2] = ((int2P_t) pw << 3) - (((trueerrw + trueerrn + trueerrnw) * m->wp_p2) >> 5);
-				subpred6[3] = ((int2P_t) pn << 3) +
+				subpred6[1] = ((int2P_t) pn << 3) - ((((int2P_t) trueerrw + trueerrn + trueerrne) * m->wp_p1) >> 5);
+				subpred6[2] = ((int2P_t) pw << 3) - ((((int2P_t) trueerrw + trueerrn + trueerrnw) * m->wp_p2) >> 5);
+				subpred6[3] = ((int2P_t) pn << 3) -
 					(((int2P_t) trueerrnw * m->wp_p3[0] + (int2P_t) trueerrn * m->wp_p3[1] +
-					  (int2P_t) trueerrne * m->wp_p3[2] + (((int2P_t) pnn + pn) << 3) * m->wp_p3[3] +
+					  (int2P_t) trueerrne * m->wp_p3[2] + (((int2P_t) pnn - pn) << 3) * m->wp_p3[3] +
 					  (((int2P_t) pnw - pw) << 3) * m->wp_p3[4]) >> 5);
 				for (i = 0; i < 4; ++i) {
-					int2P_t errsum = errn[i] + errw[i] + errnw[i] + errww[i] + errne[i];
+					int2P_t errsum = errn[i] + errw[i] + errnw[i] + errww[i] + errne[i] + errw2[i];
 					int32_t shift = jxsml__max32(jxsml__floor_lg2P((uint2P_t) errsum + 1) - 5, 0);
-					w[i] = 4 + ((int2P_t) m->wp_w[i] * JXSML__24DIVP1[errsum >> shift] >> 24);
+					w[i] = (int2P_t) (4 + ((int64_t) m->wp_w[i] * JXSML__24DIVP1[errsum >> shift] >> shift));
 				}
 				logw = jxsml__floor_lg2P((uint2P_t) (w[0] + w[1] + w[2] + w[3])) - 4;
 				wsum = sum = 0;
@@ -2071,13 +2106,14 @@ int JXSML__CONCAT(jxsml__modular_channel, JXSML__P)(
 					wsum += w[i] >>= logw;
 					sum += subpred6[i] * w[i];
 				}
-				pred6 = ((int2P_t) sum + (wsum >> 1) - 1) * JXSML__24DIVP1[wsum - 1] >> 24;
+				pred6 = (int2P_t) (((int64_t) sum + (wsum >> 1) - 1) * JXSML__24DIVP1[wsum - 1] >> 24);
 				if (((trueerrn ^ trueerrw) | (trueerrn ^ trueerrnw)) <= 0) {
-					int2P_t lo = jxsml__min2P(pw, jxsml__min2P(pn, pne));
-					int2P_t hi = jxsml__max2P(pw, jxsml__max2P(pn, pne));
+					int2P_t lo = jxsml__min2P(pw, jxsml__min2P(pn, pne)) << 3;
+					int2P_t hi = jxsml__max2P(pw, jxsml__max2P(pn, pne)) << 3;
 					pred6 = jxsml__min2P(jxsml__max2P(lo, pred6), hi);
 				}
 			}
+#endif // JXSML__WP
 
 			while (n->branch.prop < 0) {
 				int32_t refcidx;
@@ -2101,10 +2137,14 @@ int JXSML__CONCAT(jxsml__modular_channel, JXSML__P)(
 				case 13: val = pn - pnn; break;
 				case 14: val = pw - pww; break;
 				case 15:
+#ifdef JXSML__WP
 					val = trueerrw;
 					if (jxsml__abs2P(val) < jxsml__abs2P(trueerrn)) val = trueerrn;
 					if (jxsml__abs2P(val) < jxsml__abs2P(trueerrnw)) val = trueerrnw;
 					if (jxsml__abs2P(val) < jxsml__abs2P(trueerrne)) val = trueerrne;
+#else
+					JXSML__UNREACHABLE();
+#endif
 					break;
 				default:
 					refcidx = cidx - (~n->branch.prop - 16) / 4 - 1;
@@ -2126,38 +2166,50 @@ int JXSML__CONCAT(jxsml__modular_channel, JXSML__P)(
 				n += val > n->branch.value ? n->branch.leftoff : n->branch.rightoff;
 			}
 
-			val = jxsml__code(st, n->leaf.ctx, n->leaf.multiplier, &m->code);
-			val = JXSML__TO_SIGNED(val) + n->leaf.offset;
+			val = jxsml__code(st, n->leaf.ctx, m->max_width, &m->code);
+			val = JXSML__TO_SIGNED(val) * n->leaf.multiplier + n->leaf.offset;
 			switch (n->leaf.predictor) {
 			case 0: break;
 			case 1: val += pw; break;
 			case 2: val += pn; break;
-			case 3: val += (pw + pn) / 2; break;
+			case 3: val += ((int2P_t) pw + pn) / 2; break;
 			case 4: val += jxsml__abs2P(pn - pnw) < jxsml__abs2P(pw - pnw) ? pw : pn; break;
 			case 5: val += jxsml__gradient2P(pw, pn, pnw); break;
+#ifdef JXSML__WP
 			case 6: val += (pred6 + 3) >> 3; break;
+#else
+			case 6: JXSML__UNREACHABLE(); break;
+#endif
 			case 7: val += pne; break;
 			case 8: val += pnw; break;
 			case 9: val += pww; break;
-			case 10: val += (pw + pnw) / 2; break;
-			case 11: val += (pn + pnw) / 2; break;
-			case 12: val += (pn + pne) / 2; break;
-			case 13: val += (6 * pn - 2 * pnn + 7 * pw + pww + pnee + 3 * pne + 8) / 16; break;
+			case 10: val += ((int2P_t) pw + pnw) / 2; break;
+			case 11: val += ((int2P_t) pn + pnw) / 2; break;
+			case 12: val += ((int2P_t) pn + pne) / 2; break;
+			case 13: val += (6 * (int2P_t) pn - 2 * (int2P_t) pnn + 7 * (int2P_t) pw + (int2P_t) pww + (int2P_t) pnee + 3 * (int2P_t) pne + 8) / 16; break;
 			default: JXSML__RAISE("pred");
 			}
 
-			// update self-correcting predictor state
-			trueerr[x] = jxsml__abs2P((val << 3) - pred6);
-			for (i = 0; i < 4; ++i) err[x][i] = jxsml__abs2P(val - ((subpred6[i] + 3) >> 3));
-
 			JXSML__SHOULD(INT16_MIN <= val && val <= INT16_MAX, "povf");
 			line[x] = (intP_t) val;
+
+#ifdef JXSML__WP
+			// update self-correcting predictor state
+			trueerr[x] = pred6 - (val << 3);
+			for (i = 0; i < 4; ++i) err[x][i] = (jxsml__abs2P(subpred6[i] - (val << 3)) + 3) >> 3;
+#endif
 		}
 	}
 
+#ifdef JXSML__WP
+	free(errbuf);
+#endif
 	return 0;
 
 error:
+#ifdef JXSML__WP
+	free(errbuf);
+#endif
 	free(c->pixels);
 	c->pixels = NULL;
 	return st->err;
@@ -2171,162 +2223,182 @@ int jxsml__modular_channel(jxsml__st *st, jxsml__modular_t *m, int32_t cidx, int
 	}
 }
 
-int JXSML__CONCAT(jxsml__finish_modular, JXSML__P)(jxsml__st *st, jxsml__modular_t *m) {
+int JXSML__CONCAT(jxsml__inverse_rct, JXSML__P)(
+	jxsml__st *st, jxsml__modular_t *m, const jxsml__transform_t *tr
+) {
 	typedef JXSML__CONCAT3(int, JXSML__P, _t) intP_t;
 	typedef JXSML__CONCAT3(int, JXSML__2P, _t) int2P_t;
 
-	int32_t i, j, k;
+	static const uint8_t PERMUTATIONS[6][3] = {{0,1,2},{1,2,0},{2,0,1},{0,2,1},{1,0,2},{2,1,0}};
 
-	JXSML__TRY(jxsml__finish_and_free_code(st, &m->code));
+	jxsml__modular_channel_t *channel = m->channel + tr->rct.begin_c;
+	intP_t *p[3];
+	int32_t npixels, i;
 
-	for (i = m->nb_transforms - 1; i >= 0; --i) {
-		jxsml__transform_t *tr = &m->transform[i];
+	JXSML__ASSERT(tr->tr == JXSML__TR_RCT);
+	JXSML__ASSERT(jxsml__is_modular_channel_equal_sized(st, channel, channel + 3));
 
-		switch (tr->tr) {
-		case JXSML__TR_RCT: {
-			static const uint8_t PERMUTATIONS[6][3] = {{0,1,2},{1,2,0},{2,0,1},{0,2,1},{1,0,2},{2,1,0}};
-			intP_t *p[3];
-			int32_t begin_c = tr->rct.begin_c, npixels;
+	npixels = channel->width * channel->height;
+	for (i = 0; i < 3; ++i) p[i] = channel[i].pixels;
 
-			JXSML__ASSERT(jxsml__is_modular_channel_equal_sized(st, m, begin_c, begin_c + 3));
-			npixels = m->channel[begin_c].width * m->channel[begin_c].height;
-			for (j = 0; j < 3; ++j) p[j] = m->channel[begin_c + j].pixels;
-			switch (tr->rct.type % 7) {
-			case 0: break;
-			case 1:
-				for (j = 0; j < npixels; ++j) p[2][j] = (intP_t) (p[2][j] + p[0][j]);
-				break;
-			case 2:
-				for (j = 0; j < npixels; ++j) p[1][j] = (intP_t) (p[1][j] + p[0][j]);
-				break;
-			case 3:
-				for (j = 0; j < npixels; ++j) {
-					p[1][j] = (intP_t) (p[1][j] + p[0][j]);
-					p[2][j] = (intP_t) (p[2][j] + p[0][j]);
-				}
-				break;
-			case 4:
-				for (j = 0; j < npixels; ++j) {
-					p[1][j] = (intP_t) (p[1][j] + jxsml__floor_avgP(p[0][j], p[2][j]));
-				}
-				break;
-			case 5:
-				for (j = 0; j < npixels; ++j) {
-					p[1][j] = (intP_t) (p[1][j] + jxsml__floor_avgP(p[0][j], p[2][j]));
-					p[2][j] = (intP_t) (p[2][j] + p[0][j]);
-				}
-				break;
-			case 6: // YCgCo
-				for (j = 0; j < npixels; ++j) { // TODO avoid int2P_t if possible
-					int2P_t tmp = (int2P_t) p[0][j] - ((int2P_t) p[2][j] >> 1);
-					int2P_t p1 = (int2P_t) p[2][j] + tmp;
-					int2P_t p2 = tmp - ((int2P_t) p[1][j] >> 1);
-					p[0][j] = (intP_t) (p2 + (int2P_t) p[1][j]);
-					p[1][j] = (intP_t) p1;
-					p[2][j] = (intP_t) p2;
-				}
-				break;
-			default: JXSML__UNREACHABLE();
-			}
-			for (j = 0; j < 3; ++j) {
-				m->channel[begin_c + (int32_t) PERMUTATIONS[tr->rct.type / 7][j]].pixels = p[j];
-			}
-			// TODO detect overflow
-			break;
+	// TODO detect overflow
+	switch (tr->rct.type % 7) {
+	case 0: break;
+	case 1:
+		for (i = 0; i < npixels; ++i) p[2][i] = (intP_t) (p[2][i] + p[0][i]);
+		break;
+	case 2:
+		for (i = 0; i < npixels; ++i) p[1][i] = (intP_t) (p[1][i] + p[0][i]);
+		break;
+	case 3:
+		for (i = 0; i < npixels; ++i) {
+			p[1][i] = (intP_t) (p[1][i] + p[0][i]);
+			p[2][i] = (intP_t) (p[2][i] + p[0][i]);
 		}
+		break;
+	case 4:
+		for (i = 0; i < npixels; ++i) {
+			p[1][i] = (intP_t) (p[1][i] + jxsml__floor_avgP(p[0][i], p[2][i]));
+		}
+		break;
+	case 5:
+		for (i = 0; i < npixels; ++i) {
+			p[1][i] = (intP_t) (p[1][i] + p[0][i] + (p[2][i] >> 1));
+			p[2][i] = (intP_t) (p[2][i] + p[0][i]);
+		}
+		break;
+	case 6: // YCgCo
+		for (i = 0; i < npixels; ++i) { // TODO avoid int2P_t if possible
+			int2P_t tmp = (int2P_t) p[0][i] - ((int2P_t) p[2][i] >> 1);
+			int2P_t p1 = (int2P_t) p[2][i] + tmp;
+			int2P_t p2 = tmp - ((int2P_t) p[1][i] >> 1);
+			p[0][i] = (intP_t) (p2 + p[1][i]);
+			p[1][i] = (intP_t) p1;
+			p[2][i] = (intP_t) p2;
+		}
+		break;
+	default: JXSML__UNREACHABLE();
+	}
 
-		case JXSML__TR_PALETTE: {
-			static const int16_t DELTAS[72][3] = {
-				{0, 0, 0}, {4, 4, 4}, {11, 0, 0}, {0, 0, -13}, {0, -12, 0}, {-10, -10, -10},
-				{-18, -18, -18}, {-27, -27, -27}, {-18, -18, 0}, {0, 0, -32}, {-32, 0, 0}, {-37, -37, -37},
-				{0, -32, -32}, {24, 24, 45}, {50, 50, 50}, {-45, -24, -24}, {-24, -45, -45}, {0, -24, -24},
-				{-34, -34, 0}, {-24, 0, -24}, {-45, -45, -24}, {64, 64, 64}, {-32, 0, -32}, {0, -32, 0},
-				{-32, 0, 32}, {-24, -45, -24}, {45, 24, 45}, {24, -24, -45}, {-45, -24, 24}, {80, 80, 80},
-				{64, 0, 0}, {0, 0, -64}, {0, -64, -64}, {-24, -24, 45}, {96, 96, 96}, {64, 64, 0},
-				{45, -24, -24}, {34, -34, 0}, {112, 112, 112}, {24, -45, -45}, {45, 45, -24}, {0, -32, 32},
-				{24, -24, 45}, {0, 96, 96}, {45, -24, 24}, {24, -45, -24}, {-24, -45, 24}, {0, -64, 0},
-				{96, 0, 0}, {128, 128, 128}, {64, 0, 64}, {144, 144, 144}, {96, 96, 0}, {-36, -36, 36},
-				{45, -24, -45}, {45, -45, -24}, {0, 0, -96}, {0, 128, 128}, {0, 96, 0}, {45, 24, -45},
-				{-128, 0, 0}, {24, -45, 24}, {-45, 24, -45}, {64, 0, -64}, {64, -64, -64}, {96, 0, 96},
-				{45, -45, 24}, {24, 45, -45}, {64, 64, -64}, {128, 128, 0}, {0, 0, -128}, {-24, 45, -45},
-			};
-			// `first` is the index channel index; restored color channels will be at indices [first,last),
-			// where the original index channel is relocated to the index `last - 1` and then repurposed.
-			// the palette meta channel 0 will be removed at the very end.
-			int32_t first = tr->pal.begin_c + 1, last = tr->pal.begin_c + tr->pal.num_c, bpp = st->out->bpp;
-			int32_t y, x;
-			jxsml__modular_channel_t *idxc = &m->channel[last - 1];
-			memmove(m->channel + last, m->channel + first, sizeof(jxsml__modular_channel_t) * (size_t) (m->num_channels - first));
-			m->num_channels += last - first;
-			for (j = first; j < last - 1; ++j) m->channel[j].pixels = NULL;
-			for (j = first; j < last - 1; ++j) {
-				jxsml__modular_channel_t *c = &m->channel[j];
-				c->width = idxc->width;
-				c->height = idxc->height;
-				JXSML__SHOULD(c->pixels = malloc(sizeof(intP_t) * (size_t) (c->width * c->height)), "!mem");
-			}
-			for (j = 0; j < tr->pal.num_c; ++j) {
-				int32_t width = idxc->width, height = idxc->height;
-				intP_t *palp = (intP_t*) m->channel[0].pixels + j * tr->pal.nb_colours;
-				for (y = 0; y < height; ++y) {
-					intP_t *idxp = (intP_t*) idxc->pixels + y * width;
-					intP_t *p = (intP_t*) m->channel[first + j].pixels + y * width;
-					for (x = 0; x < width; ++x) {
-						intP_t idx = idxp[x], val;
-						int is_delta = idx < tr->pal.nb_deltas;
-						if (idx < 0) { // hard-coded delta for first 3 channels, otherwise 0
-							if (j < 3) {
-								idx = ~idx % 143; // say no to 1's complement
-								val = DELTAS[(idx + 1) >> 1][j];
-								if ((idx & 1) == 0) val = -val;
-								if (bpp > 8) val <<= jxsml__min32(bpp, 24) - 8;
-							} else {
-								val = 0;
-							}
-						} else if (idx < tr->pal.nb_colours) {
-							val = palp[idx];
-						} else { // synthesized from (idx - nb_colours)
-							idx -= tr->pal.nb_colours;
-							if (idx < 64) { // idx == ..YX in base 4 -> {(X+0.5)/4, (Y+0.5)/4, ...}
-								val = (intP_t) ((j < 3 ? idx >> (2 * j) : 0) * (((int2P_t) 1 << bpp) - 1) / 4 +
-									(1 << jxsml__max32(0, bpp - 3)));
-							} else { // idx + 64 == ..ZYX in base 5 -> {X/4, Y/4, Z/4, ...}
-								val = idx - 64;
-								for (k = 0; k < j; ++k) val /= 5;
-								val = (intP_t) ((val % 5) * ((1 << bpp) - 1) / 4);
-							}
-						}
-						if (is_delta) {
-							JXSML__RAISE("TODO: not ready for palette deltas");
-						}
-						p[x] = val;
+	for (i = 0; i < 3; ++i) {
+		channel[PERMUTATIONS[tr->rct.type / 7][i]].pixels = p[i];
+	}
+	return 0;
+
+error:
+	return st->err;
+}
+
+#define JXSML__X(x,y,z) {x,y,z}, {-(x),-(y),-(z)}
+#define JXSML__XX(a,b,c,d,e,f) JXSML__X a, JXSML__X b, JXSML__X c, JXSML__X d, JXSML__X e, JXSML__X f
+static const int16_t JXSML__PALETTE_DELTAS[144][3] = { // the first entry is a duplicate and skipped
+	JXSML__XX((0, 0, 0), (4, 4, 4), (11, 0, 0), (0, 0, -13), (0, -12, 0), (-10, -10, -10)),
+	JXSML__XX((-18, -18, -18), (-27, -27, -27), (-18, -18, 0), (0, 0, -32), (-32, 0, 0), (-37, -37, -37)),
+	JXSML__XX((0, -32, -32), (24, 24, 45), (50, 50, 50), (-45, -24, -24), (-24, -45, -45), (0, -24, -24)),
+	JXSML__XX((-34, -34, 0), (-24, 0, -24), (-45, -45, -24), (64, 64, 64), (-32, 0, -32), (0, -32, 0)),
+	JXSML__XX((-32, 0, 32), (-24, -45, -24), (45, 24, 45), (24, -24, -45), (-45, -24, 24), (80, 80, 80)),
+	JXSML__XX((64, 0, 0), (0, 0, -64), (0, -64, -64), (-24, -24, 45), (96, 96, 96), (64, 64, 0)),
+	JXSML__XX((45, -24, -24), (34, -34, 0), (112, 112, 112), (24, -45, -45), (45, 45, -24), (0, -32, 32)),
+	JXSML__XX((24, -24, 45), (0, 96, 96), (45, -24, 24), (24, -45, -24), (-24, -45, 24), (0, -64, 0)),
+	JXSML__XX((96, 0, 0), (128, 128, 128), (64, 0, 64), (144, 144, 144), (96, 96, 0), (-36, -36, 36)),
+	JXSML__XX((45, -24, -45), (45, -45, -24), (0, 0, -96), (0, 128, 128), (0, 96, 0), (45, 24, -45)),
+	JXSML__XX((-128, 0, 0), (24, -45, 24), (-45, 24, -45), (64, 0, -64), (64, -64, -64), (96, 0, 96)),
+	JXSML__XX((45, -45, 24), (24, 45, -45), (64, 64, -64), (128, 128, 0), (0, 0, -128), (-24, 45, -45)),
+};
+#undef JXSML__X
+#undef JXSML__XX
+
+int JXSML__CONCAT(jxsml__inverse_palette, JXSML__P)(
+	jxsml__st *st, jxsml__modular_t *m, const jxsml__transform_t *tr
+) {
+	typedef JXSML__CONCAT3(int, JXSML__P, _t) intP_t;
+	typedef JXSML__CONCAT3(int, JXSML__2P, _t) int2P_t;
+
+	// `first` is the index channel index; restored color channels will be at indices [first,last],
+	// where the original index channel is relocated to the index `last` and then repurposed.
+	// the palette meta channel 0 will be removed at the very end.
+	int32_t first = tr->pal.begin_c + 1, last = tr->pal.begin_c + tr->pal.num_c, bpp = st->out->bpp;
+	int32_t i, j, y, x;
+	jxsml__modular_channel_t *idxc = &m->channel[last];
+
+	JXSML__ASSERT(tr->tr == JXSML__TR_PALETTE);
+
+	memmove(m->channel + last, m->channel + first, sizeof(jxsml__modular_channel_t) * (size_t) (m->num_channels - first));
+	m->num_channels += last - first;
+
+	for (i = first; i < last; ++i) m->channel[i].pixels = NULL;
+	for (i = first; i < last; ++i) {
+		jxsml__modular_channel_t *c = &m->channel[i];
+		c->width = idxc->width;
+		c->height = idxc->height;
+		JXSML__SHOULD(c->pixels = malloc(sizeof(intP_t) * (size_t) (c->width * c->height)), "!mem");
+	}
+
+	for (i = 0; i < tr->pal.num_c; ++i) {
+		int32_t width = idxc->width, height = idxc->height;
+		intP_t *palp = (intP_t*) m->channel[0].pixels + i * tr->pal.nb_colours;
+		for (y = 0; y < height; ++y) {
+			intP_t *idxp = (intP_t*) idxc->pixels + y * width;
+			intP_t *p = (intP_t*) m->channel[first + i].pixels + y * width;
+			for (x = 0; x < width; ++x) {
+				intP_t idx = idxp[x], val;
+				int is_delta = idx < tr->pal.nb_deltas;
+				if (idx < 0) { // hard-coded delta for first 3 channels, otherwise 0
+					if (i < 3) {
+						idx = (intP_t) (~idx % 143); // say no to 1's complement
+						val = JXSML__PALETTE_DELTAS[idx + 1][i];
+						if (bpp > 8) val = (intP_t) (val << (jxsml__min32(bpp, 24) - 8));
+					} else {
+						val = 0;
+					}
+				} else if (idx < tr->pal.nb_colours) {
+					val = palp[idx];
+				} else { // synthesized from (idx - nb_colours)
+					idx = (intP_t) (idx - tr->pal.nb_colours);
+					if (idx < 64) { // idx == ..YX in base 4 -> {(X+0.5)/4, (Y+0.5)/4, ...}
+						val = (intP_t) ((i < 3 ? idx >> (2 * i) : 0) * (((int2P_t) 1 << bpp) - 1) / 4 +
+							(1 << jxsml__max32(0, bpp - 3)));
+					} else { // idx + 64 == ..ZYX in base 5 -> {X/4, Y/4, Z/4, ...}
+						val = (intP_t) (idx - 64);
+						for (j = 0; j < i; ++j) val /= 5;
+						val = (intP_t) ((val % 5) * ((1 << bpp) - 1) / 4);
 					}
 				}
+				if (is_delta) {
+					JXSML__RAISE("TODO: not ready for palette deltas");
+				}
+				p[x] = val;
 			}
-			free(m->channel[0].pixels);
-			memmove(m->channel, m->channel + 1, sizeof(jxsml__modular_channel_t) * (size_t) --m->num_channels);
-			break;
-		}
-
-		case JXSML__TR_SQUEEZE: {
-			JXSML__RAISE("TODO: squeeze inverse transformation");
-			break;
-		}
-
-		default: JXSML__UNREACHABLE();
 		}
 	}
+
+	free(m->channel[0].pixels);
+	memmove(m->channel, m->channel + 1, sizeof(jxsml__modular_channel_t) * (size_t) --m->num_channels);
+	return 0;
 
 error:
 	return st->err;
 }
 
 int jxsml__finish_modular(jxsml__st *st, jxsml__modular_t *m) {
+	int32_t i;
+
 	if (st->modular_16bit_buffers) {
-		return jxsml__finish_modular16(st, m);
+		for (i = m->nb_transforms - 1; i >= 0; --i) {
+			const jxsml__transform_t *tr = &m->transform[i];
+			switch (tr->tr) {
+			case JXSML__TR_RCT: JXSML__TRY(jxsml__inverse_rct16(st, m, tr)); break;
+			case JXSML__TR_PALETTE: JXSML__TRY(jxsml__inverse_palette16(st, m, tr)); break;
+			case JXSML__TR_SQUEEZE: JXSML__RAISE("TODO: squeeze inverse transformation"); break;
+			default: JXSML__UNREACHABLE();
+			}
+		}
 	} else {
-		return JXSML__ERR("TODO: jxsml__finish_modular32");
+		return JXSML__ERR("TODO: jxsml__inverse_*32");
 	}
+
+error:
+	return st->err;
 }
 
 void jxsml__free_modular(jxsml__modular_t *m) {
@@ -2662,15 +2734,18 @@ int jxsml__frame(jxsml__st *st, jxsml__frame_t *f) {
 		}
 		JXSML__TRY(jxsml__init_modular_for_global(st, f->is_modular, f->do_ycbcr,
 			f->log_upsampling, f->ec_log_upsampling, f->width, f->height, &f->gmodular));
-		JXSML__TRY(jxsml__modular_header(st, f->global_tree, &f->global_codespec, &f->gmodular));
-		JXSML__TRY(jxsml__allocate_modular(st, &f->gmodular));
-		if (f->width <= (1 << f->group_size_shift) && f->height <= (1 << f->group_size_shift)) {
-			num_gm_channels = f->gmodular.num_channels;
-		} else {
-			num_gm_channels = f->gmodular.nb_meta_channels;
-		}
-		for (i = 0; i < num_gm_channels; ++i) {
-			JXSML__TRY(jxsml__modular_channel(st, &f->gmodular, i, 0));
+		if (f->gmodular.num_channels > 0) {
+			JXSML__TRY(jxsml__modular_header(st, f->global_tree, &f->global_codespec, &f->gmodular));
+			JXSML__TRY(jxsml__allocate_modular(st, &f->gmodular));
+			if (f->width <= (1 << f->group_size_shift) && f->height <= (1 << f->group_size_shift)) {
+				num_gm_channels = f->gmodular.num_channels;
+			} else {
+				num_gm_channels = f->gmodular.nb_meta_channels;
+			}
+			for (i = 0; i < num_gm_channels; ++i) {
+				JXSML__TRY(jxsml__modular_channel(st, &f->gmodular, i, 0));
+			}
+			JXSML__TRY(jxsml__finish_and_free_code(st, &f->gmodular.code));
 		}
 	}
 
@@ -2704,10 +2779,10 @@ int jxsml__frame(jxsml__st *st, jxsml__frame_t *f) {
 
 		if (i > 0) JXSML__RAISE("TODO: more passes");
 
-		sidx = 1 + 3 * num_lf_groups + /*TODO # dequant tables + */ i * num_groups;
+		sidx = 1 + 3 * num_lf_groups + 17 /*TODO this is DCTSelect count */ + i * num_groups;
 		for (gy = 0; gy < f->height; gy += 1 << f->group_size_shift) {
 			for (gx = 0; gx < f->width; gx += 1 << f->group_size_shift, ++sidx) {
-				fprintf(stderr, "pass %d gx %d gy %d\n", i, gx, gy);
+				fprintf(stderr, "pass %d gx %d gy %d sidx %d\n", i, gx, gy, sidx);
 				JXSML__TRY(jxsml__zero_pad_to_byte(st));
 				if (!f->is_modular) {
 					JXSML__RAISE("TODO: HF coefficients in PassGroup");
@@ -2715,15 +2790,18 @@ int jxsml__frame(jxsml__st *st, jxsml__frame_t *f) {
 
 				JXSML__TRY(jxsml__init_modular_for_pass_group(
 					st, num_gm_channels, gy, gx, 1 << f->group_size_shift, 0, 3, &f->gmodular, &mgroup));
-				JXSML__TRY(jxsml__modular_header(st, f->global_tree, &f->global_codespec, &mgroup));
-				JXSML__TRY(jxsml__allocate_modular(st, &mgroup));
-				for (j = 0; j < mgroup.num_channels; ++j) {
-					JXSML__TRY(jxsml__modular_channel(st, &mgroup, j, sidx));
+				if (mgroup.num_channels > 0) {
+					JXSML__TRY(jxsml__modular_header(st, f->global_tree, &f->global_codespec, &mgroup));
+					JXSML__TRY(jxsml__allocate_modular(st, &mgroup));
+					for (j = 0; j < mgroup.num_channels; ++j) {
+						JXSML__TRY(jxsml__modular_channel(st, &mgroup, j, sidx));
+					}
+					JXSML__TRY(jxsml__finish_and_free_code(st, &mgroup.code));
+					JXSML__TRY(jxsml__finish_modular(st, &mgroup));
+					JXSML__TRY(jxsml__combine_modular_from_pass_group(
+						st, num_gm_channels, gy, gx, 0, 3, &f->gmodular, &mgroup));
+					jxsml__free_modular(&mgroup);
 				}
-				JXSML__TRY(jxsml__finish_modular(st, &mgroup));
-				JXSML__TRY(jxsml__combine_modular_from_pass_group(
-					st, num_gm_channels, gy, gx, 0, 3, &f->gmodular, &mgroup));
-				jxsml__free_modular(&mgroup);
 			}
 		}
 	}
@@ -2786,8 +2864,11 @@ int jxsml_load_from_memory(jxsml *out, const void *buf, size_t bufsize) {
 	jxsml__frame_t frame;
 	do {
 		JXSML__TRY(jxsml__frame(st, &frame));
+		fprintf(stderr, "%sframe: %s, %d+%d+%dx%d\n", frame.is_last ? "last " : "",
+			(char*[]){"regular", "lf", "refonly", "regular-but-skip-progressive"}[frame.type],
+			frame.x0, frame.y0, frame.width, frame.height);
 
-		if (1) {
+		if (frame.type == JXSML__FRAME_REGULAR) {
 			JXSML__ASSERT(st->modular_16bit_buffers && st->out->bpp >= 8 && st->out->exp_bits == 0);
 			FILE *f = fopen("corpus/dump.png", "wb");
 			uint32_t crc, adler, unused = 0, idatsize;
@@ -2827,7 +2908,8 @@ int jxsml_load_from_memory(jxsml *out, const void *buf, size_t bufsize) {
 				fwrite(buf, 6, 1, f);
 				for (j = 0; j < frame.width; ++j) {
 					for (k = 0; k < nchan; ++k) {
-						update_cksum(buf[k] = (uint8_t) (c[k][i * frame.width + j] >> (st->out->bpp - 8)), &crc, &adler);
+						int32_t p = jxsml__min32(jxsml__max32(0, c[k][i * frame.width + j]), 1 << st->out->bpp);
+						update_cksum(buf[k] = (uint8_t) (p * 255 / ((1 << st->out->bpp) - 1)), &crc, &adler);
 					}
 					fwrite(buf, (size_t) nchan, 1, f);
 				}
