@@ -115,7 +115,7 @@ typedef struct {
 #undef JXSML__RECURSING
 
 #endif // !JXSML__RECURSING
-#if 0+JXSML__RECURSING == 100
+#if JXSML__RECURSING+0 == 100
 	#define jxsml__intN_t JXSML__CONCAT3(int, JXSML__N, _t)
 	#define jxsml__uintN_t JXSML__CONCAT3(uint, JXSML__N, _t)
 // ----------------------------------------
@@ -2071,7 +2071,7 @@ static const int16_t JXSML__PALETTE_DELTAS[144][3] = { // the first entry is a d
 #undef JXSML__RECURSING
 
 #endif // !JXSML__RECURSING
-#if 0+JXSML__RECURSING == 200
+#if JXSML__RECURSING+0 == 200
 	#define jxsml__intP_t JXSML__CONCAT3(int, JXSML__P, _t)
 	#define jxsml__int2P_t JXSML__CONCAT3(int, JXSML__2P, _t)
 	#define jxsml__uint2P_t JXSML__CONCAT3(uint, JXSML__2P, _t)
@@ -2088,8 +2088,6 @@ jxsml__int2P_t jxsml__gradient2P(jxsml__int2P_t w, jxsml__int2P_t n, jxsml__int2
 	return jxsml__min2P(jxsml__max2P(lo, w + n - nw), hi);
 }
 
-#define JXSML__WP // TODO also parametrize over this
-
 int JXSML__CONCAT(jxsml__modular_channel, JXSML__P)(
 	jxsml__st *st, jxsml__modular_t *m, int32_t cidx, int32_t sidx
 ) {
@@ -2101,17 +2099,27 @@ int JXSML__CONCAT(jxsml__modular_channel, JXSML__P)(
 	int32_t width = c->width, height = c->height;
 	int32_t y, x, i;
 	int32_t *refcmap = NULL, nrefcmap; // refcmap[i] is a channel index for properties (16..19)+4*i
-#ifdef JXSML__WP
 	int2P_t *errbuf = NULL;
-#endif
+	int use_wp = 0;
 
 	JXSML__ASSERT(m->tree); // caller should set this to the global tree if not given
 	JXSML__ASSERT(c->pixels);
 
+	{ // determine use_wp
+		int32_t lasttree = 0;
+		for (i = 0; i <= lasttree && !use_wp; ++i) {
+			if (m->tree[i].branch.prop < 0) {
+				use_wp |= ~m->tree[i].branch.prop == 15;
+				lasttree = jxsml__max32(lasttree,
+					i + jxsml__max32(m->tree[i].branch.leftoff, m->tree[i].branch.rightoff));
+			} else {
+				use_wp |= m->tree[i].leaf.predictor == 6;
+			}
+		}
+	}
+
 	JXSML__SHOULD(refcmap = malloc(sizeof(int32_t) * (size_t) cidx), "!mem");
-#ifdef JXSML__WP
-	JXSML__SHOULD(errbuf = calloc((size_t) width * 10, sizeof(int2P_t)), "!mem");
-#endif
+	if (use_wp) JXSML__SHOULD(errbuf = calloc((size_t) width * 10, sizeof(int2P_t)), "!mem");
 
 	nrefcmap = 0;
 	for (i = cidx - 1; i >= 0; --i) {
@@ -2126,19 +2134,15 @@ int JXSML__CONCAT(jxsml__modular_channel, JXSML__P)(
 		intP_t *nline = (intP_t*) c->pixels + (y - 1) * c->width;
 		intP_t *line = (intP_t*) c->pixels + y * c->width;
 
-#ifdef JXSML__WP
-		int2P_t (*err)[4] = (void*) (errbuf + (y & 1 ? width * 4 : 0));
-		int2P_t (*nerr)[4] = (void*) (errbuf + (y & 1 ? 0 : width * 4));
-		int2P_t *trueerr = errbuf + (y & 1 ? width * 9 : width * 8);
-		int2P_t *ntrueerr = errbuf + (y & 1 ? width * 8 : width * 9);
-#endif
+		int2P_t (*err)[4] = use_wp ? (void*) (errbuf + (y & 1 ? width * 4 : 0)) : NULL;
+		int2P_t (*nerr)[4] = use_wp ? (void*) (errbuf + (y & 1 ? 0 : width * 4)) : NULL;
+		int2P_t *trueerr = use_wp ? errbuf + (y & 1 ? width * 9 : width * 8) : NULL;
+		int2P_t *ntrueerr = use_wp ? errbuf + (y & 1 ? width * 8 : width * 9) : NULL;
 
 		for (x = 0; x < width; ++x) {
 			jxsml__ma_tree_t *n = m->tree;
 			int2P_t pnn, pnww, pnw, pn, pne, pnee, pww, pw, val;
-#ifdef JXSML__WP
-			int2P_t trueerrw, trueerrn, trueerrnw, trueerrne, subpred6[4], pred6;
-#endif
+			int2P_t trueerrw = 0, trueerrn = 0, trueerrnw = 0, trueerrne = 0, subpred6[4] = {}, pred6 = 0;
 
 			/*            NN
 			 *             |
@@ -2162,13 +2166,7 @@ int JXSML__CONCAT(jxsml__modular_channel, JXSML__P)(
 			pww = x > 1 ? line[x - 2] : pw;
 			pnww = x > 1 && y > 0 ? nline[x - 2] : pww;
 
-#ifdef JXSML__WP
-			trueerrw = x > 0 ? trueerr[x - 1] : 0;
-			trueerrn = y > 0 ? ntrueerr[x] : 0;
-			trueerrnw = x > 0 && y > 0 ? ntrueerr[x - 1] : trueerrn;
-			trueerrne = x + 1 < c->width && y > 0 ? ntrueerr[x + 1] : trueerrn;
-
-			{ // weighted self-correcting predictor
+			if (use_wp) { // weighted self-correcting predictor
 				static const int2P_t ZERO[4] = {0, 0, 0, 0};
 				int2P_t w[4], wsum, sum;
 				const int2P_t *errw = x > 0 ? err[x - 1] : ZERO;
@@ -2178,6 +2176,11 @@ int JXSML__CONCAT(jxsml__modular_channel, JXSML__P)(
 				const int2P_t *errww = x > 1 ? err[x - 2] : ZERO;
 				const int2P_t *errw2 = x + 1 < c->width ? ZERO : errw; // what?
 				int32_t logw;
+
+				trueerrw = x > 0 ? trueerr[x - 1] : 0;
+				trueerrn = y > 0 ? ntrueerr[x] : 0;
+				trueerrnw = x > 0 && y > 0 ? ntrueerr[x - 1] : trueerrn;
+				trueerrne = x + 1 < c->width && y > 0 ? ntrueerr[x + 1] : trueerrn;
 
 				subpred6[0] = ((int2P_t) pw + pne - pn) << 3;
 				subpred6[1] = ((int2P_t) pn << 3) - ((((int2P_t) trueerrw + trueerrn + trueerrne) * m->wp_p1) >> 5);
@@ -2204,7 +2207,6 @@ int JXSML__CONCAT(jxsml__modular_channel, JXSML__P)(
 					pred6 = jxsml__min2P(jxsml__max2P(lo, pred6), hi);
 				}
 			}
-#endif // JXSML__WP
 
 			while (n->branch.prop < 0) {
 				int32_t refcidx;
@@ -2227,15 +2229,11 @@ int JXSML__CONCAT(jxsml__modular_channel, JXSML__P)(
 				case 12: val = pn - pne; break;
 				case 13: val = pn - pnn; break;
 				case 14: val = pw - pww; break;
-				case 15:
-#ifdef JXSML__WP
+				case 15: // requires use_wp
 					val = trueerrw;
 					if (jxsml__abs2P(val) < jxsml__abs2P(trueerrn)) val = trueerrn;
 					if (jxsml__abs2P(val) < jxsml__abs2P(trueerrnw)) val = trueerrnw;
 					if (jxsml__abs2P(val) < jxsml__abs2P(trueerrne)) val = trueerrne;
-#else
-					JXSML__UNREACHABLE();
-#endif
 					break;
 				default:
 					refcidx = (~n->branch.prop - 16) / 4;
@@ -2265,11 +2263,7 @@ int JXSML__CONCAT(jxsml__modular_channel, JXSML__P)(
 			case 3: val += ((int2P_t) pw + pn) / 2; break;
 			case 4: val += jxsml__abs2P(pn - pnw) < jxsml__abs2P(pw - pnw) ? pw : pn; break;
 			case 5: val += jxsml__gradient2P(pw, pn, pnw); break;
-#ifdef JXSML__WP
-			case 6: val += (pred6 + 3) >> 3; break;
-#else
-			case 6: JXSML__UNREACHABLE(); break;
-#endif
+			case 6: val += (pred6 + 3) >> 3; break; // requires use_wp
 			case 7: val += pne; break;
 			case 8: val += pnw; break;
 			case 9: val += pww; break;
@@ -2283,11 +2277,10 @@ int JXSML__CONCAT(jxsml__modular_channel, JXSML__P)(
 			JXSML__SHOULD(INT16_MIN <= val && val <= INT16_MAX, "povf");
 			line[x] = (intP_t) val;
 
-#ifdef JXSML__WP
-			// update self-correcting predictor state
-			trueerr[x] = pred6 - (val << 3);
-			for (i = 0; i < 4; ++i) err[x][i] = (jxsml__abs2P(subpred6[i] - (val << 3)) + 3) >> 3;
-#endif
+			if (use_wp) { // update self-correcting predictor state
+				trueerr[x] = pred6 - (val << 3);
+				for (i = 0; i < 4; ++i) err[x][i] = (jxsml__abs2P(subpred6[i] - (val << 3)) + 3) >> 3;
+			}
 		}
 	}
 
@@ -3057,4 +3050,4 @@ int main(int argc, char **argv) {
 	return 0;
 }
 
-#endif // !JXSML__RECURSING
+#endif // !JXSML__RECURSING (there should be no actual code below, as JXSML may #include itself!)
