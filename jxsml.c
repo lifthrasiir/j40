@@ -81,7 +81,7 @@ typedef struct {
 	int num_extra_channels;
 	jxsml__ec_info *ec_info;
 	int xyb_encoded;
-	float opsin_inv_mat[3][3], opsin_bias[3], quant_bias[3], quant_bias_num;
+	float opsin_inv_mat[3][3], opsin_bias[3], quant_bias[3 /*xyb*/], quant_bias_num;
 	int want_icc;
 } jxsml__st;
 
@@ -144,6 +144,21 @@ typedef struct {
 		#define JXSML_RESTRICT __restrict
 	#endif
 #endif // !defined JXSML_RESTRICT
+
+// rule of thumb: sparingly use them, except for the obvious error cases
+#ifndef JXSML_EXPECT
+	#if JXSML__HAS_ATTR(expect) || JXSML__GCC_VER >= 0x30000 || JXSML__CLANG_VER >= 0x10000
+		#define JXSML_EXPECT(p, v) __builtin_expect(p, v)
+	#else
+		#define JXSML_EXPECT(p, v) (p)
+	#endif
+#endif // !defined JXSML_EXPECT
+#ifndef JXSML_LIKELY
+	#define JXSML_LIKELY(p) JXSML_EXPECT(!!(p), 1)
+#endif
+#ifndef JXSML_UNLIKELY
+	#define JXSML_UNLIKELY(p) JXSML_EXPECT(!!(p), 0)
+#endif
 
 JXSML_ALWAYS_INLINE int32_t jxsml__to_signed(int32_t x) {
 	return (int32_t) (x & 1 ? -(x + 1) / 2 : x / 2);
@@ -272,10 +287,13 @@ JXSML_ALWAYS_INLINE jxsml__intN_t jxsml__(max,N)(jxsml__intN_t x, jxsml__intN_t 
 
 #define JXSML__4(s) (jxsml_err) (((uint32_t) s[0] << 24) | ((uint32_t) s[1] << 16) | ((uint32_t) s[2] << 8) | (uint32_t) s[3])
 #define JXSML__ERR(s) jxsml__set_error(st, JXSML__4(s))
-#define JXSML__SHOULD(cond, s) do { if (st->err) goto error; else if (!(cond)) { jxsml__set_error(st, JXSML__4(s)); goto error; } } while (0)
+#define JXSML__SHOULD(cond, s) do { \
+		if (JXSML_UNLIKELY(st->err)) goto error; \
+		else if (JXSML_UNLIKELY(!(cond))) { jxsml__set_error(st, JXSML__4(s)); goto error; } \
+	} while (0)
 #define JXSML__RAISE(s) do { jxsml__set_error(st, JXSML__4(s)); goto error; } while (0)
-#define JXSML__RAISE_DELAYED() do { if (st->err) goto error; } while (0)
-#define JXSML__TRY(expr) do { if (expr) goto error; } while (0)
+#define JXSML__RAISE_DELAYED() do { if (JXSML_UNLIKELY(st->err)) goto error; } while (0)
+#define JXSML__TRY(expr) do { if (JXSML_UNLIKELY(expr)) goto error; } while (0)
 #ifdef JXSML_DEBUG
 #define JXSML__ASSERT(cond) JXSML__SHOULD(cond, "!exp")
 #define JXSML__UNREACHABLE() JXSML__ASSERT(0)
@@ -313,7 +331,7 @@ error:
 #define JXSML__TRY_REALLOC(ptr, itemsize, len, cap) \
 	do { \
 		void *newptr = jxsml__realloc(st, *(ptr), itemsize, len, cap); \
-		if (newptr) *(ptr) = newptr; else goto error; \
+		if (JXSML_LIKELY(newptr)) *(ptr) = newptr; else goto error; \
 	} while (0) \
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -2749,7 +2767,7 @@ error:
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// dequantization matrix
+// dequantization matrix and coefficient orders
 
 enum {
 	JXSML__NUM_DCT_SELECT = 27, // the number of all possible varblock types (DctSelect)
@@ -2772,13 +2790,15 @@ static const jxsml__dct_select JXSML__DCT_SELECT[JXSML__NUM_DCT_SELECT] = {
 typedef struct {
 	enum { // the number of params per channel follows:
 		JXSML__DQ_ENC_LIBRARY = 0, // 0
-		JXSML__DQ_ENC_HORNUSS = 1, // 3
-		JXSML__DQ_ENC_DCT2 = 2, // 6
-		JXSML__DQ_ENC_DCT4 = 3, // 2 + n
-		JXSML__DQ_ENC_DCT4X8 = 4, // 1 + n
-		JXSML__DQ_ENC_AFV = 5, // 6 + n + m
-		JXSML__DQ_ENC_DCT = 6, // n
-		JXSML__DQ_ENC_RAW = 7, // n rows * m columns (all other modes eventually decode to this one)
+		JXSML__DQ_ENC_HORNUSS = 1, // 3 (params)
+		JXSML__DQ_ENC_DCT2 = 2, // 6 (params)
+		JXSML__DQ_ENC_DCT4 = 3, // 2 (params) + n (dct_params)
+		// TODO spec issue: DCT4x8 uses an undefined name "parameters" (should be "params")
+		JXSML__DQ_ENC_DCT4X8 = 4, // 1 (params) + n (dct_params)
+		JXSML__DQ_ENC_AFV = 5, // 9 (params) + n (dct_params) + m (dct4x4_params)
+		JXSML__DQ_ENC_DCT = 6, // n (params)
+		// all other modes eventually decode to:
+		JXSML__DQ_ENC_RAW = 7, // n rows * m columns, with the top-left 1/8 by 1/8 unused
 	} mode;
 	int16_t n, m;
 	float (*params)[4]; // the last element per each row is unused
@@ -2877,6 +2897,10 @@ static const float JXSML__LIBRARY_DCT_PARAMS[129][4] = {
 	JXSML__LARGE_DCT_PARAMS(61435.5921973295970f, 24209.44206460261196f, 12979.84647584004484f),
 };
 
+static const int8_t JXSML__LOG_ORDER_SIZE[JXSML__NUM_ORDERS][2] = {
+	{3,3}, {3,3}, {4,4}, {5,5}, {4,3}, {5,3}, {5,4}, {6,6}, {6,5}, {7,7}, {7,6}, {8,8}, {8,7},
+};
+
 JXSML_STATIC jxsml_err jxsml__dq_matrix(
 	jxsml__st *st, int32_t rows, int32_t columns, int32_t raw_sidx, jxsml__dq_matrix_t *dqmat
 ) {
@@ -2917,12 +2941,61 @@ error:
 	return st->err;
 }
 
-JXSML_STATIC jxsml_err jxsml__load_dq_matrix(jxsml__st *st, int32_t dct_select, jxsml__dq_matrix_t *dqmat) {
-	const struct jxsml__dct_params dct = JXSML__DCT_PARAMS[dct_select];
+// piecewise exponential interpolation where pos is in [0,1], mapping pos = k/(len-1) to bands[k]
+JXSML_INLINE float jxsml__interpolate(float pos, int32_t c, const float (*bands)[4], int32_t len) {
+	float scaled_pos, scaled_idx, frac_idx, a, b;
+	if (len == 1) return bands[0][c];
+	scaled_pos = pos * (float) (len - 1);
+	scaled_idx = floorf(scaled_pos);
+	frac_idx = scaled_pos - scaled_idx;
+	a = bands[(int32_t) scaled_idx][c];
+	b = bands[(int32_t) scaled_idx + 1][c];
+	return a * powf(b / a, frac_idx);
+}
+
+JXSML_STATIC jxsml_err jxsml__interpolation_bands(
+	jxsml__st *st, const float (*params)[4], int32_t nparams, float (*out)[4]
+) {
+	int32_t i, c;
+	for (c = 0; c < 3; ++c) {
+		// TODO spec bug: loops for x & y are independent of the loop for i (bands)
+		// TODO spec bug: `bands(i)` for i >= 0 (not i > 0) should be larger (not no less) than 0
+		out[0][c] = params[0][c];
+		JXSML__SHOULD(out[0][c] > 0, "band");
+		for (i = 1; i < nparams; ++i) {
+			float v = params[i][c];
+			out[i][c] = v > 0 ? out[i - 1][c] * (1.0f + v) : out[i - 1][c] / (1.0f - v);
+			JXSML__SHOULD(out[i][c] > 0, "band");
+		}
+	}
+error:
+	return st->err;
+}
+
+JXSML_STATIC void jxsml__dct_quant_weights(
+	int32_t rows, int32_t columns, const float (*bands)[4], int32_t len, float (*out)[4]
+) {
+	int32_t x, y, c;
+	for (c = 0; c < 3; ++c) {
+		for (y = 0; y < rows; ++y) {
+			for (x = 0; x < columns; ++x) {
+				static const float SQRT2 = 1.414214562373095f; // sqrt(2) + 1e-6
+				float d = hypotf((float) x / (float) (columns - 1), (float) y / (float) (rows - 1)) / SQRT2;
+				// TODO spec issue: num_bands doesn't exist (probably len)
+				out[y * columns + x][c] = jxsml__interpolate(d, c, bands, len);
+			}
+		}
+	}
+}
+
+// TODO spec issue: VarDCT uses the (row, column) notation, not the (x, y) notation; explicitly note this
+JXSML_STATIC jxsml_err jxsml__load_dq_matrix(jxsml__st *st, int32_t idx, jxsml__dq_matrix_t *dqmat) {
+	enum { MAX_BANDS = 15 };
+	const struct jxsml__dct_params dct = JXSML__DCT_PARAMS[idx];
 	int32_t rows, columns, mode, n, m;
 	const float (*params)[4];
-	float (*raw)[4];
-	int32_t c, i;
+	float (*raw)[4] = NULL, bands[MAX_BANDS][4], scratch[64][4];
+	int32_t x, y, i, c;
 
 	mode = dqmat->mode;
 	if (mode == JXSML__DQ_ENC_RAW) {
@@ -2942,14 +3015,25 @@ JXSML_STATIC jxsml_err jxsml__load_dq_matrix(jxsml__st *st, int32_t dct_select, 
 	columns = 1 << dct.log_columns;
 	JXSML__SHOULD(raw = malloc(sizeof(float[4]) * (size_t) (rows * columns)), "!mem");
 
-	switch (dqmat->mode) {
+	switch (mode) {
 	case JXSML__DQ_ENC_DCT:
-		JXSML__RAISE("TODO: encoding mode DCT");
+		JXSML__TRY(jxsml__interpolation_bands(st, params, 3, bands));
+		jxsml__dct_quant_weights(rows, columns, bands, 3, raw);
 		break;
 
 	case JXSML__DQ_ENC_DCT4:
 		JXSML__ASSERT(rows == 8 && columns == 8);
-		JXSML__RAISE("TODO: encoding mode DCT4");
+		JXSML__ASSERT(n <= MAX_BANDS);
+		JXSML__TRY(jxsml__interpolation_bands(st, params + 2, n, bands));
+		jxsml__dct_quant_weights(4, 4, bands, n, scratch);
+		for (c = 0; c < 3; ++c) {
+			for (y = 0; y < 8; ++y) for (x = 0; x < 8; ++x) {
+				raw[y * 8 + x][c] = scratch[(y / 2) * 4 + (x / 2)][c];
+			}
+			raw[001][c] /= params[0][c];
+			raw[010][c] /= params[0][c];
+			raw[011][c] /= params[1][c];
+		}
 		break;
 
 	case JXSML__DQ_ENC_DCT2:
@@ -2983,12 +3067,54 @@ JXSML_STATIC jxsml_err jxsml__load_dq_matrix(jxsml__st *st, int32_t dct_select, 
 
 	case JXSML__DQ_ENC_DCT4X8:
 		JXSML__ASSERT(rows == 8 && columns == 8);
-		JXSML__RAISE("TODO: encoding mode DCT4x8");
+		JXSML__ASSERT(n <= MAX_BANDS);
+		JXSML__TRY(jxsml__interpolation_bands(st, params + 1, n, bands));
+		// TODO spec bug: 4 rows by 8 columns, not 8 rows by 4 columns (compare with AFV weights4x8)
+		// the position (x, y Idiv 2) is also confusing, since it's using the (x, y) notation
+		jxsml__dct_quant_weights(4, 8, bands, n, scratch);
+		for (c = 0; c < 3; ++c) {
+			for (y = 0; y < 8; ++y) for (x = 0; x < 8; ++x) {
+				raw[y * 8 + x][c] = scratch[(y / 2) * 4 + x][c];
+			}
+			raw[001][c] /= params[0][c];
+		}
 		break;
 
 	case JXSML__DQ_ENC_AFV:
 		JXSML__ASSERT(rows == 8 && columns == 8);
-		JXSML__RAISE("TODO: encoding mode AFV");
+		JXSML__ASSERT(n <= MAX_BANDS && m <= MAX_BANDS);
+		JXSML__TRY(jxsml__interpolation_bands(st, params + 9, n, bands));
+		jxsml__dct_quant_weights(4, 8, bands, n, scratch);
+		JXSML__TRY(jxsml__interpolation_bands(st, params + 9 + n, m, bands));
+		jxsml__dct_quant_weights(4, 4, bands, m, scratch + 32);
+		JXSML__TRY(jxsml__interpolation_bands(st, params + 5, 4, bands));
+		for (c = 0; c < 3; ++c) {
+			static const float FREQS[12] = { // precomputed values of (freqs[i] - lo) / (hi - lo)
+				0.000000000f, 0.373436447f, 0.320380127f, 0.379332627f, 0.066671358f, 0.259756783f,
+				0.530035695f, 0.789731126f, 0.149436610f, 0.559318870f, 0.669198701f, 1.000000000f,
+			};
+			scratch[0][c] = params[0][c]; // replaces the top-left corner of weights4x8
+			scratch[32][c] = params[1][c]; // replaces the top-left corner of weights4x4
+			for (i = 0; i < 12; ++i) scratch[i + 48][c] = jxsml__interpolate(FREQS[i], c, bands, 4);
+			scratch[60][c] = 1.0f;
+			for (i = 0; i < 3; ++i) scratch[i + 61][c] = params[i + 2][c];
+		}
+		for (c = 0; c < 3; ++c) {
+			// TODO spec bug: `weight(...)` uses multiple conflicting notations
+			static const int8_t MAP[64] = {
+				// 1..31 from weights4x8, 33..47 from weights4x4, 48..59 interpolated,
+				// 0/32/61..63 directly from parameters, 60 fixed to 1.0
+				60, 32, 62, 33, 48, 34, 49, 35,
+				 0,  1,  2,  3,  4,  5,  6,  7,
+				61, 36, 63, 37, 50, 38, 51, 39,
+				 8,  9, 10, 11, 12, 13, 14, 15,
+				52, 40, 53, 41, 54, 42, 55, 43,
+				16, 17, 18, 19, 20, 21, 22, 23,
+				56, 44, 57, 45, 58, 46, 59, 47,
+				24, 25, 26, 27, 28, 29, 30, 31,
+			};
+			for (i = 0; i < 64; ++i) raw[MAP[i]][c] = scratch[i][c];
+		}
 		break;
 
 	default: JXSML__UNREACHABLE();
@@ -3003,6 +3129,63 @@ JXSML_STATIC jxsml_err jxsml__load_dq_matrix(jxsml__st *st, int32_t dct_select, 
 
 error:
 	free(raw);
+	return st->err;
+}
+
+JXSML_STATIC jxsml_err jxsml__natural_order(jxsml__st *st, int32_t log_rows, int32_t log_columns, int32_t **out) {
+	int32_t size, log_slope;
+	int32_t *order = NULL;
+	int32_t y, x, key1, o;
+
+	JXSML__ASSERT(8 >= log_rows && log_rows >= log_columns && log_columns >= 3);
+	size = 1 << (log_rows + log_columns);
+	log_slope = log_rows - log_columns;
+
+	// zero doubles as an available cell and the top-left corner index,
+	// where the latter has key1 = 0 so can be easily distinguished
+	JXSML__SHOULD(order = calloc((size_t) size, sizeof(int32_t)), "!mem");
+
+	o = 0;
+	for (y = 0; y < (1 << (log_rows - 3)); ++y) {
+		for (x = 0; x < (1 << (log_columns - 3)); ++x) order[y << log_columns | x] = (int16_t) o++;
+	}
+
+	//      a b c d..
+	// +---/-/-/-/-  each diagonal is identified by an integer
+	// |  | / / / /    key1 = scaled_x + scaled_y = x * 2^log_slope + y,
+	// |__|/ / / /   and covers at least one cell when:
+	// |/ / / / / /    2^(log_rows - 3) <= key1 < 2^(log_rows + 1) - 2^log_slope.
+	for (key1 = 1 << (log_rows - 3); o < size; ++key1) {
+		// place initial endpoints to leftmost and topmost edges, then fix out-of-bounds later
+		int32_t x0 = 0, y0 = key1, x1 = key1 >> log_slope, y1 = key1 & ((1 << log_slope) - 1);
+		if (y0 >= (1 << log_rows)) {
+			int32_t excess = jxsml__ceil_div32(y0 - ((1 << log_rows) - 1), 1 << log_slope);
+			x0 += excess;
+			y0 -= excess << log_slope;
+			JXSML__ASSERT(x0 < (1 << log_columns) && y0 >= 0);
+		}
+		if (x1 >= (1 << log_columns)) {
+			int32_t excess = x1 - ((1 << log_columns) - 1);
+			x1 -= excess;
+			y1 += excess << log_slope;
+			JXSML__ASSERT(x1 >= 0 && y1 < (1 << log_rows));
+		}
+		if (key1 & 1) {
+			for (x = x1, y = y1; x >= x0; --x, y += 1 << log_slope) {
+				if (!order[y << log_columns | x]) order[y << log_columns | x] = (int16_t) o++;
+			}
+		} else {
+			for (x = x0, y = y0; x <= x1; ++x, y -= 1 << log_slope) {
+				if (!order[y << log_columns | x]) order[y << log_columns | x] = (int16_t) o++;
+			}
+		}
+	}
+
+	*out = order;
+	return 0;
+
+error:
+	free(order);
 	return st->err;
 }
 
@@ -3065,15 +3248,17 @@ typedef struct {
 	int32_t nb_lf_thr[3 /*xyb*/], nb_qf_thr;
 	uint8_t *block_ctx_map;
 	int32_t block_ctx_size, nb_block_ctx;
-	int32_t colour_factor, x_factor_lf, b_factor_lf;
+	float inv_colour_factor;
+	int32_t x_factor_lf, b_factor_lf;
 	float base_corr_x, base_corr_b;
 
 	// vardct only, available after HfGlobal/HfPass
+	int32_t dct_select_used, order_used; // bitset for DctSelect and order, respectively
 	jxsml__dq_matrix_t dq_matrix[JXSML__NUM_DCT_PARAMS];
 	int32_t num_hf_presets;
-	// if order_lens[o][c] > 0, orders[o][c] is a Lehmer code of that length instead of actual mapping
-	int32_t order_lens[JXSML__MAX_PASSES][JXSML__NUM_ORDERS][3];
-	int32_t *orders[JXSML__MAX_PASSES][JXSML__NUM_ORDERS][3]; // possibly NULL if the Lehmer code is empty
+	// Lehmer code + sentinel (-1) before actual coefficient decoding,
+	// either properly computed or discarded due to non-use later (can be NULL in that case)
+	int32_t *orders[JXSML__MAX_PASSES][JXSML__NUM_ORDERS][3 /*xyb*/];
 	jxsml__code_spec_t coeff_codespec[JXSML__MAX_PASSES];
 } jxsml__frame_t;
 
@@ -3128,13 +3313,13 @@ JXSML_STATIC jxsml_err jxsml__frame_header(jxsml__st *st, jxsml__frame_t *f) {
 	memset(&f->global_codespec, 0, sizeof(jxsml__code_spec_t));
 	memset(&f->gmodular, 0, sizeof(jxsml__modular_t));
 	f->block_ctx_map = NULL;
-	f->colour_factor = 84;
-	f->x_factor_lf = 127;
-	f->b_factor_lf = 127;
+	f->inv_colour_factor = 1 / 84.0f;
+	f->x_factor_lf = 0;
+	f->b_factor_lf = 0;
 	f->base_corr_x = 0.0f;
 	f->base_corr_b = 1.0f;
+	f->dct_select_used = f->order_used = 0;
 	memset(f->dq_matrix, 0, sizeof(f->dq_matrix));
-	memset(f->order_lens, 0, sizeof(f->order_lens));
 	memset(f->orders, 0, sizeof(f->orders));
 	memset(f->coeff_codespec, 0, sizeof(f->coeff_codespec));
 
@@ -3295,10 +3480,10 @@ error:
 	return st->err;
 }
 
-// also used in jxsml__hf_global
+// also used in jxsml__hf_global; out is terminated by a sentinel (-1)
 // TODO permutation may have to handle more than 2^31 entries
 JXSML_STATIC jxsml_err jxsml__permutation(
-	jxsml__st *st, jxsml__code_t *code, int32_t size, int32_t skip, int32_t **out, int32_t *outlen
+	jxsml__st *st, jxsml__code_t *code, int32_t size, int32_t skip, int32_t **out
 ) {
 	int32_t *arr = NULL;
 	int32_t i, prev, end;
@@ -3308,7 +3493,7 @@ JXSML_STATIC jxsml_err jxsml__permutation(
 	// SPEC this is the number of integers to read, not the last offset to read (can differ when skip > 0)
 	end = jxsml__code(st, jxsml__min32(7, jxsml__ceil_lg32((uint32_t) size + 1)), 0, code);
 	JXSML__SHOULD(end <= size - skip, "perm"); // SPEC missing
-	JXSML__SHOULD(arr = malloc(sizeof(int32_t) * (size_t) end), "!mem");
+	JXSML__SHOULD(arr = malloc(sizeof(int32_t) * (size_t) (end + 1)), "!mem");
 
 	prev = 0;
 	for (i = 0; i < end; ++i) {
@@ -3316,29 +3501,33 @@ JXSML_STATIC jxsml_err jxsml__permutation(
 		JXSML__SHOULD(prev < size - (skip + i), "perm"); // SPEC missing
 	}
 
+	arr[end] = -1; // sentinel
 	*out = arr;
-	*outlen = end;
 error:
 	return st->err;
 }
 
 // target is pre-shifted by skip
-#define JXSML__APPLY_PERMUTATION(type, target, lehmer, size, end) do { \
-	int32_t i_, x_; \
-	for (i_ = 0; i_ < (end); ++i_) { \
-		type temp = (target)[x_ = lehmer[i_]]; \
-		memmove((target) + i_ + 1, (target) + i_, sizeof(type) * (size_t) (x_ - i_)); \
-		(target)[i_] = temp; \
-	} \
-} while (0)
+JXSML_INLINE void jxsml__apply_permutation(
+	void *targetbuf, void *temp, size_t elemsize, const int32_t *lehmer
+) {
+	char *target = targetbuf;
+	while (*lehmer >= 0) {
+		size_t x = (size_t) *lehmer++;
+		memcpy(temp, target + elemsize * x, elemsize);
+		memmove(target + elemsize, target, elemsize * x);
+		memcpy(target, temp, elemsize);
+		target += elemsize;
+	}
+}
 
 JXSML_STATIC jxsml_err jxsml__toc(jxsml__st *st, jxsml__frame_t *f) {
 	typedef struct { int32_t lo, hi; } toc_t;
 	int32_t size = f->num_passes == 1 && f->num_groups == 1 ? 1 :
 		1 /*lf_global*/ + f->num_lf_groups /*lf_group*/ +
 		1 /*hf_global + hf_pass*/ + f->num_passes * f->num_groups /*group_pass*/;
-	toc_t *toc;
-	int32_t lehmerlen, *lehmer = NULL;
+	toc_t *toc, temp;
+	int32_t *lehmer = NULL;
 	jxsml__code_spec_t codespec = {0};
 	jxsml__code_t code = { .spec = &codespec };
 	int32_t base, i;
@@ -3347,9 +3536,10 @@ JXSML_STATIC jxsml_err jxsml__toc(jxsml__st *st, jxsml__frame_t *f) {
 
 	if (jxsml__u(st, 1)) { // permuted
 		JXSML__TRY(jxsml__code_spec(st, 8, &codespec));
-		JXSML__TRY(jxsml__permutation(st, &code, size, 0, &lehmer, &lehmerlen));
+		JXSML__TRY(jxsml__permutation(st, &code, size, 0, &lehmer));
 		JXSML__TRY(jxsml__finish_and_free_code(st, &code));
 		jxsml__free_code_spec(&codespec);
+		JXSML__RAISE("TODO: should reorder groups in this case");
 	}
 	JXSML__TRY(jxsml__zero_pad_to_byte(st));
 
@@ -3361,7 +3551,7 @@ JXSML_STATIC jxsml_err jxsml__toc(jxsml__st *st, jxsml__frame_t *f) {
 	base = (int32_t) (st->bits_read / 8);
 	for (i = 0; i < size; ++i) toc[i].lo += base, toc[i].hi += base;
 
-	if (lehmer) JXSML__APPLY_PERMUTATION(toc_t, toc, lehmer, size, lehmerlen);
+	if (lehmer) jxsml__apply_permutation(toc, &temp, sizeof(toc_t), lehmer);
 
 	printf("TOC: lf_global %d-%d\n", toc[0].lo, toc[0].hi);
 	if (size > 1) {
@@ -3398,7 +3588,7 @@ error:
 
 // [(1<<n) + k] = sec((2k+1)/2n pi) / 2 for n >= 1 and 0 <= k < 2^n
 static const float JXSML__HALF_SECANTS[256] = {
-	0, 0.70710678f, // unused
+	0, 0.70710678f, // unused ([1] repurposed)
 	0.54119610f, 1.30656296f, // n=1 for DCT-4
 	0.50979558f, 0.60134489f, 0.89997622f, 2.56291545f, // n=2 for DCT-8
 	// n=3 for DCT-16
@@ -3440,7 +3630,7 @@ static const float JXSML__HALF_SECANTS[256] = {
 };
 
 // [(1<<N) + k] = ScaleF(N, 8N, k) / 2^N for N >= 1 and 0 <= k < 2^N
-static const float JXSML__LLF2LF_SCALES[64] = {
+static const float JXSML__LF2LLF_SCALES[64] = {
 	0, // unused
 	1.00000000f, // N=1, n=8
 	0.50000000f, 0.55446868f, // N=2, n=16
@@ -3642,6 +3832,56 @@ JXSML_STATIC void jxsml__inverse_dct(JXSML__DCT_ARGS, int32_t rep) {
 #undef JXSML__IN
 #undef JXSML__OUT
 
+JXSML_STATIC void jxsml__forward_dct2d_scaled_for_llf(
+	float *JXSML_RESTRICT out, float *JXSML_RESTRICT scratch, int32_t log_rows, int32_t log_columns
+) {
+	int32_t rows = 1 << log_rows, columns = 1 << log_columns;
+	const float *scalec = JXSML__LF2LLF_SCALES + columns, *scaler = JXSML__LF2LLF_SCALES + rows;
+	int32_t i, j;
+
+	jxsml__forward_dct_unscaled(scratch, out, log_rows, columns, columns, columns);
+	for (i = 0; i < rows; ++i) for (j = 0; j < columns; ++j) {
+		out[j * rows + i] = scratch[i * columns + j];
+	}
+	jxsml__forward_dct_unscaled(scratch, out, log_columns, rows, rows, rows);
+	// TODO spec improvement (I.6.3 note): given the pseudocode, it might be better to
+	// state that the DCT result *always* has C >= R, transposing as necessary.
+	if (log_columns > log_rows) {
+		for (j = 0; j < columns; ++j) for (i = 0; i < rows; ++i) {
+			// parentheses hopefully guide a compiler to factor
+			// the second multiplication out of the inner loop (TODO verify this)
+			out[i * rows + j] = scratch[j * columns + i] * (scaler[i] * scalec[j]);
+		}
+	} else {
+		for (j = 0; j < columns; ++j) for (i = 0; i < rows; ++i) {
+			out[j * columns + i] = scratch[j * columns + i] * (scaler[i] * scalec[j]);
+		}
+	}
+}
+
+JXSML_STATIC void jxsml__inverse_dct2d(
+	float *JXSML_RESTRICT out, float *JXSML_RESTRICT scratch, int32_t log_rows, int32_t log_columns
+) {
+	int32_t rows = 1 << log_rows, columns = 1 << log_columns;
+	int32_t i, j;
+
+	// TODO spec improvement: coefficients start being transposed, note this as well
+	if (log_columns > log_rows) {
+		for (j = 0; j < columns; ++j) for (i = 0; i < rows; ++i) {
+			scratch[j * columns + i] = out[i * rows + j];
+		}
+	} else {
+		for (j = 0; j < columns; ++j) for (i = 0; i < rows; ++i) {
+			scratch[j * columns + i] = out[j * columns + i];
+		}
+	}
+	jxsml__inverse_dct(out, scratch, log_columns, rows, rows, rows);
+	for (i = 0; i < rows; ++i) for (j = 0; j < columns; ++j) {
+		scratch[i * columns + j] = out[j * rows + i];
+	}
+	jxsml__inverse_dct(out, scratch, log_rows, columns, columns, columns);
+}
+
 /*
 JXSML_STATIC void jxsml__aux_inverse_dct11(float *JXSML_RESTRICT out, float *JXSML_RESTRICT in, int32_t S) {
 	int32_t x, y, S2 = S / 2;
@@ -3737,11 +3977,11 @@ JXSML_STATIC jxsml_err jxsml__lf_global(jxsml__st *st, jxsml__frame_t *f) {
 		}
 
 		if (!jxsml__u(st, 1)) { // LfChannelCorrelation.all_default
-			f->colour_factor = jxsml__u32(st, 84, 0, 256, 0, 2, 8, 258, 16);
+			f->inv_colour_factor = 1.0f / (float) jxsml__u32(st, 84, 0, 256, 0, 2, 8, 258, 16);
 			f->base_corr_x = jxsml__f16(st);
 			f->base_corr_b = jxsml__f16(st);
-			f->x_factor_lf = jxsml__u(st, 8);
-			f->b_factor_lf = jxsml__u(st, 8);
+			f->x_factor_lf = jxsml__u(st, 8) - 127;
+			f->b_factor_lf = jxsml__u(st, 8) - 127;
 		}
 	}
 
@@ -3797,7 +4037,7 @@ typedef struct {
 	int32_t *blocks; // [width8*height8]
 	jxsml__varblock *varblocks; // [nb_varblocks]
 
-	float *coeffs[3 /*xyb*/]; // [width8*height8*64] each
+	float *coeffs[3]; // [width8*height8*64] each
 
 	// precomputed lf_idx
 	int8_t *lfindices; // [width8*height8], later reused as NonZeros
@@ -3854,6 +4094,7 @@ JXSML_STATIC jxsml_err jxsml__lf_quant(
 		JXSML__LF_INDICES_THRESHOLD(1);
 	}
 	#undef JXSML__LF_INDICES_THRESHOLD
+	#undef JXSML__LF_INDICES_MULTIPLY
 
 	// apply smoothing to LfQuant
 	if (!f->skip_adapt_lf_smooth) {
@@ -3898,12 +4139,12 @@ error:
 }
 
 JXSML_STATIC jxsml_err jxsml__hf_metadata(
-	jxsml__st *st, const jxsml__frame_t *f, int32_t nb_varblocks,
+	jxsml__st *st, jxsml__frame_t *f, int32_t nb_varblocks,
 	jxsml__modular_t *m, float (*lfquant)[3], jxsml__lf_group_t *gg
 ) {
 	int32_t *blocks = NULL;
 	jxsml__varblock *varblocks = NULL;
-	float *coeffs[3] = {};
+	float *coeffs[3 /*xyb*/] = {};
 	int32_t log_gsize8 = f->group_size_shift - 3;
 	int32_t ggw8 = gg->width8, ggh8 = gg->height8;
 	int32_t voff, coeffoff;
@@ -3923,7 +4164,7 @@ JXSML_STATIC jxsml_err jxsml__hf_metadata(
 	}
 
 	// temporarily use coeffoff_qfidx to store DctSelect
-	// TODO spec issue: HfFul seems to be capped to [1, Quantizer::kQuantMax = 256] in libjxl
+	// TODO spec issue: HfMul seems to be capped to [1, Quantizer::kQuantMax = 256] in libjxl
 	if (st->modular_16bit_buffers) {
 		int16_t *blockinfo = JXSML__ALIGNED(PIXELS, m->channel[2].pixels);
 		for (i = 0; i < nb_varblocks; ++i) {
@@ -3949,6 +4190,8 @@ JXSML_STATIC jxsml_err jxsml__hf_metadata(
 		dctsel = varblocks[voff].coeffoff_qfidx;
 		JXSML__SHOULD(0 <= dctsel && dctsel < JXSML__NUM_DCT_SELECT, "dct?");
 		dct = &JXSML__DCT_SELECT[dctsel];
+		f->dct_select_used |= 1 << dctsel;
+		f->order_used |= 1 << dct->order_idx;
 		varblocks[voff].coeffoff_qfidx = coeffoff;
 		JXSML__ASSERT(coeffoff % 64 == 0);
 
@@ -3973,26 +4216,12 @@ JXSML_STATIC jxsml_err jxsml__hf_metadata(
 		for (i = 0; i < vh8; ++i) for (j = 0; j < vw8; ++j) for (c = 0; c < 3; ++c) {
 			coeffs[c][coeffoff + i * vw8 + j] = lfquant[pos + i * ggw8 + j][c];
 		}
-		if (log_vw > 3 || log_vh > 3) { // TODO spec issue: DCT8x8 doesn't need this
-			for (c = 0; c < 3; ++c) { // the decoder rarely uses forward DCT, so it's inlined here
-				float *coeffs1 = coeffs[c] + coeffoff, scratch[1024]; // DCT256x256 requires 32x32
-				const float *scalex = JXSML__LLF2LF_SCALES + vw8, *scaley = JXSML__LLF2LF_SCALES + vh8;
-				jxsml__forward_dct_unscaled(scratch, coeffs1, log_vh - 3, vw8, vw8, vw8);
-				for (i = 0; i < vh8; ++i) for (j = 0; j < vw8; ++j) {
-					coeffs1[j * vh8 + i] = scratch[i * vw8 + j];
-				}
-				jxsml__forward_dct_unscaled(scratch, coeffs1, log_vw - 3, vh8, vh8, vh8);
-				if (log_vw > log_vh) { // transposed so that R >= C
-					for (i = 0; i < vh8; ++i) for (j = 0; j < vw8; ++j) {
-						// parentheses hopefully guide a compiler to factor
-						// the second multiplication out of the inner loop (TODO verify this)
-						coeffs1[j * vh8 + i] = scratch[i * vw8 + j] * (scaley[i] * scalex[j]);
-					}
-				} else {
-					for (i = 0; i < vh8; ++i) for (j = 0; j < vw8; ++j) {
-						coeffs1[i * vw8 + j] = scratch[i * vw8 + j] * (scaley[i] * scalex[j]);
-					}
-				}
+		// TODO spec bug: DctSelect type IDENTIFY [sic] no longer exists
+		// TODO spec issue: DCT8x8 doesn't need this
+		if (log_vw > 3 || log_vh > 3) {
+			float scratch[1024]; // DCT256x256 requires 32x32
+			for (c = 0; c < 3; ++c) {
+				jxsml__forward_dct2d_scaled_for_llf(scratch, coeffs[c] + coeffoff, log_vh - 3, log_vw - 3);
 			}
 		}
 
@@ -4081,6 +4310,7 @@ JXSML_STATIC jxsml_err jxsml__lf_group(
 			for (c = 0; c < 3; ++c) JXSML__TRY(jxsml__modular_channel(st, &m, c, sidx0));
 			JXSML__TRY(jxsml__finish_and_free_code(st, &m.code));
 			JXSML__TRY(jxsml__inverse_transform(st, &m));
+			// TODO spec issue: this modular image is independent of bpp/float_sample/etc.
 			JXSML__TRY(jxsml__lf_quant(st, f, extra_prec, &m, gg, &lfquant));
 			jxsml__free_modular(&m);
 		} else {
@@ -4146,14 +4376,10 @@ JXSML_STATIC jxsml_err jxsml__hf_global(jxsml__st *st, jxsml__frame_t *f) {
 		int32_t used_orders = jxsml__u32(st, 0x5f, 0, 0x13, 0, 0, 0, 0, 13);
 		if (used_orders > 0) JXSML__TRY(jxsml__code_spec(st, 8, &codespec));
 		for (j = 0; j < JXSML__NUM_ORDERS; ++j) {
-			static const int8_t LOG_ORDER_SIZE[JXSML__NUM_ORDERS][2] = {
-				{3,3},{3,3},{4,4},{5,5},{4,3},{5,3},{5,4},{6,6},{6,5},{7,7},{7,6},{8,8},{8,7}
-			};
 			if (used_orders >> j & 1) {
-				int32_t size = 1 << (LOG_ORDER_SIZE[j][0] + LOG_ORDER_SIZE[j][1]);
+				int32_t size = 1 << (JXSML__LOG_ORDER_SIZE[j][0] + JXSML__LOG_ORDER_SIZE[j][1]);
 				for (c = 0; c < 3; ++c) { // SPEC this loop is omitted
-					JXSML__TRY(jxsml__permutation(st, &code, size, size / 64,
-						&f->orders[i][j][c], &f->order_lens[i][j][c]));
+					JXSML__TRY(jxsml__permutation(st, &code, size, size / 64, &f->orders[i][j][c]));
 				}
 			}
 		}
@@ -4184,7 +4410,7 @@ JXSML_STATIC jxsml_err jxsml__hf_coeffs(
 	int8_t (*nonzeros)[3] = NULL;
 	jxsml__code_t code = { .spec = &f->coeff_codespec[pass] };
 	int32_t lfidx_size = (f->nb_lf_thr[0] + 1) * (f->nb_lf_thr[1] + 1) * (f->nb_lf_thr[2] + 1);
-	int32_t x8, y8, i, j, c;
+	int32_t x8, y8, i, j, c_yxb;
 
 	JXSML__ASSERT(gx_in_gg % 8 == 0 && gy_in_gg % 8 == 0);
 
@@ -4217,8 +4443,8 @@ JXSML_STATIC jxsml_err jxsml__hf_coeffs(
 			bctx0 = (dct->order_idx * (f->nb_qf_thr + 1) + qfidx) * lfidx_size + lfidx;
 			bctxc = 13 * (f->nb_qf_thr + 1) * lfidx_size;
 
-			// unlike most places, this uses the YXB order which should be later shuffled!
-			for (c = 0; c < 3; ++c) {
+			// unlike most places, this uses the YXB order
+			for (c_yxb = 0; c_yxb < 3; ++c_yxb) {
 				static const int8_t TWICE_COEFF_FREQ_CTX[64] = { // pre-multiplied by 2, [0] is unused
 					-1,  0,  2,  4,  6,  8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28,
 					30, 30, 32, 32, 34, 34, 36, 36, 38, 38, 40, 40, 42, 42, 44, 44,
@@ -4233,12 +4459,15 @@ JXSML_STATIC jxsml_err jxsml__hf_coeffs(
 					412, 412, 412, 412, 412, 412, 412, 412, 412, 412, 412, 412, 412, 412, 412, 412,
 				};
 
+				int32_t c = c_yxb < 2 ? !c_yxb : c_yxb;
 				float *coeffs = gg->coeffs[c] + coeffoff;
-				int32_t bctx = f->block_ctx_map[bctx0 + bctxc * c]; // BlockContext()
+				int32_t *order = f->orders[pass][dct->order_idx][c];
+				int32_t bctx = f->block_ctx_map[bctx0 + bctxc * c_yxb]; // BlockContext()
 				int32_t nz, nzctx, cctx, qnz, prev;
 
+				JXSML__ASSERT(order); // orders should have been already converted from Lehmer code
+
 				// predict and read the number of non-zero coefficients
-				qnz =
 				nz = x8 > 0 ?
 					(y8 > 0 ? (nonzeros[nzpos - 1][c] + nonzeros[nzpos - gw8][c] + 1) >> 1 : nonzeros[nzpos - 1][c]) :
 					(y8 > 0 ? nonzeros[nzpos - gw8][c] : 32);
@@ -4268,8 +4497,9 @@ JXSML_STATIC jxsml_err jxsml__hf_coeffs(
 					// TODO spec question: can this overflow?
 					// unlike modular there is no guarantee about "buffers" or anything similar here
 					int32_t ucoeff = jxsml__code(st, ctx, 0, &code);
-					// TODO should be coeffs[order[i]]
-					coeffs[i] += (float) jxsml__to_signed(ucoeff); // TODO int-to-float conversion, is it okay?
+					// TODO int-to-float conversion, is it okay?
+					coeffs[order[i]] += (float) jxsml__to_signed(ucoeff);
+					// TODO spec issue: normative indicator has changed from [[...]] to a long comment
 					nz -= prev = (ucoeff != 0);
 				}
 				JXSML__SHOULD(nz == 0, "coef"); // TODO spec issue: missing
@@ -4300,6 +4530,7 @@ JXSML_STATIC jxsml_err jxsml__pass_group(
 	if (!f->is_modular) {
 		int32_t ctxoff;
 		JXSML__ASSERT(gg);
+		// TODO spec issue: this offset is later referred so should be monospaced
 		ctxoff = 495 * f->nb_block_ctx * jxsml__u(st, jxsml__ceil_lg32((uint32_t) f->num_hf_presets));
 		JXSML__TRY(jxsml__hf_coeffs(st, f, ctxoff, pass, gx_in_gg, gy_in_gg, gw, gh, gg));
 	}
@@ -4327,11 +4558,196 @@ error:
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+// coefficients to samples
+
+JXSML_STATIC jxsml_err jxsml__dequant_hf(jxsml__st *st, const jxsml__frame_t *f, jxsml__lf_group_t *gg) {
+	// QM_SCALE[i] = 0.8^(i - 2)
+	static const float QM_SCALE[8] = {1.5625f, 1.25f, 1.0f, 0.8f, 0.64f, 0.512f, 0.4096f, 0.32768f};
+
+	int32_t nblocks = gg->width8 * gg->height8;
+	float x_qm_scale, b_qm_scale, quant_bias_num = st->quant_bias_num, *quant_bias = st->quant_bias;
+	int32_t i, j, c;
+
+	JXSML__ASSERT(f->x_qm_scale >= 0 && f->x_qm_scale < 8);
+	JXSML__ASSERT(f->b_qm_scale >= 0 && f->b_qm_scale < 8);
+	x_qm_scale = QM_SCALE[f->x_qm_scale];
+	b_qm_scale = QM_SCALE[f->b_qm_scale];
+
+	for (i = 0; i < nblocks; ++i) {
+		const jxsml__dct_select *dct;
+		const jxsml__dq_matrix_t *dqmat;
+		int32_t voff = gg->blocks[i], dctsel = voff >> 20, size;
+		float mult[3 /*xyb*/];
+
+		if (dctsel < 2) continue; // not top-left block
+		voff &= 0xfffff;
+		dct = &JXSML__DCT_SELECT[dctsel - 2];
+		size = 1 << (dct->log_rows + dct->log_columns);
+		mult[1] = (float) (gg->varblocks[voff].hfmul_m1 + 1);
+		mult[0] = mult[1] * x_qm_scale;
+		mult[2] = mult[1] * b_qm_scale;
+		dqmat = &f->dq_matrix[dct->param_idx];
+		JXSML__ASSERT(dqmat->mode == JXSML__DQ_ENC_RAW); // should have been already loaded
+
+		for (c = 0; c < 3; ++c) {
+			float *coeffs = gg->coeffs[c] + (gg->varblocks[voff].coeffoff_qfidx & ~15);
+			for (j = size >> 6; j < size; ++j) {
+				// TODO spec issue: "quant" is a variable name and should be monospaced
+				if (-1.0f <= coeffs[j] && coeffs[j] <= 1.0f) {
+					coeffs[j] *= quant_bias[c]; // TODO coeffs[j] is integer at this point?
+				} else {
+					coeffs[j] -= quant_bias_num / coeffs[j];
+				}
+				coeffs[j] *= mult[c] * dqmat->params[j][c];
+			}
+		}
+	}
+
+error:
+	return st->err;
+}
+
+JXSML_STATIC jxsml_err jxsml__combine_vardct_from_lf_group(
+	jxsml__st *st, jxsml__frame_t *f, int32_t ggx, int32_t ggy, jxsml__lf_group_t *gg
+) {
+	int32_t ggw64 = gg->width64;
+	int32_t ggw8 = gg->width8, ggh8 = gg->height8;
+	int32_t ggw = gg->width, ggh = gg->height;
+	int32_t x8, y8, x, y, i, c;
+	float kx_lf, kb_lf;
+	void *xfromy, *bfromy;
+	float *scratch = NULL, cbrt_opsin_bias[3];
+
+	// TODO allocates the same amount of memory regardless of transformations used
+	JXSML__SHOULD(scratch = malloc(sizeof(float) * 65536), "!mem");
+
+	kx_lf = f->base_corr_x + (float) f->x_factor_lf * f->inv_colour_factor;
+	kb_lf = f->base_corr_b + (float) f->b_factor_lf * f->inv_colour_factor;
+	xfromy = JXSML__ALIGNED(PIXELS, gg->xfromy);
+	bfromy = JXSML__ALIGNED(PIXELS, gg->bfromy);
+
+	for (y8 = 0; y8 < ggh8; ++y8) {
+		for (x8 = 0; x8 < ggw8; ++x8) {
+			const jxsml__dct_select *dct;
+			int32_t voff = gg->blocks[y8 * ggw8 + x8], dctsel = voff >> 20, size;
+			int32_t coeffoff, ccpos;
+			float *coeffs[3 /*xyb*/], kx_hf, kb_hf;
+
+			if (dctsel < 2) continue; // not top-left block
+			voff &= 0xfffff;
+			dct = &JXSML__DCT_SELECT[dctsel - 2];
+			size = 1 << (dct->log_rows + dct->log_columns);
+			coeffoff = gg->varblocks[voff].coeffoff_qfidx & ~15;
+			for (c = 0; c < 3; ++c) coeffs[c] = gg->coeffs[c] + coeffoff;
+
+			// chroma from luma
+			// TODO spec bug: x_factor and b_factor (for HF) is constant in the same varblock,
+			// even when the varblock spans multiple 64x64 rectangles
+			// TODO skip CfL if there's subsampled channel
+			ccpos = (y8 / 8) * ggw64 + (x8 / 8);
+			if (st->modular_16bit_buffers) {
+				kx_hf = f->base_corr_x + (float) ((int16_t*) xfromy)[ccpos] * f->inv_colour_factor;
+				kb_hf = f->base_corr_b + (float) ((int16_t*) bfromy)[ccpos] * f->inv_colour_factor;
+			} else {
+				kx_hf = f->base_corr_x + (float) ((int32_t*) xfromy)[ccpos] * f->inv_colour_factor;
+				kb_hf = f->base_corr_b + (float) ((int32_t*) bfromy)[ccpos] * f->inv_colour_factor;
+			}
+			for (i = 0; i < (size >> 6); ++i) { // LF
+				coeffs[0][i] += coeffs[1][i] * kx_lf;
+				coeffs[2][i] += coeffs[1][i] * kb_lf;
+			}
+			for (; i < size; ++i) { // HF
+				coeffs[0][i] += coeffs[1][i] * kx_hf;
+				coeffs[2][i] += coeffs[1][i] * kb_hf;
+			}
+
+			// inverse DCT
+			for (c = 0; c < 3; ++c) {
+				switch (dctsel) {
+				case 1: // Hornuss -- TODO
+					//JXSML__RAISE("TODO: inverse Hornuss");
+					break;
+
+				case 2: // DCT11
+					//JXSML__RAISE("TODO: inverse DCT11");
+					break;
+
+				case 3: // DCT22 -- TODO
+					//JXSML__RAISE("TODO: inverse DCT22");
+					break;
+
+				case 12: // DCT23
+					//JXSML__RAISE("TODO: inverse DCT23");
+					break;
+
+				case 13: // DCT32
+					//JXSML__RAISE("TODO: inverse DCT32");
+					break;
+
+				case 14: // AFV0
+				case 15: // AFV1
+				case 16: // AFV2
+				case 17: // AFV3
+					//JXSML__RAISE("TODO: inverse AFV*");
+					break;
+
+				default: // every other DCTnm where n, m >= 3
+					jxsml__inverse_dct2d(coeffs[c], scratch, dct->log_rows, dct->log_columns);
+					break;
+				}
+			}
+		}
+	}
+
+	// coeffs is now correctly positioned, copy to the modular buffer
+	for (c = 0; c < 3; ++c) cbrt_opsin_bias[c] = cbrtf(st->opsin_bias[c]);
+	for (y = 0; y < ggh8 * 8; ++y) {
+		for (x = 0; x < ggw8 * 8; ++x) {
+			int32_t pos = y * (ggw8 * 8) + x;
+			float p[3] = {
+				gg->coeffs[1][pos] + gg->coeffs[0][pos],
+				gg->coeffs[1][pos] - gg->coeffs[0][pos],
+				gg->coeffs[2][pos],
+			};
+			float itscale = (float) (1 << st->out->bpp) * 255.0f / st->out->intensity_target;
+			for (c = 0; c < 3; ++c) {
+				float pp = p[c] - cbrt_opsin_bias[c];
+				gg->coeffs[c][pos] = (pp * pp * pp + st->opsin_bias[c]) * itscale;
+			}
+		}
+	}
+	if (st->modular_16bit_buffers) {
+		int16_t *pixels[3];
+		for (c = 0; c < 3; ++c) pixels[c] = JXSML__ALIGNED(PIXELS, f->gmodular.channel[c].pixels);
+		for (y = 0; y < ggh; ++y) {
+			for (x = 0; x < ggw; ++x) {
+				// TODO spec issue: overflown samples (due to non-8n dimensions) are probably ignored
+				int32_t coeffpos = y * (ggw8 * 8) + x, pixelpos = (ggy + y) * ggw + (ggx + x);
+				for (c = 0; c < 3; ++c) {
+					float v =
+						gg->coeffs[0][coeffpos] * st->opsin_inv_mat[c][0] +
+						gg->coeffs[1][coeffpos] * st->opsin_inv_mat[c][1] +
+						gg->coeffs[2][coeffpos] * st->opsin_inv_mat[c][2];
+					pixels[c][pixelpos] = (int64_t) (v / 1000.0f) & 0xff;
+						//(v < (float) INT16_MIN ? INT16_MIN : v > (float) INT16_MAX ? INT16_MAX : (int16_t) v);
+				}
+			}
+		}
+	} else {
+		JXSML__RAISE("TODO: don't keep this here");
+	}
+
+error:
+	free(scratch);
+	return st->err;
+}
+
+////////////////////////////////////////////////////////////////////////////////
 // frame
 
 JXSML_STATIC jxsml_err jxsml__frame(jxsml__st *st, jxsml__frame_t *f) {
 	jxsml__lf_group_t *gg = NULL;
-	int32_t i;
+	int32_t i, j, c;
 
 	JXSML__TRY(jxsml__frame_header(st, f));
 	JXSML__TRY(jxsml__toc(st, f));
@@ -4358,12 +4774,41 @@ JXSML_STATIC jxsml_err jxsml__frame(jxsml__st *st, jxsml__frame_t *f) {
 
 	if (!f->is_modular) JXSML__TRY(jxsml__hf_global(st, f));
 
+	// ensure all needed dequantization matrices loaded
+	for (j = 0; j < JXSML__NUM_DCT_SELECT; ++j) {
+		if (f->dct_select_used >> j & 1) {
+			const jxsml__dct_select *dct = &JXSML__DCT_SELECT[j];
+			int32_t param_idx = dct->param_idx;
+			JXSML__TRY(jxsml__load_dq_matrix(st, param_idx, &f->dq_matrix[param_idx]));
+		}
+	}
+
 	// PassGroups
 	for (i = 0; i < f->num_passes; ++i) {
 		int32_t gsize = 1 << f->group_size_shift, log_ggsize = 3 + f->group_size_shift;
 		int32_t gx, gy, gidx = 0;
 
 		if (i > 0) JXSML__RAISE("TODO: more passes");
+
+		// compute all needed coefficient orders and discard others
+		for (j = 0; j < JXSML__NUM_ORDERS; ++j) {
+			if (f->order_used >> j & 1) {
+				int32_t log_rows = JXSML__LOG_ORDER_SIZE[j][0];
+				int32_t log_columns = JXSML__LOG_ORDER_SIZE[j][1];
+				int32_t *order, temp, skip = 1 << (log_rows + log_columns - 6);
+				for (c = 0; c < 3; ++c) {
+					JXSML__TRY(jxsml__natural_order(st, log_rows, log_columns, &order));
+					jxsml__apply_permutation(order + skip, &temp, sizeof(int32_t), f->orders[i][j][c]);
+					free(f->orders[i][j][c]);
+					f->orders[i][j][c] = order;
+				}
+			} else {
+				for (c = 0; c < 3; ++c) {
+					free(f->orders[i][j][c]);
+					f->orders[i][j][c] = NULL;
+				}
+			}
+		}
 
 		for (gy = 0; gy < f->height; gy += gsize) {
 			int32_t gh = jxsml__min32(gsize, f->height - gy);
@@ -4381,6 +4826,28 @@ JXSML_STATIC jxsml_err jxsml__frame(jxsml__st *st, jxsml__frame_t *f) {
 	}
 
 	JXSML__TRY(jxsml__inverse_transform(st, &f->gmodular));
+
+	// render the LF group into modular buffers
+	if (!f->is_modular) {
+		int32_t ggsize = 8 << f->group_size_shift, ggx, ggy, ggidx = 0;
+
+		// TODO pretty incorrect to do this
+		JXSML__SHOULD(!f->do_ycbcr && st->out->cspace != JXSML_CS_GREY, "TODO: we don't yet do YCbCr or gray");
+		JXSML__SHOULD(st->modular_16bit_buffers, "TODO: !modular_16bit_buffers");
+		f->gmodular.num_channels = 3;
+		JXSML__SHOULD(f->gmodular.channel = calloc(3, sizeof(jxsml__modular_channel_t)), "!mem");
+		for (i = 0; i < f->gmodular.num_channels; ++i) {
+			jxsml__modular_channel_t *c = &f->gmodular.channel[i];
+			size_t sz = sizeof(int16_t) * (size_t) (f->width * f->height);
+			JXSML__SHOULD(c->pixels = JXSML__ALLOC_ALIGNED(PIXELS, sz), "!mem");
+		}
+		for (ggy = 0; ggy < f->height; ggy += ggsize) {
+			for (ggx = 0; ggx < f->width; ggx += ggsize, ++ggidx) {
+				JXSML__TRY(jxsml__dequant_hf(st, f, &gg[ggidx]));
+				JXSML__TRY(jxsml__combine_vardct_from_lf_group(st, f, ggx, ggy, &gg[ggidx]));
+			}
+		}
+	}
 
 error:
 	if (gg) for (i = 0; i < f->num_lf_groups; ++i) jxsml__free_lf_group(&gg[i]);
