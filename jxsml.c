@@ -1,6 +1,10 @@
 // JXSML: An extra small JPEG XL decoder
 // Kang Seonghoon, 2022-06, Public Domain (CC0)
 //
+// This is an independent reimplementation of a decoder for JPEG XL (ISO/IEC 18181) image format.
+// As the first such reimplementation, JXSML was used to validate the specification and
+// detect and fix its bugs and ambiguities.
+//
 // "SPEC" comments are used for incorrect, ambiguous or misleading specification issues.
 // "TODO spec" comments are roughly same, but not yet fully confirmed & reported.
 
@@ -287,19 +291,24 @@ JXSML_ALWAYS_INLINE jxsml__intN_t jxsml__(max,N)(jxsml__intN_t x, jxsml__intN_t 
 
 #define JXSML__4(s) (jxsml_err) (((uint32_t) s[0] << 24) | ((uint32_t) s[1] << 16) | ((uint32_t) s[2] << 8) | (uint32_t) s[3])
 #define JXSML__ERR(s) jxsml__set_error(st, JXSML__4(s))
-#define JXSML__SHOULD(cond, s) do { \
-		if (JXSML_UNLIKELY(st->err)) goto error; \
-		else if (JXSML_UNLIKELY(!(cond))) { jxsml__set_error(st, JXSML__4(s)); goto error; } \
+#define JXSML__SHOULD_OR(cond, s, stmt) do { \
+		if (JXSML_UNLIKELY(st->err)) { stmt; } \
+		else if (JXSML_UNLIKELY(!(cond))) { jxsml__set_error(st, JXSML__4(s)); stmt; } \
 	} while (0)
+#define JXSML__SHOULD(cond, s) JXSML__SHOULD_OR(cond, s, goto error)
 #define JXSML__RAISE(s) do { jxsml__set_error(st, JXSML__4(s)); goto error; } while (0)
 #define JXSML__RAISE_DELAYED() do { if (JXSML_UNLIKELY(st->err)) goto error; } while (0)
 #define JXSML__TRY(expr) do { if (JXSML_UNLIKELY(expr)) goto error; } while (0)
 #ifdef JXSML_DEBUG
-#define JXSML__ASSERT(cond) JXSML__SHOULD(cond, "!exp")
-#define JXSML__UNREACHABLE() JXSML__ASSERT(0)
+	#define JXSML__ON_ERROR error
+	#define JXSML__ASSERT(cond) JXSML__SHOULD(cond, "!exp")
+	#define JXSML__ASSERT_OR(cond, stmt) JXSML__SHOULD_OR(cond, "!exp", stmt)
+	#define JXSML__UNREACHABLE() JXSML__ASSERT(0)
 #else
-#define JXSML__ASSERT(cond) (void) 0
-#define JXSML__UNREACHABLE() (void) 0
+	#define JXSML__ON_ERROR goto error; error // suppress warnings
+	#define JXSML__ASSERT(cond) (void) 0
+	#define JXSML__ASSERT_OR(cond, stmt) (void) 0
+	#define JXSML__UNREACHABLE() (void) 0
 #endif
 
 JXSML_STATIC jxsml_err jxsml__set_error(jxsml__st *st, jxsml_err err) {
@@ -324,7 +333,7 @@ JXSML_STATIC void *jxsml__realloc(jxsml__st *st, void *ptr, size_t itemsize, int
 	JXSML__SHOULD(newptr = realloc(ptr, itemsize * newcap), "!mem");
 	*cap = (int32_t) newcap;
 	return newptr;
-error:
+JXSML__ON_ERROR:
 	return NULL;
 }
 
@@ -335,6 +344,28 @@ error:
 	} while (0) \
 
 ////////////////////////////////////////////////////////////////////////////////
+// plane
+
+/*
+typedef struct {
+	int8_t type; // i8 (8), i16 (16), i32 (32), f32 (-32) or uninitialized (0)
+	int32_t stride; // the number of *bytes* between each row
+	int32_t width, height;
+	union { int8_t *i8; int16_t *i16; int32_t *i32; float *f32; } pixels; // aligned like PIXELS
+} jxsml__plane;
+
+JXSML_STATIC jxsml_err jxsml__plane_i8(jxsml__st *st, int32_t width, int32_t height, jxsml__plane *out) {
+	int32_t stride = jxsml__ceil_div32(width, JXSML__ALIGNMENT_PIXELS) * JXSML__ALIGNMENT_PIXELS;
+	if (stride * height
+	JXSML__SHOULD(out->pixels.i8 = JXSML__ALLOC_ALIGNED(PIXELS, stride * height * ), "!mem");
+	(int32_t) sizeof(int8_t);
+	
+JXSML__ON_ERROR:
+	return st->err;
+}
+*/
+
+////////////////////////////////////////////////////////////////////////////////
 // container
 
 JXSML_STATIC jxsml_err jxsml__container_u32(jxsml__st *st, uint32_t *v) {
@@ -343,7 +374,7 @@ JXSML_STATIC jxsml_err jxsml__container_u32(jxsml__st *st, uint32_t *v) {
 		((uint32_t) st->container_buf[2] << 8) | (uint32_t) st->container_buf[3];
 	st->container_buf += 4;
 	st->container_bufsize -= 4;
-error:
+JXSML__ON_ERROR:
 	return st->err;
 }
 
@@ -380,7 +411,7 @@ JXSML_STATIC jxsml_err jxsml__box(jxsml__st *st, jxsml__box_t *out) {
 	out->start = st->container_buf;
 	st->container_buf += out->size;
 	st->container_bufsize -= out->size;
-error:
+JXSML__ON_ERROR:
 	return st->err;
 }
 
@@ -428,7 +459,7 @@ JXSML_STATIC jxsml_err jxsml__init_container(jxsml__st *st, const void *buf, siz
 		st->bufsize = bufsize;
 	}
 	printf("skipped %d bytes of container\n", (int32_t) (st->buf - (const uint8_t*) buf)); fflush(stdout);
-error:
+JXSML__ON_ERROR:
 	return st->err;
 }
 
@@ -448,7 +479,7 @@ JXSML_STATIC jxsml_err jxsml__refill_container(jxsml__st *st) {
 	st->container_continued = !(box.start[0] >> 7);
 	st->buf = box.start + 4;
 	st->bufsize = box.size - 4;
-error:
+JXSML__ON_ERROR:
 	return st->err;
 }
 
@@ -463,7 +494,7 @@ JXSML_STATIC jxsml_err jxsml__finish_container(jxsml__st *st) {
 			box.type != 0x6a786c69 /*jxli*/,
 			"box?"); // some box is disallowed after the last jxlp/jxlc
 	}
-error:
+JXSML__ON_ERROR:
 	return st->err;
 }
 
@@ -471,9 +502,7 @@ error:
 // bitstream
 
 JXSML_STATIC jxsml_err jxsml__always_refill(jxsml__st *st, int32_t n) {
-#ifdef JXSML_DEBUG
-	if (n < 0 || n > 31) return JXSML__ERR("!exp");
-#endif
+	JXSML__ASSERT(0 <= n && n <= 31);
 	do {
 		size_t consumed = (size_t) ((32 - st->nbits) >> 3);
 		if (st->bufsize < consumed) {
@@ -489,21 +518,19 @@ JXSML_STATIC jxsml_err jxsml__always_refill(jxsml__st *st, int32_t n) {
 			}
 		} else {
 			st->bufsize -= consumed;
-#ifdef JXSML_DEBUG
-			if (st->nbits > 24) return JXSML__ERR("!exp");
-#endif
+			JXSML__ASSERT(st->nbits <= 24);
 			do {
 				st->bits |= (uint32_t) *st->buf++ << st->nbits;
 				st->nbits += 8;
 			} while (st->nbits <= 24);
 		}
 	} while (0);
-error:
+JXSML__ON_ERROR:
 	return st->err;
 }
 
 // ensure st->nbits is at least n; otherwise pull as many bytes as possible into st->bits
-#define jxsml__refill(st, n) (st->nbits < (n) ? jxsml__always_refill(st, n) : st->err)
+#define jxsml__refill(st, n) (JXSML_UNLIKELY(st->nbits < (n)) ? jxsml__always_refill(st, n) : st->err)
 
 JXSML_INLINE jxsml_err jxsml__zero_pad_to_byte(jxsml__st *st) {
 	int32_t n = st->nbits & 7;
@@ -539,9 +566,7 @@ JXSML_STATIC jxsml_err jxsml__skip(jxsml__st *st, uint64_t n) {
 // TODO there are cases where n > 31
 JXSML_INLINE int32_t jxsml__u(jxsml__st *st, int32_t n) {
 	int32_t ret;
-#ifdef JXSML_DEBUG
-	if (n < 0 || n > 31) return JXSML__ERR("!exp"), 0;
-#endif
+	JXSML__ASSERT_OR(0 <= n && n <= 31, return 0);
 	if (jxsml__refill(st, n)) return 0;
 	ret = (int32_t) (st->bits & ((1u << n) - 1));
 	st->bits >>= n;
@@ -559,12 +584,10 @@ JXSML_INLINE int32_t jxsml__u32(
 	const int32_t o[4] = { o0, o1, o2, o3 };
 	const int32_t n[4] = { n0, n1, n2, n3 };
 	int32_t sel;
-#ifdef JXSML_DEBUG
-	if (n0 < 0 || n0 > 30 || o0 > 0x7fffffff - (1 << n0)) return JXSML__ERR("!exp"), 0;
-	if (n1 < 0 || n1 > 30 || o1 > 0x7fffffff - (1 << n1)) return JXSML__ERR("!exp"), 0;
-	if (n2 < 0 || n2 > 30 || o2 > 0x7fffffff - (1 << n2)) return JXSML__ERR("!exp"), 0;
-	if (n3 < 0 || n3 > 30 || o3 > 0x7fffffff - (1 << n3)) return JXSML__ERR("!exp"), 0;
-#endif
+	JXSML__ASSERT_OR(0 <= n0 && n0 <= 30 && o0 <= 0x7fffffff - (1 << n0), return 0);
+	JXSML__ASSERT_OR(0 <= n1 && n1 <= 30 && o1 <= 0x7fffffff - (1 << n1), return 0);
+	JXSML__ASSERT_OR(0 <= n2 && n2 <= 30 && o2 <= 0x7fffffff - (1 << n2), return 0);
+	JXSML__ASSERT_OR(0 <= n3 && n3 <= 30 && o3 <= 0x7fffffff - (1 << n3), return 0);
 	sel = jxsml__u(st, 2);
 	return jxsml__u(st, n[sel]) + o[sel];
 }
@@ -836,7 +859,7 @@ JXSML_STATIC jxsml_err jxsml__init_prefix_code(
 	*out_table = l2table;
 	return 0;
 
-error:
+JXSML__ON_ERROR:
 	free(l2lengths);
 	free(l2table);
 	return st->err;
@@ -991,7 +1014,7 @@ JXSML_STATIC jxsml_err jxsml__init_alias_map(
 	*out = buckets;
 	return 0;
 
-error:
+JXSML__ON_ERROR:
 	free(buckets);
 	return st->err;
 }
@@ -1127,7 +1150,7 @@ JXSML_STATIC jxsml_err jxsml__cluster_map(
 
 	return 0;
 
-error:
+JXSML__ON_ERROR:
 	jxsml__free_code(&code);
 	jxsml__free_code_spec(&codespec);
 	return st->err;
@@ -1289,7 +1312,7 @@ JXSML_STATIC jxsml_err jxsml__code_spec(jxsml__st *st, int32_t num_dist, jxsml__
 	spec->num_dist = num_dist;
 	return 0;
 
-error:
+JXSML__ON_ERROR:
 	jxsml__free_code_spec(spec);
 	return st->err;
 }
@@ -1318,9 +1341,7 @@ continue_lz77:
 		return code->window[code->num_decoded++ & 0xfffff] = code->window[code->copy_pos++ & 0xfffff];
 	}
 
-#ifdef JXSML_DEBUG
-	if (ctx >= spec->num_dist) return JXSML__ERR("!exp"), 0;
-#endif
+	JXSML__ASSERT_OR(ctx < spec->num_dist, return 0);
 	use_prefix_code = spec->use_prefix_code;
 	log_alpha_size = spec->log_alpha_size;
 	cluster = &spec->clusters[spec->cluster_map[ctx]];
@@ -1385,7 +1406,7 @@ JXSML_STATIC jxsml_err jxsml__finish_and_free_code(jxsml__st *st, jxsml__code_t 
 		}
 	}
 	// it's explicitly allowed that num_to_copy can be > 0 at the end of stream
-error:
+JXSML__ON_ERROR:
 	jxsml__free_code(code);
 	return st->err;
 }
@@ -1432,7 +1453,7 @@ JXSML_STATIC jxsml_err jxsml__size_header(jxsml__st *st, int32_t *outw, int32_t 
 		break;
 	default: JXSML__UNREACHABLE();
 	}
-error:
+JXSML__ON_ERROR:
 	return st->err;
 }
 
@@ -1449,7 +1470,7 @@ JXSML_STATIC jxsml_err jxsml__bit_depth(jxsml__st *st, int32_t *outbpp, int32_t 
 		*outexpbits = 0;
 		JXSML__SHOULD(1 <= *outbpp && *outbpp <= 31, "bpp?");
 	}
-error:
+JXSML__ON_ERROR:
 	return st->err;
 }
 
@@ -1480,7 +1501,7 @@ JXSML_STATIC jxsml_err jxsml__name(jxsml__st *st, int32_t *outlen, char **outbuf
 	}
 	*outlen = len;
 	return 0;
-error:
+JXSML__ON_ERROR:
 	free(buf);
 	return st->err;
 }
@@ -1504,7 +1525,7 @@ JXSML_STATIC jxsml_err jxsml__extensions(jxsml__st *st) {
 		}
 	}
 	return jxsml__skip(st, nbits);
-error:
+JXSML__ON_ERROR:
 	return st->err;
 }
 
@@ -1690,7 +1711,7 @@ JXSML_STATIC jxsml_err jxsml__image_metadata(jxsml__st *st) {
 	JXSML__RAISE_DELAYED();
 	return 0;
 
-error:
+JXSML__ON_ERROR:
 	return st->err;
 }
 
@@ -1763,7 +1784,7 @@ JXSML_STATIC jxsml_err jxsml__icc(jxsml__st *st) {
 
 	return 0;
 
-error:
+JXSML__ON_ERROR:
 	jxsml__free_code(&code);
 	jxsml__free_code_spec(&codespec);
 	return st->err;
@@ -1824,7 +1845,7 @@ JXSML_STATIC jxsml_err jxsml__tree(jxsml__st *st, jxsml__tree_t **tree, jxsml__c
 	*tree = t;
 	return 0;
 
-error:
+JXSML__ON_ERROR:
 	free(t);
 	jxsml__free_code(&code);
 	jxsml__free_code_spec(codespec);
@@ -1902,7 +1923,7 @@ JXSML_STATIC jxsml_err jxsml__init_modular(
 		m->channel[i].height = h[i];
 		m->channel[i].hshift = m->channel[i].vshift = 0;
 	}
-error:
+JXSML__ON_ERROR:
 	return st->err;
 }
 
@@ -1936,7 +1957,7 @@ JXSML_STATIC jxsml_err jxsml__init_modular_for_global(
 	}
 	return 0;
 
-error:
+JXSML__ON_ERROR:
 	free(m->channel);
 	m->channel = NULL;
 	return st->err;
@@ -1970,7 +1991,7 @@ JXSML_STATIC jxsml_err jxsml__init_modular_for_pass_group(
 		free(m->channel);
 		m->channel = NULL;
 	}
-error:
+JXSML__ON_ERROR:
 	return st->err;
 }
 
@@ -2000,7 +2021,7 @@ JXSML_STATIC jxsml_err jxsml__combine_modular_from_pass_group(
 		}
 	}
 	JXSML__ASSERT(cidx == m->num_channels);
-error:
+JXSML__ON_ERROR:
 	return st->err;
 }
 
@@ -2008,17 +2029,15 @@ JXSML_STATIC jxsml_err jxsml__is_modular_channel_equal_sized(
 	jxsml__st *st, const jxsml__modular_channel_t *begin, const jxsml__modular_channel_t *end
 ) {
 	jxsml__modular_channel_t c;
+	(void) st;
 	if (begin >= end) return 0; // do not allow edge cases
 	c = *begin;
 	while (++begin < end) {
 		if (c.width != begin->width || c.height != begin->height) return 0;
-#ifdef JXSML_DEBUG
-		if (c.vshift >= 0 && c.hshift >= 0 && begin->vshift >= 0 && begin->hshift >= 0 &&
-			(c.vshift != begin->vshift || c.hshift != begin->hshift)
-		) {
-			return JXSML__ERR("!exp"), 0;
-		}
-#endif
+		JXSML__ASSERT_OR(
+			c.vshift < 0 || c.hshift < 0 || begin->vshift < 0 || begin->hshift < 0 ||
+			(c.vshift == begin->vshift && c.hshift == begin->hshift),
+			return 0);
 	}
 	return 1;
 }
@@ -2146,7 +2165,7 @@ JXSML_STATIC jxsml_err jxsml__modular_header(
 	}
 	return 0;
 
-error:
+JXSML__ON_ERROR:
 	free(channel);
 	free(m->transform);
 	if (!m->use_global_tree) {
@@ -2169,7 +2188,7 @@ JXSML_STATIC jxsml_err jxsml__allocate_modular(jxsml__st *st, jxsml__modular_t *
 		size_t sz = pixel_size * (size_t) (c->width * c->height);
 		JXSML__SHOULD(c->pixels = JXSML__ALLOC_ALIGNED(PIXELS, sz), "!mem");
 	}
-error:
+JXSML__ON_ERROR:
 	return st->err;
 }
 
@@ -2274,7 +2293,7 @@ JXSML_STATIC jxsml_err jxsml__(init_wp,2P)(jxsml__st *st, jxsml__wp_params param
 	JXSML__SHOULD(wp->errors = calloc((size_t) width * 2, sizeof(jxsml__int2P_t[5])), "!mem");
 	for (i = 0; i < 5; ++i) wp->pred[i] = 0;
 	wp->trueerrw = wp->trueerrn = wp->trueerrnw = wp->trueerrne = 0;
-error:
+JXSML__ON_ERROR:
 	return st->err;
 }
 
@@ -2507,7 +2526,7 @@ JXSML_STATIC jxsml_err jxsml__(modular_channel,P)(
 	free(refcmap);
 	return 0;
 
-error:
+JXSML__ON_ERROR:
 	jxsml__(free_wp,2P)(&wp);
 	free(refcmap);
 	JXSML__FREE_ALIGNED(PIXELS, c->pixels);
@@ -2636,7 +2655,7 @@ JXSML_STATIC jxsml_err jxsml__(inverse_rct,P)(
 	}
 	return 0;
 
-error:
+JXSML__ON_ERROR:
 	return st->err;
 }
 
@@ -2722,7 +2741,7 @@ JXSML_STATIC jxsml_err jxsml__(inverse_palette,P)(
 	memmove(m->channel, m->channel + 1, sizeof(jxsml__modular_channel_t) * (size_t) --m->num_channels);
 	return 0;
 
-error:
+JXSML__ON_ERROR:
 	jxsml__(free_wp,2P)(&wp);
 	return st->err;
 }
@@ -2762,7 +2781,7 @@ JXSML_STATIC jxsml_err jxsml__inverse_transform(jxsml__st *st, jxsml__modular_t 
 		}
 	}
 
-error:
+JXSML__ON_ERROR:
 	return st->err;
 }
 
@@ -2834,8 +2853,7 @@ static const struct jxsml__dct_params {
 	{-0.20819395464f, -0.33699592683512467f, -0.7f}, {-0.421064f, -0.30180866526242109f, -0.4f}, \
 	{-0.32733845535848671f, -0.27321683125358037f, -0.5f} // (8)
 static const float JXSML__LIBRARY_DCT_PARAMS[129][4] = {
-	// DCT33 dct_params (n=6)
-	// TODO spec bug: written as {2560.0f, 563.2f, ..}, {.., .., -3.0f}, {.., .., 0.0f},
+	// DCT33 dct_params (n=6) (SPEC some values are incorrect)
 	{3150.0f, 560.0f, 512.0f}, {0.0f, 0.0f, -2.0f}, {-0.4f, -0.3f, -1.0f},
 	{-0.4f, -0.3f, 0.0f}, {-0.4f, -0.3f, -1.0f}, {-2.0f, -0.3f, -2.0f},
 	// Hornuss params (3)
@@ -2933,7 +2951,7 @@ JXSML_STATIC jxsml_err jxsml__dq_matrix(
 	}
 	return 0;
 
-error:
+JXSML__ON_ERROR:
 	free(dqmat->params);
 	dqmat->params = NULL;
 	return st->err;
@@ -2967,7 +2985,7 @@ JXSML_STATIC jxsml_err jxsml__interpolation_bands(
 			JXSML__SHOULD(out[i][c] > 0, "band");
 		}
 	}
-error:
+JXSML__ON_ERROR:
 	return st->err;
 }
 
@@ -3127,7 +3145,7 @@ JXSML_STATIC jxsml_err jxsml__load_dq_matrix(jxsml__st *st, int32_t idx, jxsml__
 	dqmat->params = raw;
 	return 0;
 
-error:
+JXSML__ON_ERROR:
 	free(raw);
 	return st->err;
 }
@@ -3182,7 +3200,7 @@ JXSML_STATIC jxsml_err jxsml__natural_order(jxsml__st *st, int32_t log_rows, int
 	*out = order;
 	return 0;
 
-error:
+JXSML__ON_ERROR:
 	free(order);
 	return st->err;
 }
@@ -3470,7 +3488,7 @@ JXSML_STATIC jxsml_err jxsml__frame_header(jxsml__st *st, jxsml__frame_t *f) {
 	f->num_lf_groups = f->num_lf_groups_per_row * jxsml__ceil_div32(f->height, 8 << f->group_size_shift);
 	return 0;
 
-error:
+JXSML__ON_ERROR:
 	free(f->ec_log_upsampling);
 	free(f->ec_blend_info);
 	free(f->name);
@@ -3506,7 +3524,7 @@ JXSML_STATIC jxsml_err jxsml__permutation(
 	}
 	arr[end] = -1; // sentinel
 	*out = arr;
-error:
+JXSML__ON_ERROR:
 	return st->err;
 }
 
@@ -3575,7 +3593,7 @@ JXSML_STATIC jxsml_err jxsml__toc(jxsml__st *st, jxsml__frame_t *f) {
 	free(toc); // TODO use toc somehow (especially required for permuted one)
 	return 0;
 
-error:
+JXSML__ON_ERROR:
 	free(lehmer);
 	free(toc);
 	jxsml__free_code(&code);
@@ -3653,16 +3671,11 @@ static const float JXSML__LF2LLF_SCALES[64] = {
 
 #define JXSML__SQRT2 1.4142135623730951f
 
-#define JXSML__DCT_ARGS float *JXSML_RESTRICT out, float *JXSML_RESTRICT in, int32_t t
+#define JXSML__DCT_ARGS jxsml__st *st, float *JXSML_RESTRICT out, float *JXSML_RESTRICT in, int32_t t
 #define JXSML__REPEAT1() for (r1 = 0; r1 < rep1 * rep2; r1 += rep2)
 #define JXSML__REPEAT2() for (r2 = 0; r2 < rep2; ++r2)
 #define JXSML__IN(i) in[(i) * stride + r1 + r2]
 #define JXSML__OUT(i) out[(i) * stride + r1 + r2]
-#ifdef JXSML_DEBUG
-	#define JXSML__ASSERT_EQ(v, expected) if ((v) != (expected)) abort();
-#else
-	#define JXSML__ASSERT_EQ(v, expected) (void) v
-#endif
 
 JXSML_ALWAYS_INLINE void jxsml__forward_dct_core(
 	JXSML__DCT_ARGS, int32_t rep1, int32_t rep2,
@@ -3684,8 +3697,8 @@ JXSML_ALWAYS_INLINE void jxsml__forward_dct_core(
 
 	// in[0..N/2) = mcos2(out[0..N/2), N/2)
 	// in[N/2..N) = mcos2(out[N/2..N), N/2)
-	half_forward_dct(in, out, t - 1, rep1, rep2);
-	half_forward_dct(in + N / 2 * stride, out + N / 2 * stride, t - 1, rep1, rep2);
+	half_forward_dct(st, in, out, t - 1, rep1, rep2);
+	half_forward_dct(st, in + N / 2 * stride, out + N / 2 * stride, t - 1, rep1, rep2);
 
 	// out[0,2..N) = in[0..N/2)
 	JXSML__REPEAT1() for (i = 0; i < N / 2; ++i) JXSML__REPEAT2() {
@@ -3725,8 +3738,8 @@ JXSML_ALWAYS_INLINE void jxsml__inverse_dct_core(
 
 	// in[0..N/2) = mcos3(out[0..N/2), N/2)
 	// in[N/2..N) = mcos3(out[N/2..N), N/2)
-	half_inverse_dct(in, out, t - 1, rep1, rep2);
-	half_inverse_dct(in + N / 2 * stride, out + N / 2 * stride, t - 1, rep1, rep2);
+	half_inverse_dct(st, in, out, t - 1, rep1, rep2);
+	half_inverse_dct(st, in + N / 2 * stride, out + N / 2 * stride, t - 1, rep1, rep2);
 
 	// out[0..N) = (H_N)^T W^c_N in[0..N)
 	JXSML__REPEAT1() {
@@ -3745,7 +3758,8 @@ JXSML_ALWAYS_INLINE void jxsml__inverse_dct_core(
 
 JXSML_ALWAYS_INLINE void jxsml__dct2(JXSML__DCT_ARGS, int32_t rep1, int32_t rep2) {
 	int32_t r1, r2, stride = rep1 * rep2;
-	JXSML__ASSERT_EQ(t, 1);
+	(void) st;
+	JXSML__ASSERT_OR(t == 1, return); (void) t;
 	JXSML__REPEAT1() JXSML__REPEAT2() {
 		float x = JXSML__IN(0), y = JXSML__IN(1);
 		JXSML__OUT(0) = x + y;
@@ -3754,26 +3768,26 @@ JXSML_ALWAYS_INLINE void jxsml__dct2(JXSML__DCT_ARGS, int32_t rep1, int32_t rep2
 }
 
 JXSML_ALWAYS_INLINE void jxsml__forward_dct4(JXSML__DCT_ARGS, int32_t rep1, int32_t rep2) {
-	JXSML__ASSERT_EQ(t, 2);
-	jxsml__forward_dct_core(out, in, 2, rep1, rep2, jxsml__dct2);
+	JXSML__ASSERT_OR(t == 2, return); (void) t;
+	jxsml__forward_dct_core(st, out, in, 2, rep1, rep2, jxsml__dct2);
 }
 
 JXSML_STATIC void jxsml__forward_dct_recur(JXSML__DCT_ARGS, int32_t rep1, int32_t rep2) {
 	if (t < 4) {
-		JXSML__ASSERT_EQ(t, 3);
-		jxsml__forward_dct_core(out, in, 3, rep1, rep2, jxsml__forward_dct4);
+		JXSML__ASSERT_OR(t == 3, return);
+		jxsml__forward_dct_core(st, out, in, 3, rep1, rep2, jxsml__forward_dct4);
 	} else {
-		jxsml__forward_dct_core(out, in, t, rep1, rep2, jxsml__forward_dct_recur);
+		jxsml__forward_dct_core(st, out, in, t, rep1, rep2, jxsml__forward_dct_recur);
 	}
 }
 
 JXSML_STATIC void jxsml__forward_dct_recur_x8(JXSML__DCT_ARGS, int32_t rep1, int32_t rep2) {
-	JXSML__ASSERT_EQ(rep2, 8);
+	JXSML__ASSERT_OR(rep2 == 8, return); (void) rep2;
 	if (t < 4) {
-		JXSML__ASSERT_EQ(t, 3);
-		jxsml__forward_dct_core(out, in, 3, rep1, 8, jxsml__forward_dct4);
+		JXSML__ASSERT_OR(t == 3, return);
+		jxsml__forward_dct_core(st, out, in, 3, rep1, 8, jxsml__forward_dct4);
 	} else {
-		jxsml__forward_dct_core(out, in, t, rep1, 8, jxsml__forward_dct_recur_x8);
+		jxsml__forward_dct_core(st, out, in, t, rep1, 8, jxsml__forward_dct_recur_x8);
 	}
 }
 
@@ -3782,37 +3796,37 @@ JXSML_STATIC void jxsml__forward_dct_unscaled(JXSML__DCT_ARGS, int32_t rep) {
 	if (t <= 0) {
 		memcpy(out, in, sizeof(float) * (size_t) rep);
 	} else if (rep % 8 == 0) {
-		if (t == 1) return jxsml__dct2(out, in, 1, rep / 8, 8);
-		if (t == 2) return jxsml__forward_dct4(out, in, 2, rep / 8, 8);
-		return jxsml__forward_dct_recur_x8(out, in, t, rep / 8, 8);
+		if (t == 1) return jxsml__dct2(st, out, in, 1, rep / 8, 8);
+		if (t == 2) return jxsml__forward_dct4(st, out, in, 2, rep / 8, 8);
+		return jxsml__forward_dct_recur_x8(st, out, in, t, rep / 8, 8);
 	} else {
-		if (t == 1) return jxsml__dct2(out, in, 1, rep, 1);
-		if (t == 2) return jxsml__forward_dct4(out, in, 2, rep, 1);
-		return jxsml__forward_dct_recur(out, in, t, rep, 1);
+		if (t == 1) return jxsml__dct2(st, out, in, 1, rep, 1);
+		if (t == 2) return jxsml__forward_dct4(st, out, in, 2, rep, 1);
+		return jxsml__forward_dct_recur(st, out, in, t, rep, 1);
 	}
 }
 
 JXSML_ALWAYS_INLINE void jxsml__inverse_dct4(JXSML__DCT_ARGS, int32_t rep1, int32_t rep2) {
-	JXSML__ASSERT_EQ(t, 2);
-	jxsml__inverse_dct_core(out, in, 2, rep1, rep2, jxsml__dct2);
+	JXSML__ASSERT_OR(t == 2, return); (void) t;
+	jxsml__inverse_dct_core(st, out, in, 2, rep1, rep2, jxsml__dct2);
 }
 
 JXSML_STATIC void jxsml__inverse_dct_recur(JXSML__DCT_ARGS, int32_t rep1, int32_t rep2) {
 	if (t < 4) {
-		JXSML__ASSERT_EQ(t, 3);
-		jxsml__inverse_dct_core(out, in, 3, rep1, rep2, jxsml__inverse_dct4);
+		JXSML__ASSERT_OR(t == 3, return);
+		jxsml__inverse_dct_core(st, out, in, 3, rep1, rep2, jxsml__inverse_dct4);
 	} else {
-		jxsml__inverse_dct_core(out, in, t, rep1, rep2, jxsml__inverse_dct_recur);
+		jxsml__inverse_dct_core(st, out, in, t, rep1, rep2, jxsml__inverse_dct_recur);
 	}
 }
 
 JXSML_STATIC void jxsml__inverse_dct_recur_x8(JXSML__DCT_ARGS, int32_t rep1, int32_t rep2) {
-	JXSML__ASSERT_EQ(rep2, 8);
+	JXSML__ASSERT_OR(rep2 == 8, return); (void) rep2;
 	if (t < 4) {
-		JXSML__ASSERT_EQ(t, 3);
-		jxsml__inverse_dct_core(out, in, 3, rep1, 8, jxsml__inverse_dct4);
+		JXSML__ASSERT_OR(t == 3, return);
+		jxsml__inverse_dct_core(st, out, in, 3, rep1, 8, jxsml__inverse_dct4);
 	} else {
-		jxsml__inverse_dct_core(out, in, t, rep1, 8, jxsml__inverse_dct_recur_x8);
+		jxsml__inverse_dct_core(st, out, in, t, rep1, 8, jxsml__inverse_dct_recur_x8);
 	}
 }
 
@@ -3820,33 +3834,33 @@ JXSML_STATIC void jxsml__inverse_dct(JXSML__DCT_ARGS, int32_t rep) {
 	if (t <= 0) {
 		memcpy(out, in, sizeof(float) * (size_t) rep);
 	} else if (rep % 8 == 0) {
-		if (t == 1) return jxsml__dct2(out, in, 1, rep / 8, 8);
-		if (t == 2) return jxsml__inverse_dct4(out, in, 2, rep / 8, 8);
-		return jxsml__inverse_dct_recur_x8(out, in, t, rep / 8, 8);
+		if (t == 1) return jxsml__dct2(st, out, in, 1, rep / 8, 8);
+		if (t == 2) return jxsml__inverse_dct4(st, out, in, 2, rep / 8, 8);
+		return jxsml__inverse_dct_recur_x8(st, out, in, t, rep / 8, 8);
 	} else {
-		if (t == 1) return jxsml__dct2(out, in, 1, rep, 1);
-		if (t == 2) return jxsml__inverse_dct4(out, in, 2, rep, 1);
-		return jxsml__inverse_dct_recur(out, in, t, rep, 1);
+		if (t == 1) return jxsml__dct2(st, out, in, 1, rep, 1);
+		if (t == 2) return jxsml__inverse_dct4(st, out, in, 2, rep, 1);
+		return jxsml__inverse_dct_recur(st, out, in, t, rep, 1);
 	}
 }
 
 #undef JXSML__DCT_ARGS
-#undef JXSML__ASSERT_EQ
 #undef JXSML__IN
 #undef JXSML__OUT
 
 JXSML_STATIC void jxsml__forward_dct2d_scaled_for_llf(
-	float *JXSML_RESTRICT out, float *JXSML_RESTRICT scratch, int32_t log_rows, int32_t log_columns
+	jxsml__st *st, float *JXSML_RESTRICT out, float *JXSML_RESTRICT scratch,
+	int32_t log_rows, int32_t log_columns
 ) {
 	int32_t rows = 1 << log_rows, columns = 1 << log_columns;
 	const float *scalec = JXSML__LF2LLF_SCALES + columns, *scaler = JXSML__LF2LLF_SCALES + rows;
 	int32_t i, j;
 
-	jxsml__forward_dct_unscaled(scratch, out, log_rows, columns);
+	jxsml__forward_dct_unscaled(st, scratch, out, log_rows, columns);
 	for (i = 0; i < rows; ++i) for (j = 0; j < columns; ++j) {
 		out[j * rows + i] = scratch[i * columns + j];
 	}
-	jxsml__forward_dct_unscaled(scratch, out, log_columns, rows);
+	jxsml__forward_dct_unscaled(st, scratch, out, log_columns, rows);
 	// TODO spec improvement (I.6.3 note): given the pseudocode, it might be better to
 	// state that the DCT result *always* has C >= R, transposing as necessary.
 	if (log_columns > log_rows) {
@@ -3863,7 +3877,8 @@ JXSML_STATIC void jxsml__forward_dct2d_scaled_for_llf(
 }
 
 JXSML_STATIC void jxsml__inverse_dct2d(
-	float *JXSML_RESTRICT out, float *JXSML_RESTRICT scratch, int32_t log_rows, int32_t log_columns
+	jxsml__st *st, float *JXSML_RESTRICT out, float *JXSML_RESTRICT scratch,
+	int32_t log_rows, int32_t log_columns
 ) {
 	int32_t rows = 1 << log_rows, columns = 1 << log_columns;
 	int32_t i, j;
@@ -3878,36 +3893,229 @@ JXSML_STATIC void jxsml__inverse_dct2d(
 			scratch[j * columns + i] = out[j * columns + i];
 		}
 	}
-	jxsml__inverse_dct(out, scratch, log_columns, rows);
+	jxsml__inverse_dct(st, out, scratch, log_columns, rows);
 	for (i = 0; i < rows; ++i) for (j = 0; j < columns; ++j) {
 		scratch[i * columns + j] = out[j * rows + i];
 	}
-	jxsml__inverse_dct(out, scratch, log_rows, columns);
+	jxsml__inverse_dct(st, out, scratch, log_rows, columns);
 }
 
-JXSML_ALWAYS_INLINE void jxsml__aux_inverse_dct11(
-	float *JXSML_RESTRICT out, float *JXSML_RESTRICT in, int32_t S
-) {
+// a single iteration of AuxIDCT2x2
+JXSML_ALWAYS_INLINE void jxsml__aux_inverse_dct11(float *out, float *in, int32_t x, int32_t y, int32_t S2) {
+	int32_t p = y * 8 + x, q = (y * 2) * 8 + (x * 2);
+	float c00 = in[p], c01 = in[p + S2], c10 = in[p + S2 * 8], c11 = in[p + S2 * 9];
+	out[q + 0] = c00 + c01 + c10 + c11; // r00
+	out[q + 1] = c00 + c01 - c10 - c11; // r01
+	out[q + 8] = c00 - c01 + c10 - c11; // r10
+	out[q + 9] = c00 - c01 - c10 + c11; // r11
+}
+
+JXSML_STATIC void jxsml__inverse_dct11(float *buf) {
+	float scratch[64];
 	int32_t x, y;
-	for (y = 0; y < S / 2; ++y) {
-		for (x = 0; x < S / 2; ++x) {
-			int32_t p = y * 8 + x, q = (y * 2) * 8 + (x * 2);
-			float c00 = in[p], c01 = in[p + S / 2], c10 = in[p + S / 2 * 8], c11 = in[p + S / 2 * 9];
-			out[q + 0] = c00 + c01 + c10 + c11; // r00
-			out[q + 1] = c00 + c01 - c10 - c11; // r01
-			out[q + 8] = c00 - c01 + c10 - c11; // r10
-			out[q + 9] = c00 - c01 - c10 + c11; // r11
-		}
+
+	// TODO spec issue: only the "top-left" SxS cells, not "top"
+	jxsml__aux_inverse_dct11(buf, buf, 0, 0, 1); // updates buf[(0..1)*8+(0..1)]
+	// updates scratch[(0..3)*8+(0..3)], copying other elements from buf in verbatim
+	memcpy(scratch, buf, sizeof(float) * 64);
+	for (y = 0; y < 2; ++y) for (x = 0; x < 2; ++x) jxsml__aux_inverse_dct11(scratch, buf, x, y, 2);
+	// updates the entire buf
+	for (y = 0; y < 4; ++y) for (x = 0; x < 4; ++x) jxsml__aux_inverse_dct11(buf, scratch, x, y, 4);
+}
+
+JXSML_STATIC void jxsml__inverse_dct22(jxsml__st *st, float *buf) {
+	float scratch[64];
+	int32_t x, y;
+
+	jxsml__aux_inverse_dct11(buf, buf, 0, 0, 1);
+	// after the top-left inverse DCT2x2, four 4x4 submatrices are formed and IDCTed individually.
+	// IDCT itself requires transposition and the final matrices are stitched in a different way,
+	// but it turns out that IDCT can be done in place, only requiring the final stitching.
+	//
+	// input                        after transposition          output
+	// a1 a2 b1 b2 c1 c2 d1 d2      a1 a3 e1 e3 i1 i3 m1 m3      a1 e1 i1 m1 a2 e2 i2 m2
+	// a3 a4 b3 b4 c3 c4 d3 d4      a2 a4 e2 e4 i2 i4 m2 m4      b1 f1 j1 n1 b2 f2 j2 n2
+	// e1 e2 f1 f2 g1 g2 h1 h2      b1 b3 f1 f3 j1 j3 n1 n3      c1 g1 k1 o1 c2 g2 k2 o2
+	// e3 e4 f3 f4 g3 g4 h3 h4 ---> b2 b4 f2 f4 j2 j4 n2 n4 ---> d1 k1 l1 p1 d2 k2 l2 p2
+	// i1 i2 j1 j2 k1 k2 l1 l2      c1 c3 g1 g3 k1 k3 o1 o3      a3 e3 i3 m3 a4 e4 i4 m4
+	// i3 i4 j3 j4 k3 k4 l3 l4      c2 c4 g2 g4 k2 k4 o2 o4      b3 f3 j3 n3 b4 f4 j4 n4
+	// m1 m2 n1 n2 o1 o2 p1 p2      d1 d3 h1 h3 l1 l3 p1 p3      c3 g3 k3 o3 c4 g4 k4 o4
+	// m3 m4 n3 n4 o3 o4 p3 p4      d2 d4 h2 h4 l2 l4 p2 p4      d3 k3 l3 p3 d4 k4 l4 p4
+	//
+	// TODO spec issue: notationally `sample` is a *4-dimensional* array, which is not very clear
+	jxsml__inverse_dct(st, scratch, buf, 2, 16); // columnar IDCT for a#-m#, b#-n#, c#-o# and d#-p#
+	for (y = 0; y < 8; ++y) for (x = 0; x < 8; ++x) buf[x * 8 + y] = scratch[y * 8 + x];
+	jxsml__inverse_dct(st, scratch, buf, 2, 16); // columnar IDCT for a#-d#, e#-h#, i#-l# and m#-p#
+	for (y = 0; y < 4; ++y) for (x = 0; x < 4; ++x) {
+		buf[y * 8 + x] = scratch[(y * 2) * 8 + (x * 2)];
+		buf[y * 8 + (x + 4)] = scratch[(y * 2 + 1) * 8 + (x * 2)];
+		buf[(y + 4) * 8 + x] = scratch[(y * 2) * 8 + (x * 2 + 1)];
+		buf[(y + 4) * 8 + (x + 4)] = scratch[(y * 2 + 1) * 8 + (x * 2 + 1)];
 	}
 }
 
-JXSML_STATIC void jxsml__inverse_dct11(float *JXSML_RESTRICT buf, float *JXSML_RESTRICT scratch) {
-	memcpy(scratch, buf, sizeof(float) * 64);
-	// TODO spec issue: only the "top-left" SxS cells, not "top"
-	jxsml__aux_inverse_dct11(buf, scratch, 2); // only updates a top-left portion of buf
-	memcpy(scratch, buf, sizeof(float) * 64);
-	jxsml__aux_inverse_dct11(scratch, buf, 4); // only updates a top-left portion of scratch
-	jxsml__aux_inverse_dct11(buf, scratch, 8); // updates the entire buf
+/*
+JXSML_STATIC void jxsml__inverse_hornuss(float *buf) {
+	float scratch[64], residual_sum[4] = {};
+	int32_t x, y, ix, iy;
+	jxsml__aux_inverse_dct11(buf, buf, 0, 0, 1);
+	for (y = 0; y < 2; ++y) for (x = 0; x < 2; ++x) {
+		for (iy = 0; iy < 4; ++iy) for (ix 
+	}
+}
+*/
+
+JXSML_STATIC void jxsml__inverse_dct32(jxsml__st *st, float *buf) {
+	float scratch[64], tmp;
+	int32_t x, y;
+
+	// coefficients form two 4 rows x 8 columns matrices from even and odd rows;
+	// note that this is NOT 8 rows x 4 columns, because of transposition
+	tmp = buf[0] + buf[8];
+	buf[8] = buf[0] - buf[8];
+	buf[0] = tmp;
+	// TODO spec issue: coeffs_8x4 should be coeffs_4x8
+	jxsml__inverse_dct(st, scratch, buf, 2, 16);
+	for (y = 0; y < 8; ++y) for (x = 0; x < 8; ++x) buf[x * 8 + y] = scratch[y * 8 + x];
+	jxsml__inverse_dct(st, scratch, buf, 3, 8);
+	for (y = 0; y < 8; ++y) for (x = 0; x < 8; ++x) buf[y * 8 + (x % 2 * 4 + x / 2)] = scratch[y * 8 + x];
+}
+
+JXSML_STATIC void jxsml__inverse_dct23(jxsml__st *st, float *buf) {
+	float scratch[64], tmp;
+	int32_t x, y;
+
+	// coefficients form two 4 rows x 8 columns matrices from even and odd rows
+	tmp = buf[0] + buf[8];
+	buf[8] = buf[0] - buf[8];
+	buf[0] = tmp;
+	for (y = 0; y < 8; ++y) for (x = 0; x < 8; ++x) buf[x * 8 + y] = scratch[y * 8 + x];
+	jxsml__inverse_dct(st, scratch, buf, 3, 8);
+	for (y = 0; y < 8; ++y) for (x = 0; x < 8; ++x) buf[x * 8 + y] = scratch[y * 8 + x];
+	jxsml__inverse_dct(st, scratch, buf, 2, 16);
+	for (y = 0; y < 8; ++y) for (x = 0; x < 8; ++x) buf[(y % 2 * 4 + y / 2) * 8 + x] = scratch[y * 8 + x];
+}
+
+// AFV_IDCT, requires scratch[0..12) to be accessible
+JXSML_STATIC void jxsml__inverse_afv22(
+	float *JXSML_RESTRICT out, float *JXSML_RESTRICT in, float *JXSML_RESTRICT scratch
+) {
+	// AFV orthonormal bases do not seem to clearly decompose, but each row has enough pattern
+	// and symmetry to exploit. in the following A-H are constants and a-h are their negations.
+	//
+	// 1a        1b        1c        3         5         6         7
+	// A A A A   . A . .   . . A .   A B C C   . . A B   . . A B   . . A B
+	// A A A A   a . . .   . . . a   B C C C   . . D E   . C D .   . C D E
+	// A A A A   . . . .   a . . a   C C C C   a d . G   A D c G   A D F G
+	// A A A A   . . . .   . A A .   C C C C   b e g .   B . G H   B E G A
+	static const float C1A = 0.25f, C1B = -0.70710678f, C1C = 0.40824829f, // bases 0, 4, 9
+		// bases 1, 5 (transposed)
+		C3A[2] = { 0.87690293f, -0.41053776f},
+		C3B[2] = { 0.22065181f,  0.62354854f},
+		C3C[2] = {-0.10140050f, -0.06435072f},
+		// bases 2, 7, 10, 11 (transposed)
+		C5A[4] = { 0.40670076f, -0.30468475f,  0.17478670f, -0.21105601f},
+		C5B[4] = { 0.44444817f,  0.51126161f,  0.08126112f,  0.18567181f},
+		C5D[4] = { 0.19574399f, -0.29048013f, -0.36753980f,  0.49215859f},
+		C5E[4] = { 0.29291001f, -0.06578702f, -0.30788221f, -0.38525014f},
+		C5G[4] = { 0.11379074f, -0.23889774f,  0.48266891f,  0.17419413f},
+		// bases 3, 8, 14 (transposed, the final column ignored)
+		C6A[4] = {-0.21255748f,  0.30179295f, -0.17437603f,  0.00000000f},
+		C6B[4] = { 0.30854971f,  0.25792363f,  0.07027907f,  0.00000000f},
+		C6C[4] = { 0.47067023f,  0.16272340f, -0.29210266f,  0.00000000f},
+		C6D[4] = {-0.16212052f,  0.09520023f,  0.36238173f,  0.00000000f},
+		C6G[4] = {-0.14642919f, -0.35312385f, -0.43266080f,  0.00000000f},
+		C6H[4] = { 0.42511496f, -0.60358590f,  0.34875205f,  0.00000000f},
+		// bases 6, 12, 13, 15 (transposed)
+		C7A[4] = {-0.45175566f, -0.14266085f, -0.13813540f,  0.11354987f},
+		C7B[4] = { 0.15854504f, -0.34164468f,  0.33022826f, -0.07417505f},
+		C7C[4] = {-0.04038515f,  0.73674975f,  0.08755115f,  0.19402893f},
+		C7D[4] = { 0.00741823f,  0.24627108f, -0.07946707f, -0.43519050f},
+		C7E[4] = { 0.39351034f, -0.08574019f, -0.46133749f,  0.21918685f},
+		C7F[4] = { 0.11074166f,  0.14883399f,  0.49724647f,  0.55504438f},
+		C7G[4] = { 0.08298163f, -0.04768680f,  0.12538059f, -0.25468277f};
+	static const int8_t MAP[12] = {2,7,10,11, 3,8,14,15 /*overwritten*/, 6,12,13,15};
+
+	float sum;
+	int32_t i;
+
+	for (i = 0; i < 8; ++i) out[i] = in[i] + in[i + 8];
+	for (i = 0; i < 4; ++i) out[i] += out[i + 4];
+	sum = (out[0] + out[1]) + (out[2] + out[3]);
+
+	out[0] = sum * C1A;
+	out[4] = (in[1] - in[4]) * C1B;
+	out[9] = ((in[2] - in[8]) + (in[13] - in[7]) + (in[14] - in[11])) * C1C;
+	out[1] = in[0] * C3A[0] + (in[1] + in[4]) * C3B[0] + sum * C3C[0];
+	out[5] = in[0] * C3A[1] + (in[1] + in[4]) * C3B[1] + sum * C3C[1];
+	for (i = 0; i < 4; ++i) {
+		scratch[i] = (in[2] - in[8]) * C5A[i] + (in[3] - in[12]) * C5B[i] +
+			(in[6] - in[9]) * C5D[i] + (in[7] - in[13]) * C5E[i] + (in[11] - in[14]) * C5G[i];
+		scratch[i + 4] = (in[2] + in[8]) * C6A[i] + (in[3] + in[12]) * C6B[i] + (in[5] - in[10]) * C6C[i] +
+			(in[6] + in[9]) * C6D[i] + (in[11] + in[14]) * C6G[i] + in[15] * C6H[i];
+		scratch[i + 8] = (in[2] + in[8] + in[15]) * C7A[i] + (in[3] + in[12]) * C7B[i] + in[5] * C7C[i] +
+			(in[6] + in[9]) * C7D[i] + (in[7] + in[13]) * C7E[i] + in[10] * C7F[i] + (in[11] + in[14]) * C7G[i];
+	}
+	for (i = 0; i < 12; ++i) out[MAP[i]] = scratch[i];
+}
+
+JXSML_STATIC void jxsml__inverse_afv(jxsml__st *st, float *buf, int flipx, int flipy) {
+	// input          flipx/y=0/0     flipx/y=1/0     flipx/y=0/1     flipx/y=1/1
+	//  _______       +-----+-----+   +-----+-----+   +-----------+   +-----------+
+	// |_|_|_|_|      |'    |     |   |     |    '|   |           |   |           |
+	// |_|_|_|_| ---> |AFV22|DCT22|   |DCT22|AFV22|   |   DCT23   |   |   DCT23   |
+	// |_|_|_|_|      +-----+-----+   +-----+-----+   +-----+-----+   +-----+-----+
+	// |_|_|_|_|      |   DCT23   |   |   DCT23   |   |AFV22|DCT22|   |DCT22|AFV22|
+	//                |           |   |           |   |.    |     |   |     |    .|
+	// (2x2 each)     +-----------+   +-----------+   +-----+-----+   +-----+-----+
+	//
+	// coefficients are divided by 16 2x2 blocks, where two top coefficients are for AFV22
+	// and DCT22 respectively and two bottom coefficients are for DCT23.
+	// all three corresponding DC coefficients are in the top-left block and handled specially.
+	// AFV22 samples are then flipped so that the top-left cell is moved to the corner (dots above).
+	//
+	// TODO spec issue: identifiers have `*` in place of `x`
+
+	float scratch[64];
+	int32_t x, y;
+
+	(void) st;
+	JXSML__ASSERT_OR(flipx == !!flipx && flipy == !!flipy, return);
+
+	for (y = 0; y < 8; y += 2) for (x = 0; x < 8; ++x) {
+		// AFV22 coefficients to scratch[0..16), DCT22 coefficients to scratch[16..32)
+		scratch[(x % 2) * 16 + (y / 2) * 4 + (x / 2)] = buf[y * 8 + x];
+	}
+	for (y = 1; y < 8; y += 2) for (x = 0; x < 8; ++x) {
+		// DCT23 coefficients to scratch[32..64), after transposition
+		scratch[32 + x * 4 + (y / 2)] = buf[y * 8 + x];
+	}
+	scratch[0] = (buf[0] + buf[1] + buf[8]) * 4.0f;
+	scratch[16] = buf[0] - buf[1] + buf[8]; // TODO spec bug: x and y are swapped
+	scratch[32] = buf[0] - buf[8]; // TODO spec bug: x and y are swapped
+
+	jxsml__inverse_afv22(buf, scratch, buf + 16);
+	jxsml__inverse_dct(st, buf + 16, scratch + 16, 2, 4);
+	jxsml__inverse_dct(st, buf + 32, scratch + 32, 3, 4);
+
+	for (y = 0; y < 4; ++y) {
+		for (x = 0; x < 4; ++x) scratch[y * 4 + x] = buf[y * 4 + x]; // AFV22, as is
+		for (x = 0; x < 4; ++x) scratch[16 + x * 4 + y] = buf[16 + y * 4 + x]; // DCT22, transposed
+		for (x = 0; x < 8; ++x) scratch[32 + x * 4 + y] = buf[32 + y * 8 + x]; // DCT23, transposed
+	}
+
+	jxsml__inverse_dct(st, buf, scratch + 16, 2, 12); // combined IDCT for DCT23 and DCT23
+	memcpy(scratch + 16, buf, sizeof(float) * 48);
+
+	for (y = 0; y < 4; ++y) {
+		static const int8_t FLIP_FOR_AFV[2][4] = {{0, 1, 2, 3}, {7, 6, 5, 4}};
+		int32_t afv22pos = FLIP_FOR_AFV[flipy][y] * 8;
+		int32_t dct22pos = (flipy * 4 + y) * 8 + (!flipx * 4);
+		int32_t dct23pos = (!flipy * 4 + y) * 8;
+		for (x = 0; x < 4; ++x) buf[afv22pos + FLIP_FOR_AFV[flipx][x]] = scratch[y * 4 + x];
+		for (x = 0; x < 4; ++x) buf[dct22pos + x] = scratch[16 + y * 4 + x];
+		for (x = 0; x < 8; ++x) buf[dct23pos + x] = scratch[32 + y * 8 + x];
+	}
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -3993,7 +4201,7 @@ JXSML_STATIC jxsml_err jxsml__lf_global(jxsml__st *st, jxsml__frame_t *f) {
 		f->num_gm_channels = 0;
 	}
 
-error:
+JXSML__ON_ERROR:
 	return st->err;
 }
 
@@ -4123,7 +4331,7 @@ JXSML_STATIC jxsml_err jxsml__lf_quant(
 	gg->lfindices = lfindices;
 	return 0;
 
-error:
+JXSML__ON_ERROR:
 	free(temp);
 	free(lfquant);
 	free(lfindices);
@@ -4213,7 +4421,7 @@ JXSML_STATIC jxsml_err jxsml__hf_metadata(
 		if (log_vw > 3 || log_vh > 3) {
 			float scratch[1024]; // DCT256x256 requires 32x32
 			for (c = 0; c < 3; ++c) {
-				jxsml__forward_dct2d_scaled_for_llf(coeffs[c] + coeffoff, scratch, log_vh - 3, log_vw - 3);
+				jxsml__forward_dct2d_scaled_for_llf(st, coeffs[c] + coeffoff, scratch, log_vh - 3, log_vw - 3);
 			}
 		}
 
@@ -4236,7 +4444,7 @@ JXSML_STATIC jxsml_err jxsml__hf_metadata(
 	for (i = 0; i < 3; ++i) gg->coeffs[i] = coeffs[i];
 	return 0;
 
-error:
+JXSML__ON_ERROR:
 	free(blocks);
 	free(varblocks);
 	for (i = 0; i < 3; ++i) free(coeffs[i]);
@@ -4330,7 +4538,7 @@ JXSML_STATIC jxsml_err jxsml__lf_group(
 
 	return 0;
 
-error:
+JXSML__ON_ERROR:
 	jxsml__free_modular(&m);
 	free(lfquant);
 	if (gg) jxsml__free_lf_group(gg);
@@ -4383,7 +4591,7 @@ JXSML_STATIC jxsml_err jxsml__hf_global(jxsml__st *st, jxsml__frame_t *f) {
 		JXSML__TRY(jxsml__code_spec(st, 495 * f->nb_block_ctx * f->num_hf_presets, &f->coeff_codespec[i]));
 	}
 
-error:
+JXSML__ON_ERROR:
 	return st->err;
 }
 
@@ -4500,7 +4708,7 @@ JXSML_STATIC jxsml_err jxsml__hf_coeffs(
 	free(nonzeros);
 	return 0;
 
-error:
+JXSML__ON_ERROR:
 	jxsml__free_code(&code);
 	free(nonzeros);
 	return st->err;
@@ -4540,7 +4748,7 @@ JXSML_STATIC jxsml_err jxsml__pass_group(
 
 	return 0;
 
-error:
+JXSML__ON_ERROR:
 	jxsml__free_modular(&m);
 	return st->err;
 }
@@ -4592,7 +4800,7 @@ JXSML_STATIC jxsml_err jxsml__dequant_hf(jxsml__st *st, const jxsml__frame_t *f,
 		}
 	}
 
-error:
+JXSML__ON_ERROR:
 	return st->err;
 }
 
@@ -4675,35 +4883,17 @@ JXSML_STATIC jxsml_err jxsml__combine_vardct_from_lf_group(
 					//JXSML__RAISE("TODO: inverse Hornuss");
 					break;
 
-				case 2: // DCT11
-					jxsml__inverse_dct11(scratch, scratch2);
-					break;
-
-				case 3: // DCT22 -- TODO
-					for(i=0;i<size;++i)scratch[i]=(c==1);
-					//JXSML__RAISE("TODO: inverse DCT22");
-					break;
-
-				case 12: // DCT23
-					for(i=0;i<size;++i)scratch[i]=(c!=0);
-					//JXSML__RAISE("TODO: inverse DCT23");
-					break;
-
-				case 13: // DCT32
-					for(i=0;i<size;++i)scratch[i]=(c==2);
-					//JXSML__RAISE("TODO: inverse DCT32");
-					break;
-
-				case 14: // AFV0
-				case 15: // AFV1
-				case 16: // AFV2
-				case 17: // AFV3
-					for(i=0;i<size;++i)scratch[i]=(c!=1);
-					//JXSML__RAISE("TODO: inverse AFV*");
-					break;
+				case 2: jxsml__inverse_dct11(scratch); break; // DCT11
+				case 3: jxsml__inverse_dct22(st, scratch); break; // DCT22
+				case 12: jxsml__inverse_dct23(st, scratch); break; // DCT23
+				case 13: jxsml__inverse_dct32(st, scratch); break; // DCT32
+				case 14: jxsml__inverse_afv(st, scratch, 0, 0); break; // AFV0
+				case 15: jxsml__inverse_afv(st, scratch, 1, 0); break; // AFV1
+				case 16: jxsml__inverse_afv(st, scratch, 0, 1); break; // AFV2
+				case 17: jxsml__inverse_afv(st, scratch, 1, 1); break; // AFV3
 
 				default: // every other DCTnm where n, m >= 3
-					jxsml__inverse_dct2d(scratch, scratch2, dct->log_rows, dct->log_columns);
+					jxsml__inverse_dct2d(st, scratch, scratch2, dct->log_rows, dct->log_columns);
 					break;
 				}
 
@@ -4740,8 +4930,7 @@ JXSML_STATIC jxsml_err jxsml__combine_vardct_from_lf_group(
 		for (c = 0; c < 3; ++c) pixels[c] = JXSML__ALIGNED(PIXELS, f->gmodular.channel[c].pixels);
 		for (y = 0; y < ggh; ++y) {
 			for (x = 0; x < ggw; ++x) {
-				// TODO spec issue: overflown samples (due to non-8n dimensions) are probably ignored
-				int32_t p = y * ggw + x, q = (ggy + y) * ggw + (ggx + x);
+				int32_t p = y * ggw + x, q = (ggy + y) * f->width + (ggx + x);
 				for (c = 0; c < 3; ++c) {
 					float v = 
 						samples[0][p] * st->opsin_inv_mat[c][0] +
@@ -4757,7 +4946,7 @@ JXSML_STATIC jxsml_err jxsml__combine_vardct_from_lf_group(
 		JXSML__RAISE("TODO: don't keep this here");
 	}
 
-error:
+JXSML__ON_ERROR:
 	free(scratch);
 	for (c = 0; c < 3; ++c) free(samples[c]);
 	return st->err;
@@ -4881,7 +5070,7 @@ JXSML_STATIC jxsml_err jxsml__frame(jxsml__st *st, jxsml__frame_t *f) {
 		}
 	}
 
-error:
+JXSML__ON_ERROR:
 	if (gg) for (i = 0; i < f->num_lf_groups; ++i) jxsml__free_lf_group(&gg[i]);
 	free(gg);
 	return st->err;
@@ -5000,7 +5189,7 @@ jxsml_err jxsml_load_from_memory(jxsml *out, const void *buf, size_t bufsize) {
 	end(*st->out, st_);
 	return 0;
 
-error:
+JXSML__ON_ERROR:
 	return st->err;
 }
 
