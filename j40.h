@@ -8,14 +8,22 @@
 // "SPEC" comments are used for incorrect, ambiguous or misleading specification issues.
 // "TODO spec" comments are roughly same, but not yet fully confirmed & reported.
 
-// J40 is a single-file library, but it consists of multiple subsystems which have to be
-// separately `#include`d for the purpose of testing. therefore this file contains
-// multiple "parts" which can be `#include`d by setting an appropriate `J40__PART_*` macro.
-// `J40__RECURSING` is also used for templated code where the same code gets reused with
-// slightly different parameters; setting it disables usual `J40__PART_*` behaviors.
+////////////////////////////////////////////////////////////////////////////////
+// preamble (only reachable via the user `#include`)
+
+// controls whether each `#if`-`#endif` section in this file should be included or not.
+// there are multiple purposes of this macro:
+// - `J40__RECURSING` is always defined after the first ever `#include`, so:
+//   - the preamble will precede every other code in the typical usage, and
+//   - the preamble won't be included twice.
+// - `J40__RECURSING` is either 0 (public) or -1 (internal) depending on the logical visibility,
+//   so that the preamble can choose whether to include the internal code or not.
+// - a larger (>= 100) value is used to repeat a specific section of code with
+//   slightly different parameters, i.e. templated code.
+// - one value (currently 9999) is reserved and used to ignore subsequent top-level `#include`s.
 #ifndef J40__RECURSING
 
-#define J40_REVISION 2270 // (fractional gregorian year - 2000) * 100, with a liberal rounding
+#define J40_VERSION 2270 // (fractional gregorian year - 2000) * 100, with a liberal rounding
 
 #define J40_DEBUG
 
@@ -36,56 +44,27 @@
 	#ifdef J40_DEBUG
 		#include <assert.h>
 	#endif
+	#ifndef J40__EXPOSE_INTERNALS
+		#define J40__EXPOSE_INTERNALS
+	#endif
 #endif
 
-#define J40__RECURSING (-1)
-#define J40__PART_PLATFORM
-#define J40__PART_API
-#ifdef J40_IMPLEMENTATION
-	#define J40__PART_STATE
-	#define J40__PART_ERROR
-	#define J40__PART_UTILITY
-	#define J40__PART_ALIGNED_PTRS
-	#define J40__PART_VIEW
-	#define J40__PART_PLANE
-	#define J40__PART_SOURCE
-	#define J40__PART_CONTAINER
-	#define J40__PART_BITS
-	#define J40__PART_PREFIX_CODE
-	#define J40__PART_HYBRID_INT
-	#define J40__PART_ANS_CODE
-	#define J40__PART_ENTROPY_CODE
-	#define J40__PART_IMAGE_HEADER
-	#define J40__PART_ICC
-	#define J40__PART_MODULAR_TREE
-	#define J40__PART_MODULAR_HEADER
-	#define J40__PART_MODULAR_PREDICT
-	#define J40__PART_MODULAR_TRANSFORM
-	#define J40__PART_DEQUANT_MATRIX
-	#define J40__PART_FRAME_HEADER
-	#define J40__PART_DCT
-	#define J40__PART_LF_GLOBAL
-	#define J40__PART_LF_GROUP
-	#define J40__PART_HF_GLOBAL
-	#define J40__PART_PASS_GROUP
-	#define J40__PART_DEQUANT
-	#define J40__PART_FRAME
-#endif // defined J40_IMPLEMENTATION
+#ifdef J40__EXPOSE_INTERNALS
+	#define J40__RECURSING (-1)
+#else
+	#define J40__RECURSING 0
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
-#include J40_FILENAME
-#ifdef __cplusplus
-}
-#endif
-#undef J40__RECURSING
 
 #endif // !defined J40__RECURSING
 
 ////////////////////////////////////////////////////////////////////////////////
-// platform macros
+// platform macros (partially public)
 
-#if defined J40__PART_PLATFORM && J40__RECURSING < 0
+#if J40__RECURSING <= 0
 
 #ifndef J40_RESTRICT
 	#if __STDC_VERSION__ >= 199901L
@@ -94,6 +73,8 @@ extern "C" {
 		#define J40_RESTRICT __restrict
 	#endif
 #endif // !defined J40_RESTRICT
+
+#define J40_API // TODO
 
 #ifdef J40_IMPLEMENTATION
 
@@ -181,12 +162,12 @@ extern "C" {
 #endif
 
 #endif // defined J40_IMPLEMENTATION
-#endif // defined J40__PART_PLATFORM && J40__RECURSING < 0
+#endif // J40__RECURSING <= 0
 
 ////////////////////////////////////////////////////////////////////////////////
 // public API
 
-#if defined J40__PART_API && J40__RECURSING < 0
+#if J40__RECURSING <= 0
 
 // an internal error type. non-zero indicates a different error condition.
 // user callbacks can also emit error codes, which should not exceed `J40_MIN_RESERVED_ERR`.
@@ -194,12 +175,14 @@ extern "C" {
 typedef uint32_t j40_err;
 #define J40_MIN_RESERVED_ERR (j40_err) (1 << 24) // anything below this can be used freely
 
-#endif // defined J40__PART_API && J40__RECURSING < 0
+#endif // J40__RECURSING <= 0
+
+////////////////////////////////////////////////////////////////////////////////
+#if J40__RECURSING < 0                      // internal code starts from here //
+////////////////////////////////////////////////////////////////////////////////
 
 ////////////////////////////////////////////////////////////////////////////////
 // state
-
-#if defined J40__PART_STATE && J40__RECURSING < 0
 
 // a common context ("state") for all internal functions.
 typedef struct {
@@ -266,12 +249,8 @@ typedef struct {
 	//struct j40__lfgroup_st *lfgroup;
 } j40__st;
 
-#endif // defined J40__PART_STATE && J40__RECURSING < 0
-
 ////////////////////////////////////////////////////////////////////////////////
 // error handling
-
-#if defined J40__PART_ERROR && J40__RECURSING < 0
 
 #define J40__4(s) (j40_err) (((uint32_t) s[0] << 24) | ((uint32_t) s[1] << 16) | ((uint32_t) s[2] << 8) | (uint32_t) s[3])
 #define J40__ERR(s) j40__set_error(st, J40__4(s))
@@ -332,12 +311,9 @@ J40__ON_ERROR:
 }
 
 #endif // defined J40_IMPLEMENTATION
-#endif // defined J40__PART_ERROR && J40__RECURSING < 0
 
 ////////////////////////////////////////////////////////////////////////////////
 // utility
-
-#if defined J40__PART_UTILITY && J40__RECURSING < 0
 
 #define J40__CONCAT_(a,b) a##b
 #define J40__CONCAT(a,b) J40__CONCAT_(a,b)
@@ -375,7 +351,7 @@ J40_ALWAYS_INLINE int32_t j40__ceil_div32(int32_t x, int32_t y) { return (x + y 
 #undef J40__RECURSING
 #define J40__RECURSING (-1)
 
-#endif // defined J40__PART_UTILITY && J40__RECURSING < 0
+#endif // J40__RECURSING < 0
 #if J40__RECURSING == 100
 	#define j40__intN_t J40__CONCAT3(int, J40__N, _t)
 	#define j40__uintN_t J40__CONCAT3(uint, J40__N, _t)
@@ -490,15 +466,11 @@ J40_ALWAYS_INLINE j40__intN_t j40__(mul,N)(j40__st *st, j40__intN_t x, j40__intN
 	#undef J40__INTN_MIN
 	#undef J40__N
 #endif // J40__RECURSING == 100
-#if defined J40__PART_UTILITY && J40__RECURSING < 0
+#if J40__RECURSING < 0
 // ----------------------------------------
-
-#endif // defined J40__PART_UTILITY && J40__RECURSING < 0
 
 ////////////////////////////////////////////////////////////////////////////////
 // aligned pointers
-
-#if defined J40__PART_ALIGNED_PTRS && J40__RECURSING < 0
 
 // TODO simplify this if possible
 
@@ -509,14 +481,6 @@ J40_ALWAYS_INLINE j40__intN_t j40__(mul,N)(j40__st *st, j40__intN_t x, j40__intN
 		#define J40_ASSUME_ALIGNED(p, align) (p)
 	#endif
 #endif // !defined J40_ASSUME_ALIGNED
-
-#ifndef J40_ALIGNAS
-	#if __STDC_VERSION__ >= 201112L
-		#define J40_ALIGNAS(n) _Alignas(n)
-	#else
-		#define J40_ALIGNAS(n)
-	#endif
-#endif // !defined J40_ALIGNAS
 
 J40_ALWAYS_INLINE void *j40__alloc_aligned_(size_t sz, size_t align);
 J40_ALWAYS_INLINE void j40__free_aligned_(void *ptr, size_t align);
@@ -555,12 +519,9 @@ J40_ALWAYS_INLINE void j40__free_aligned_(void *ptr, size_t align);
 #endif
 
 #endif // defined J40_IMPLEMENTATION
-#endif // defined J40__PART_ALIGNED_PTRS && J40__RECURSING < 0
 
 ////////////////////////////////////////////////////////////////////////////////
 // two-dimensional view
-
-#if defined J40__PART_VIEW && J40__RECURSING < 0
 
 typedef struct { int32_t logw, logh; float *J40_RESTRICT ptr; } j40__view_f32;
 
@@ -646,12 +607,8 @@ J40_STATIC void j40__print_view_f32(j40__view_f32 v, const char *name, const cha
 #define j40__print_view_f32(v) j40__print_view_f32(v, #v, __FILE__, __LINE__)
 #endif
 
-#endif // defined J40__PART_VIEW && J40__RECURSING < 0
-
 ////////////////////////////////////////////////////////////////////////////////
 // plane
-
-#if defined J40__PART_PLANE && J40__RECURSING < 0
 
 /*
 enum {
@@ -738,12 +695,8 @@ J40_STATIC void j40__free_plane(j40__plane *plane) {
 }
 */
 
-#endif // defined J40__PART_PLANE && J40__RECURSING < 0
-
 ////////////////////////////////////////////////////////////////////////////////
 // input source
-
-#if defined J40__PART_SOURCE && J40__RECURSING < 0
 
 typedef void (*j40_memory_free_func)(void *data);
 
@@ -892,12 +845,9 @@ J40_STATIC void j40__free_source(j40__source *s) {
 }
 
 #endif // defined J40_IMPLEMENTATION
-#endif // defined J40__PART_SOURCE && J40__RECURSING < 0
 
 ////////////////////////////////////////////////////////////////////////////////
 // container
-
-#if defined J40__PART_CONTAINER && J40__RECURSING < 0
 
 typedef struct j40__container_st {
 	// the remaining number of bytes in the current box with respect to the reference point,
@@ -1098,12 +1048,9 @@ J40__ON_ERROR:
 // TODO j40__finish_container
 
 #endif // defined J40_IMPLEMENTATION
-#endif // defined J40__PART_SOURCE && J40__RECURSING < 0
 
 ////////////////////////////////////////////////////////////////////////////////
 // bitstream
-
-#if defined J40__PART_BITS && J40__RECURSING < 0
 
 J40_STATIC size_t j40__bits_read(const j40__st *st);
 
@@ -1278,12 +1225,9 @@ J40_INLINE int32_t j40__at_most(j40__st *st, int32_t max) {
 }
 
 #endif // defined J40_IMPLEMENTATION
-#endif // defined J40__PART_BITS && J40__RECURSING < 0
 
 ////////////////////////////////////////////////////////////////////////////////
 // prefix code
-
-#if defined J40__PART_PREFIX_CODE && J40__RECURSING < 0
 
 J40_STATIC j40_err j40__init_prefix_code(
 	j40__st *st, int32_t l2size, int32_t *out_fast_len, int32_t *out_max_len, int32_t **out_table
@@ -1527,12 +1471,9 @@ J40_INLINE int32_t j40__prefix_code(j40__st *st, int32_t fast_len, int32_t max_l
 }
 
 #endif // defined J40_IMPLEMENTATION
-#endif // defined J40__PART_PREFIX_CODE && J40__RECURSING < 0
 
 ////////////////////////////////////////////////////////////////////////////////
 // hybrid integer encoding
-
-#if defined J40__PART_HYBRID_INT && J40__RECURSING < 0
 
 // token < 2^split_exp is interpreted as is.
 // otherwise (token - 2^split_exp) is split into NNHHHLLL where config determines H/L lengths.
@@ -1569,12 +1510,9 @@ J40_INLINE int32_t j40__hybrid_int(j40__st *st, int32_t token, j40__hybrid_int_c
 }
 
 #endif // defined J40_IMPLEMENTATION
-#endif // defined J40__PART_HYBRID_INT && J40__RECURSING < 0
 
 ////////////////////////////////////////////////////////////////////////////////
 // rANS alias table
-
-#if defined J40__PART_ANS_CODE && J40__RECURSING < 0
 
 enum {
 	J40__DIST_BITS = 12,
@@ -1706,12 +1644,9 @@ J40_STATIC int32_t j40__ans_code(
 }
 
 #endif // defined J40_IMPLEMENTATION
-#endif // defined J40__PART_ANS_CODE && J40__RECURSING < 0
 
 ////////////////////////////////////////////////////////////////////////////////
 // entropy code
-
-#if defined J40__PART_ENTROPY_CODE && J40__RECURSING < 0
 
 typedef union {
 	j40__hybrid_int_config_t config;
@@ -2104,12 +2039,9 @@ J40_STATIC void j40__free_code_spec(j40__code_spec_t *spec) {
 }
 
 #endif // defined J40_IMPLEMENTATION
-#endif // defined J40__PART_ENTROPY_CODE && J40__RECURSING < 0
 
 ////////////////////////////////////////////////////////////////////////////////
 // image header & metadata
-
-#if defined J40__PART_IMAGE_HEADER && J40__RECURSING < 0
 
 enum {
 	J40__CHROMA_WHITE = 0, J40__CHROMA_RED = 1,
@@ -2459,12 +2391,9 @@ J40__ON_ERROR:
 }
 
 #endif // defined J40_IMPLEMENTATION
-#endif // defined J40__PART_IMAGE_HEADER && J40__RECURSING < 0
 
 ////////////////////////////////////////////////////////////////////////////////
 // ICC
-
-#if defined J40__PART_ICC && J40__RECURSING < 0
 
 J40_STATIC j40_err j40__icc(j40__st *st);
 
@@ -2543,12 +2472,9 @@ J40__ON_ERROR:
 }
 
 #endif // defined J40_IMPLEMENTATION
-#endif // defined J40__PART_ICC && J40__RECURSING < 0
 
 ////////////////////////////////////////////////////////////////////////////////
 // MA tree
-
-#if defined J40__PART_MODULAR_TREE && J40__RECURSING < 0
 
 enum { J40__NUM_PRED = 14 };
 
@@ -2614,12 +2540,9 @@ J40__ON_ERROR:
 }
 
 #endif // defined J40_IMPLEMENTATION
-#endif // defined J40__PART_MODULAR_TREE && J40__RECURSING < 0
 
 ////////////////////////////////////////////////////////////////////////////////
 // modular header
-
-#if defined J40__PART_MODULAR_HEADER && J40__RECURSING < 0
 
 typedef union {
 	enum j40__transform_id {
@@ -3004,12 +2927,9 @@ J40_STATIC void j40__free_modular(j40__modular_t *m) {
 }
 
 #endif // defined J40_IMPLEMENTATION
-#endif // defined J40__PART_MODULAR_HEADER && J40__RECURSING < 0
 
 ////////////////////////////////////////////////////////////////////////////////
 // modular prediction
-
-#if defined J40__PART_MODULAR_PREDICT && J40__RECURSING < 0
 
 J40_STATIC j40_err j40__modular_channel(j40__st *st, j40__modular_t *m, int32_t cidx, int32_t sidx);
 
@@ -3039,7 +2959,7 @@ static const int32_t J40__24DIVP1[64] = { // [i] = floor(2^24 / (i+1))
 #undef J40__RECURSING
 #define J40__RECURSING (-1)
 
-#endif // defined J40__PART_MODULAR_PREDICT && J40__RECURSING < 0
+#endif // J40__RECURSING < 0
 #if J40__RECURSING == 200
 	#define j40__intP_t J40__CONCAT3(int, J40__P, _t)
 	#define j40__int2P_t J40__CONCAT3(int, J40__2P, _t)
@@ -3367,7 +3287,7 @@ J40__ON_ERROR:
 	#undef J40__P
 	#undef J40__2P
 #endif // J40__RECURSING == 200
-#if defined J40__PART_MODULAR_PREDICT && J40__RECURSING < 0
+#if J40__RECURSING < 0
 // ----------------------------------------
 
 #ifdef J40_IMPLEMENTATION
@@ -3380,12 +3300,8 @@ J40_STATIC j40_err j40__modular_channel(j40__st *st, j40__modular_t *m, int32_t 
 }
 #endif
 
-#endif // defined J40__PART_MODULAR_PREDICT && J40__RECURSING < 0
-
 ////////////////////////////////////////////////////////////////////////////////
 // modular (inverse) transform
-
-#if defined J40__PART_MODULAR_TRANSFORM && J40__RECURSING < 0
 
 J40_STATIC j40_err j40__inverse_transform(j40__st *st, j40__modular_t *m);
 
@@ -3423,7 +3339,7 @@ static const int16_t J40__PALETTE_DELTAS[144][3] = { // the first entry is a dup
 #undef J40__RECURSING
 #define J40__RECURSING (-1)
 
-#endif // defined J40__PART_MODULAR_TRANSFORM && J40__RECURSING < 0
+#endif // J40__RECURSING < 0
 #if J40__RECURSING == 300
 	#define j40__intP_t J40__CONCAT3(int, J40__P, _t)
 	#define j40__int2P_t J40__CONCAT3(int, J40__2P, _t)
@@ -3593,7 +3509,7 @@ J40__ON_ERROR:
 	#undef J40__P
 	#undef J40__2P
 #endif // J40__RECURSING == 300
-#if defined J40__PART_MODULAR_TRANSFORM && J40__RECURSING < 0
+#if J40__RECURSING < 0
 // ----------------------------------------
 
 #ifdef J40_IMPLEMENTATION
@@ -3627,12 +3543,8 @@ J40__ON_ERROR:
 }
 #endif // defined J40_IMPLEMENTATION
 
-#endif // defined J40__PART_MODULAR_TRANSFORM && J40__RECURSING < 0
-
 ////////////////////////////////////////////////////////////////////////////////
 // dequantization matrix and coefficient orders
-
-#if defined J40__PART_DEQUANT_MATRIX && J40__RECURSING < 0
 
 enum {
 	J40__NUM_DCT_SELECT = 27, // the number of all possible varblock types (DctSelect)
@@ -4072,12 +3984,9 @@ J40__ON_ERROR:
 }
 
 #endif // defined J40_IMPLEMENTATION
-#endif // defined J40__PART_DEQUANT_MATRIX && J40__RECURSING < 0
 
 ////////////////////////////////////////////////////////////////////////////////
 // frame header & TOC
-
-#if defined J40__PART_FRAME_HEADER && J40__RECURSING < 0
 
 enum { J40__MAX_PASSES = 11 };
 
@@ -4485,12 +4394,9 @@ J40__ON_ERROR:
 }
 
 #endif // defined J40_IMPLEMENTATION
-#endif // defined J40__PART_FRAME_HEADER && J40__RECURSING < 0
 
 ////////////////////////////////////////////////////////////////////////////////
 // DCT
-
-#if defined J40__PART_DCT && J40__RECURSING < 0
 
 // both use `in` as a scratch space as well, so `in` will be altered after return
 J40_STATIC void j40__forward_dct_unscaled(
@@ -5083,12 +4989,9 @@ J40_STATIC void j40__inverse_afv(float *buf, int flipx, int flipy) {
 }
 
 #endif // defined J40_IMPLEMENTATION
-#endif // defined J40__PART_DCT && J40__RECURSING < 0
 
 ////////////////////////////////////////////////////////////////////////////////
 // LfGlobal: additional image features, HF block context, global tree, extra channels
-
-#if defined J40__PART_LF_GLOBAL && J40__RECURSING < 0
 
 J40_STATIC j40_err j40__lf_global(j40__st *st);
 
@@ -5180,12 +5083,9 @@ J40__ON_ERROR:
 }
 
 #endif // defined J40_IMPLEMENTATION
-#endif // defined J40__PART_LF_GLOBAL && J40__RECURSING < 0
 
 ////////////////////////////////////////////////////////////////////////////////
 // LfGroup: downsampled LF image (optionally smoothed), varblock information
-
-#if defined J40__PART_LF_GROUP && J40__RECURSING < 0
 
 typedef struct {
 	int32_t coeffoff_qfidx; // offset to coeffs (always a multiple of 64) | qf index (always < 16)
@@ -5556,12 +5456,9 @@ J40_STATIC void j40__free_lf_group(j40__lf_group_t *gg) {
 }
 
 #endif // defined J40_IMPLEMENTATION
-#endif // defined J40__PART_LF_GROUP && J40__RECURSING < 0
 
 ////////////////////////////////////////////////////////////////////////////////
 // HfGlobal and HfPass
-
-#if defined J40__PART_HF_GLOBAL && J40__RECURSING < 0
 
 J40_STATIC j40_err j40__hf_global(j40__st *st);
 
@@ -5616,12 +5513,9 @@ J40__ON_ERROR:
 }
 
 #endif // defined J40_IMPLEMENTATION
-#endif // defined J40__PART_HF_GLOBAL && J40__RECURSING < 0
 
 ////////////////////////////////////////////////////////////////////////////////
 // PassGroup
-
-#if defined J40__PART_PASS_GROUP && J40__RECURSING < 0
 
 J40_STATIC j40_err j40__hf_coeffs(
 	j40__st *st, int32_t ctxoff, int32_t pass,
@@ -5792,12 +5686,9 @@ J40__ON_ERROR:
 }
 
 #endif // defined J40_IMPLEMENTATION
-#endif // defined J40__PART_PASS_GROUP && J40__RECURSING < 0
 
 ////////////////////////////////////////////////////////////////////////////////
 // coefficients to samples
-
-#if defined J40__PART_DEQUANT && J40__RECURSING < 0
 
 J40_STATIC void j40__dequant_hf(j40__st *st, j40__lf_group_t *gg);
 J40_STATIC j40_err j40__combine_vardct_from_lf_group(
@@ -6012,12 +5903,9 @@ J40__ON_ERROR:
 }
 
 #endif // defined J40_IMPLEMENTATION
-#endif // defined J40__PART_DEQUANT && J40__RECURSING < 0
 
 ////////////////////////////////////////////////////////////////////////////////
 // frame
-
-#if defined J40__PART_FRAME && J40__RECURSING < 0
 
 J40_STATIC j40_err j40__frame(j40__st *st);
 
@@ -6147,12 +6035,15 @@ J40__ON_ERROR:
 }
 
 #endif // defined J40_IMPLEMENTATION
-#endif // defined J40__PART_FRAME && J40__RECURSING < 0
 
 ////////////////////////////////////////////////////////////////////////////////
-// public API
+#endif // J40__RECURSING < 0                       // internal code ends here //
+////////////////////////////////////////////////////////////////////////////////
 
-#if defined J40__PART_API && J40__RECURSING < 0
+////////////////////////////////////////////////////////////////////////////////
+// public API, continued
+
+#if J40__RECURSING <= 0
 
 const char *dumppath;
 void end(const j40__st st);
@@ -6282,8 +6173,20 @@ J40__ON_ERROR:
 }
 
 #endif // defined J40_IMPLEMENTATION
-#endif // defined J40__PART_API && J40__RECURSING < 0
+#endif // J40__RECURSING <= 0
 
 ////////////////////////////////////////////////////////////////////////////////
+
+#if J40__RECURSING <= 0
+
+#ifdef __cplusplus
+}
+#endif
+
+// prevents double `#include`s---we can't really use `#pragma once` or simple `#ifndef` guards...
+#undef J40__RECURSING
+#define J40__RECURSING 9999
+
+#endif // J40__RECURSING <= 0
 
 // vim: noet ts=4 st=4 sts=4 sw=4 list colorcolumn=100
