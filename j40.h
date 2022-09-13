@@ -1,5 +1,5 @@
 // J40: Independent, self-contained JPEG XL decoder
-// Kang Seonghoon, version 2270 (2022-09), Public Domain (CC0)
+// Kang Seonghoon, version 2270 (2022-09), Public Domain
 // https://github.com/lifthrasiir/j40
 //
 // This is a decoder for JPEG XL (ISO/IEC 18181) image format. It intends to be a fully compatible
@@ -59,9 +59,6 @@
 //     return 0;
 // }
 // --------------------------------------------------------------------------------
-//
-// This example should be enough for casual uses; see `docs/README.md` for more information.
-// You can also skip to the "public API" section to see the inlined documentation.
 
 ////////////////////////////////////////////////////////////////////////////////
 // preamble (only reachable via the user `#include`)
@@ -7673,6 +7670,7 @@ static const struct { char err[4]; const char *msg, *suffix; } J40__ERROR_STRING
 	{ "Uch?", "Bad `channel` parameter", NULL },
 	{ "Ufm?", "Bad `format` parameter", NULL },
 	{ "Uof?", "Bad `channel` and `format` combination", NULL },
+	{ "Urnd", "Frame is not yet rendered", NULL },
 	{ "Ufre", "Trying to reuse already freed image", NULL },
 	{ "!mem", "Out of memory", NULL },
 	{ "!jxl", "The JPEG XL signature is not found", NULL },
