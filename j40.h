@@ -1,12 +1,67 @@
-// J40: Self-contained JPEG XL Decoder
-// Kang Seonghoon, 2022-08, Public Domain (CC0)
+// J40: Independent, self-contained JPEG XL decoder
+// Kang Seonghoon, version 2270 (2022-09), Public Domain (CC0)
+// https://github.com/lifthrasiir/j40
 //
 // This is a decoder for JPEG XL (ISO/IEC 18181) image format. It intends to be a fully compatible
 // reimplementation to the reference implementation, libjxl, and also serves as a verification that
 // the specification allows for an independent implementation besides from libjxl.
 //
-// "SPEC" comments are used for incorrect, ambiguous or misleading specification issues.
-// "TODO spec" comments are roughly same, but not yet fully confirmed & reported.
+// The following is a simple but complete converter from JPEG XL to Portable Arbitrary Map format:
+//
+// --------------------------------------------------------------------------------
+// #define J40_IMPLEMENTATION // only a SINGLE file should have this
+// #include "j40.h" // you also need to define a macro for experimental versions; follow the error.
+// #include <stdio.h>
+// #include <stdarg.h> // for va_*
+// 
+// static int oops(const char *fmt, ...) {
+//     va_list args;
+//     va_start(args, fmt);
+//     vfprintf(stderr, fmt, args);
+//     va_end(args);
+//     return 1;
+// }
+// 
+// int main(int argc, char **argv) {
+//     if (argc < 3) return oops("Usage: %s input.jxl output.pam\n", argv[0]);
+// 
+//     FILE *out = fopen(argv[2], "wb");
+//     if (!out) return oops("Error: Cannot open an output file.\n");
+// 
+//     j40_image image;
+//     j40_from_file(&image, argv[1]); // or: j40_from_memory(&image, buf, bufsize, freefunc);
+//     j40_output_format(&image, J40_RGBA, J40_U8X4);
+//
+//     // JPEG XL supports animation, so `j40_next_frame` calls can be called multiple times
+//     if (j40_next_frame(&image)) {
+//         j40_frame frame = j40_current_frame(&image);
+//         j40_pixels_u8x4 pixels = j40_frame_pixels_u8x4(&frame, J40_RGBA);
+//         fprintf(out,
+//             "P7\n"
+//             "WIDTH %d\n"
+//             "HEIGHT %d\n"
+//             "DEPTH 4\n"
+//             "MAXVAL 255\n"
+//             "TUPLTYPE RGB_ALPHA\n"
+//             "ENDHDR\n",
+//             pixels.width, pixels.height);
+//         for (int y = 0; y < height; ++y) {
+//             fwrite(j40_row_u8x4(pixels, y), 4, pixels.width, out);
+//         }
+//     }
+// 
+//     // J40 stops once the first error is encountered; its error can be checked at the very end
+//     if (j40_error(&image)) return oops("Error: %s\n", j40_error_string(&image));
+//     if (ferror(out)) return oops("Error: Cannot fully write to the output file.\n");
+// 
+//     j40_free(&image); // also frees all memory associated to j40_frame etc.
+//     fclose(out);
+//     return 0;
+// }
+// --------------------------------------------------------------------------------
+//
+// This example should be enough for casual uses; see `docs/README.md` for more information.
+// You can also skip to the "public API" section to see the inlined documentation.
 
 ////////////////////////////////////////////////////////////////////////////////
 // preamble (only reachable via the user `#include`)
@@ -25,7 +80,11 @@
 
 #define J40_VERSION 2270 // (fractional gregorian year - 2000) * 100, with a liberal rounding
 
-#define J40_DEBUG
+#ifndef J40_CONFIRM_THAT_THIS_IS_EXPERIMENTAL_AND_POTENTIALLY_UNSAFE
+#error "Please #define J40_CONFIRM_THAT_THIS_IS_EXPERIMENTAL_AND_POTENTIALLY_UNSAFE to use J40. Proceed at your own risk."
+#endif
+
+//#define J40_DEBUG
 
 #ifndef J40_FILENAME // should be provided if this file has a different name than `j40.h`
 #define J40_FILENAME "j40.h"
@@ -62,7 +121,7 @@ extern "C" {
 #endif // !defined J40__RECURSING
 
 ////////////////////////////////////////////////////////////////////////////////
-// platform macros (partially public)
+// public platform macros
 
 #if J40__RECURSING <= 0
 
@@ -85,19 +144,137 @@ J40_STATIC_ASSERT(sizeof(uint16_t) == 2, uint16_t_should_have_no_padding_bits);
 J40_STATIC_ASSERT(sizeof(uint32_t) == 4, uint32_t_should_have_no_padding_bits);
 J40_STATIC_ASSERT(sizeof(uint64_t) == 8, uint64_t_should_have_no_padding_bits);
 
-#ifndef J40_RESTRICT
-	#if __STDC_VERSION__ >= 199901L
-		#define J40_RESTRICT restrict
-	#elif defined __GNUC__ || __MSC_VER >= 1900 // since pretty much every GCC/Clang and VS 2015
-		#define J40_RESTRICT __restrict
-	#else
-		#define J40_RESTRICT
-	#endif
-#endif // !defined J40_RESTRICT
+#ifndef J40_API
+	#define J40_API // TODO
+#endif
 
-#define J40_API // TODO
+#endif // J40__RECURSING <= 0
 
-#ifdef J40_IMPLEMENTATION
+////////////////////////////////////////////////////////////////////////////////
+// public API
+
+#if J40__RECURSING <= 0
+
+// an internal error type. non-zero indicates a different error condition.
+// user callbacks can also emit error codes, which should not exceed `J40_MIN_RESERVED_ERR`.
+// it can be interpreted as a four-letter code, but such encoding is not guaranteed.
+typedef uint32_t j40_err;
+#define J40_MIN_RESERVED_ERR (j40_err) (1 << 24) // anything below this can be used freely
+
+typedef struct {
+	// either J40__IMAGE_MAGIC, (J40__IMAGE_ERR_MAGIC ^ origin) or (J40__IMAGE_OPEN_ERR_MAGIC ^ origin)
+	uint32_t magic;
+	union {
+		struct j40__inner *inner; // if magic == J40__IMAGE_MAGIC
+		j40_err err; // if magic == J40__IMAGE_ERR_MAGIC
+		int saved_errno; // if magic == J40__IMAGE_OPEN_ERR_MAGIC (err is assumed to be `open`)
+	} u;
+} j40_image;
+
+typedef struct {
+	uint32_t magic; // should be J40__FRAME_MAGIC or J40__FRAME_ERR_MAGIC
+	uint32_t reserved;
+	struct j40__inner *inner;
+} j40_frame;
+
+typedef void (*j40_memory_free_func)(void *data);
+
+// pixel formats
+//rsvd: J40_U8                  0x0f0f
+//rsvd: J40_U16                 0x0f17
+//rsvd: J40_U32                 0x0f1b
+//rsvd: J40_U64                 0x0f1d
+//rsvd: J40_F32                 0x0f1e
+//rsvd: J40_U8X3                0x0f27
+//rsvd: J40_U16X3               0x0f2b
+//rsvd: J40_U32X3               0x0f2d
+//rsvd: J40_F32X3               0x0f2e
+#define J40_U8X4                0x0f33
+//rsvd: J40_U16X4               0x0f35
+//rsvd: J40_U32X4               0x0f36
+//rsvd: J40_F32X4               0x0f39
+
+// color types
+//rsvd: J40_RED                 0x170f
+//rsvd: J40_GREEN               0x1717
+//rsvd: J40_BLUE                0x171b
+//rsvd: J40_LUMI                0x171d
+//rsvd: J40_ALPHA               0x171e
+//rsvd: J40_CYAN                0x1727
+//rsvd: J40_YELLOW              0x172b
+//rsvd: J40_MAGENTA             0x172d
+//rsvd: J40_BLACK               0x172e
+//rsvd: J40_JPEG_Y              0x1733
+//rsvd: J40_JPEG_CB             0x1735
+//rsvd: J40_JPEG_CR             0x1736
+//rsvd: J40_OPSIN_X             0x1739
+//rsvd: J40_OPSIN_Y             0x173a
+//rsvd: J40_OPSIN_B             0x173c
+//rsvd: J40_RED_BEFORE_CT       0x1747
+//rsvd: J40_GREEN_BEFORE_CT     0x174b
+//rsvd: J40_BLUE_BEFORE_CT      0x174d
+//rsvd: J40_RGB                 0x174e
+//rsvd: J40_BGR                 0x1753
+#define J40_RGBA                0x1755
+//rsvd: J40_ARGB                0x1756
+//rsvd: J40_BGRA                0x1759
+//rsvd: J40_ABGR                0x175a
+
+J40_API j40_err j40_error(const j40_image *image);
+J40_API const char *j40_error_string(const j40_image *image);
+
+J40_API j40_err j40_from_memory(j40_image *image, void *buf, size_t size, j40_memory_free_func freefunc);
+J40_API j40_err j40_from_file(j40_image *image, const char *path);
+
+J40_API j40_err j40_output_format(j40_image *image, int32_t channel, int32_t format);
+
+J40_API int j40_next_frame(j40_image *image);
+J40_API j40_frame j40_current_frame(j40_image *image);
+
+#define J40__DEFINE_PIXELS(type, suffix) \
+	typedef struct { \
+		int32_t width, height; \
+		int32_t stride_bytes; \
+		const void *data; \
+	} j40_pixels_##suffix; \
+	J40_API j40_pixels_##suffix j40_frame_pixels_##suffix(const j40_frame *frame, int32_t channel); \
+	J40_API const type *j40_row_##suffix(j40_pixels_##suffix pixels, int32_t y)
+
+typedef uint8_t /*j40_u8x3[3],*/ j40_u8x4[4];
+//typedef uint16_t j40_u16x3[3], j40_u16x4[4];
+//typedef uint32_t j40_u32x3[3], j40_u32x4[4];
+//typedef float j40_f32x3[3], j40_f32x4[4];
+
+//J40__DEFINE_PIXELS(uint8_t, u8);      // j40_pixels_u8, j40_frame_pixels_u8, j40_row_u8
+//J40__DEFINE_PIXELS(uint16_t, u16);    // j40_pixels_u16, j40_frame_pixels_u16, j40_row_u16
+//J40__DEFINE_PIXELS(uint32_t, u32);    // j40_pixels_u32, j40_frame_pixels_u32, j40_row_u32
+//J40__DEFINE_PIXELS(uint64_t, u64);    // j40_pixels_u64, j40_frame_pixels_u64, j40_row_u64
+//J40__DEFINE_PIXELS(float, f32);       // j40_pixels_f32, j40_frame_pixels_f32, j40_row_f32
+//J40__DEFINE_PIXELS(j40_u8x3, u8x3);   // j40_pixels_u8x3, j40_frame_pixels_u8x3, j40_row_u8x3
+//J40__DEFINE_PIXELS(j40_u16x3, u16x3); // j40_pixels_u16x3, j40_frame_pixels_u16x3, j40_row_u16x3
+//J40__DEFINE_PIXELS(j40_u32x3, u32x3); // j40_pixels_u32x3, j40_frame_pixels_u32x3, j40_row_u32x3
+//J40__DEFINE_PIXELS(j40_f32x3, f32x3); // j40_pixels_f32x3, j40_frame_pixels_f32x3, j40_row_f32x3
+J40__DEFINE_PIXELS(j40_u8x4, u8x4);     // j40_pixels_u8x4, j40_frame_pixels_u8x4, j40_row_u8x4
+//J40__DEFINE_PIXELS(j40_u16x4, u16x4); // j40_pixels_u16x4, j40_frame_pixels_u16x4, j40_row_u16x4
+//J40__DEFINE_PIXELS(j40_u32x4, u32x4); // j40_pixels_u32x4, j40_frame_pixels_u32x4, j40_row_u32x4
+//J40__DEFINE_PIXELS(j40_f32x4, f32x4); // j40_pixels_f32x4, j40_frame_pixels_f32x4, j40_row_f32x4
+
+J40_API void j40_free(j40_image *image);
+
+#endif // J40__RECURSING <= 0
+
+////////////////////////////////////////////////////////////////////////////////
+//////////////////////// internal code starts from here ////////////////////////
+////////////////////////////////////////////////////////////////////////////////
+
+#if J40__RECURSING < 0
+
+// comment convention:
+// "SPEC" comments are used for incorrect, ambiguous or misleading specification issues.
+// "TODO spec" comments are roughly same, but not yet fully confirmed & reported.
+
+////////////////////////////////////////////////////////////////////////////////
+// private platform macros
 
 #ifdef __has_attribute // since GCC 5.0.0 and clang 2.9.0
 	#if __has_attribute(always_inline)
@@ -160,16 +337,36 @@ J40_STATIC_ASSERT(sizeof(uint64_t) == 8, uint64_t_should_have_no_padding_bits);
 	#endif
 #endif // !defined J40_ALWAYS_INLINE
 
+#ifndef J40_RESTRICT
+	#if __STDC_VERSION__ >= 199901L
+		#define J40_RESTRICT restrict
+	#elif defined __GNUC__ || __MSC_VER >= 1900 // since pretty much every GCC/Clang and VS 2015
+		#define J40_RESTRICT __restrict
+	#else
+		#define J40_RESTRICT
+	#endif
+#endif // !defined J40_RESTRICT
+
 #ifndef J40_NODISCARD
 	#if __cplusplus >= 201703L /*|| __STDC_VERSION__ >= 2023xxL */
 		#define J40_NODISCARD [[nodiscard]] // since C++17 and C23
 	#elif J40__HAS_WARN_UNUSED_RESULT_ATTR || J40__GCC_VER >= 0x30400 || J40__CLANG_VER >= 0x10000
-		// this is stronger than [[nodiscard]] in that it's much harder to suppress
+		// this is stronger than [[nodiscard]] in that it's much harder to suppress; we're okay with that
 		#define J40_NODISCARD __attribute__((warn_unused_result)) // since GCC 3.4 and clang 1.0.0
 	#else
 		#define J40_NODISCARD
 	#endif
 #endif // !defined J40_NODISCARD
+
+#ifndef J40_MAYBE_UNUSED
+	#if __cplusplus >= 201703L /*|| __STDC_VERSION__ >= 2023xxL */
+		#define J40_MAYBE_UNUSED [[maybe_unused]] // since C++17 and C23
+	#elif J40__GCC_VER >= 0x30000 || J40__CLANG_VER >= 0x10000
+		#define J40_MAYBE_UNUSED __attribute__((unused)) // since GCC 2.95 or earlier (!) and clang 1.0.0
+	#else
+		#define J40_MAYBE_UNUSED
+	#endif
+#endif
 
 // rule of thumb: sparingly use them, except for the obvious error cases
 #ifndef J40_EXPECT
@@ -196,115 +393,60 @@ J40_STATIC_ASSERT(sizeof(uint64_t) == 8, uint64_t_should_have_no_padding_bits);
 	#define J40_MUL_OVERFLOW(a, b, res) __builtin_mul_overflow(a, b, res)
 #endif
 
-#endif // defined J40_IMPLEMENTATION
-#endif // J40__RECURSING <= 0
-
-////////////////////////////////////////////////////////////////////////////////
-// public API
-
-#if J40__RECURSING <= 0
-
-// an internal error type. non-zero indicates a different error condition.
-// user callbacks can also emit error codes, which should not exceed `J40_MIN_RESERVED_ERR`.
-// it can be interpreted as a four-letter code, but such encoding is not guaranteed.
-typedef uint32_t j40_err;
-#define J40_MIN_RESERVED_ERR (j40_err) (1 << 24) // anything below this can be used freely
-
-#ifdef J40_IMPLEMENTATION
-#define J40_RETURNS_ERR J40_NODISCARD j40_err
-#endif // defined J40_IMPLEMENTATION
-
-#endif // J40__RECURSING <= 0
-
-////////////////////////////////////////////////////////////////////////////////
-#if J40__RECURSING < 0                      // internal code starts from here //
-////////////////////////////////////////////////////////////////////////////////
+#if !defined J40_MALLOC && !defined J40_CALLOC && !defined J40_REALLOC && !defined J40_FREE
+	#define J40_MALLOC malloc
+	#define J40_CALLOC calloc
+	#define J40_REALLOC realloc
+	#define J40_FREE free
+#elif !(defined J40_MALLOC && defined J40_CALLOC && defined J40_REALLOC && defined J40_FREE)
+	#error "J40_MALLOC, J40_CALLOC, J40_REALLOC and J40_FREE should be provided altogether."
+#endif
 
 ////////////////////////////////////////////////////////////////////////////////
 // state
 
+// bit and logical buffer. this is most frequently accessed and thus available without indirection.
+//
+// the bit buffer (`nbits` least significant bits of `bits`) is the least significant bits available
+// for decoding, and the logical buffer [ptr, end) corresponds to subsequent bits.
+// the logical buffer is guaranteed to be all in the codestream (which is not always true if
+// the file uses a container).
+//
+// when the bit buffer has been exhausted the next byte from the logical buffer is consumed and
+// appended at the *top* of the bit buffer. when the logical buffer has been exhausted
+// higher layers (first backing buffer, then container, and finally source) should be consulted.
+typedef struct j40__bits_st {
+	int32_t nbits; // [0, 64]
+	uint64_t bits;
+	uint8_t *ptr, *end;
+} j40__bits_st;
+
 // a common context ("state") for all internal functions.
+// this bears a strong similarity with `struct j40__inner` type in the API layer which would be
+// introduced much later. there are multiple reasons for this split:
+// - `j40__st` is designed to be in the stack, so it doesn't take up much stack space.
+// - `j40__st` allows for partial initialization of subsystems, which makes testing much easier.
+// - `j40__st` only holds things relevant to decoding, while `j40__inner` has API contexts.
+// - there can be multiple `j40__st` for multi-threaded decoding.
 typedef struct {
 	j40_err err; // first error code encountered, or 0
 	int saved_errno;
 	int cannot_retry; // a fatal error was encountered and no more additional input will fix it
 
-	//                 |<------------------- capacity ------------------->|
-	//                 |<------------- size -------------->|              |
-	//                 +-----------------------------------|-----------+  |
-	//                 |    +---------+    +---------------|---+       |  |
-	// file:           |    |  box 1  |    |       box 2   |   |       |  |
-	//                 |    +---------+    +---------------|---+       |  |
-	//                 +-----------------------------------+---|-------+--+
-	// backing buffer: | buf                               |///|//////////|
-	//                 +----------------------+------------+---|----|-----+
-	// logical buffer:                        | ptr        |   | garbage
-	//                                        +------------+   |
-	//                              remaining |<---------->|<->| box_remaining
-	//
-	// the _backing buffer_ is a region of memory managed by the input source, which may have
-	// been provided from the caller or allocated by the input source itself.
-	// its valid extent is [buf, buf + size) while the allocated extent is [buf, buf + capacity).
-	// the valid portion of the backing buffer is guaranteed to be a contiguous region of the file.
-	//
-	// the _logical buffer_ [ptr, ptr + remaining) is a slice of the backing buffer and
-	// normally a contiguous region of the codestream. if the file is a bare codestream
-	// (starting with `FF 0A`) there is no actual distinction and the logical buffer covers
-	// the whole valid portion of the backing buffer. if the file is an ISOBMFF container however,
-	// the actual codestream may span multiple disconnected regions ("boxes") of the file,
-	// and the logical buffer can hold only one such region at a time.
-	//
-	// normally the parser has to scan the file sequentially, so at some point its pointer will
-	// be between codestream boxes. we call this the "container" mode, as opposed to the typical
-	// "codestream" mode. in the container mode the logical buffer temporarily can cover multiple
-	// boxes or even no boxes at all; the parser should shrink the logical buffer into a single box
-	// before it switches back to the codestream mode. if the current logical buffer doesn't cover
-	// the whole box, the size of the remainder (i.e. the region beyond the current backing buffer)
-	// is recorded to `box_remaining`.
-	//
-	// if the parser proceeds to the end of the logical buffer, it rolls back the state and
-	// issues a partial input condition (error code `shrt`). this is a soft error and can be
-	// fixed by the input source providing more input; the parser prepares this by moving
-	// the uncommitted input since the last checkpoint to the beginning of the backing buffer
-	// and reading the next input into the rest. the parser retries back from that checkpoint.
-	// if the checkpoint didn't advance after retry, this means that the current backing buffer is
-	// too small to continue on. the backing buffer gets expanded until the checkpoint advances.
-
-	// bit buffer
-	int nbits;
-	uint64_t bits;
-
-	// logical buffer
-	uint8_t *ptr;
-	size_t remaining;
-
-	// the input source; only used to repopulate `ptr` when `remaining == 0`.
-	struct j40__source *source;
-
 	// different subsystems make use of additional contexts, all accessible from here.
+	struct j40__bits_st bits; // very frequently accessed, thus inlined here
+	struct j40__source_st *source;
 	struct j40__container_st *container;
+	struct j40__buffer_st *buffer;
 	struct j40__image_st *image;
 	struct j40__frame_st *frame;
-	//struct j40__lfgroup_st *lfgroup;
+	struct j40__lf_group_st *lf_group;
+	struct j40__alloc_st *alloc;
 } j40__st;
 
 ////////////////////////////////////////////////////////////////////////////////
-// error handling
+// error handling and memory allocation
 
-#define J40__4(s) (j40_err) (((uint32_t) s[0] << 24) | ((uint32_t) s[1] << 16) | ((uint32_t) s[2] << 8) | (uint32_t) s[3])
-#define J40__ERR(s) j40__set_error(st, J40__4(s))
-#define J40__SHOULD_OR(cond, s, stmt) do { \
-		if (J40_UNLIKELY(st->err)) { stmt; } \
-		else if (J40_UNLIKELY(!(cond))) { j40__set_error(st, J40__4(s)); stmt; } \
-	} while (0)
-#define J40__ON_ERROR error // goto label
-#define J40__SHOULD(cond, s) J40__SHOULD_OR(cond, s, goto J40__ON_ERROR)
-#define J40__RAISE(s) do { j40__set_error(st, J40__4(s)); goto J40__ON_ERROR; } while (0)
-#define J40__RAISE_DELAYED() do { if (J40_UNLIKELY(st->err)) goto J40__ON_ERROR; } while (0)
-#define J40__TRY(expr) do { if (J40_UNLIKELY(expr)) goto J40__ON_ERROR; } while (0)
-// this *should* use casting because C/C++ don't allow comparison between pointers
-// that came from different arrays at all: https://stackoverflow.com/a/39161283
-#define J40__INBOUNDS(ptr, start, size) ((uintptr_t) (ptr) - (uintptr_t) (start) <= (uintptr_t) (size))
 #ifdef J40_DEBUG
 	#define J40__ASSERT(cond) assert(cond)
 	#define J40__UNREACHABLE() J40__ASSERT(0)
@@ -316,14 +458,41 @@ typedef struct {
 	#define J40__UNREACHABLE() ((void) 0) // TODO also check for MSVC __assume
 #endif
 
-#define J40__TRY_REALLOC(ptr, itemsize, len, cap) \
+#define J40__RETURNS_ERR J40_NODISCARD j40_err
+
+#define J40__4(s) \
+	(j40_err) (((uint32_t) (s)[0] << 24) | ((uint32_t) (s)[1] << 16) | ((uint32_t) (s)[2] << 8) | (uint32_t) (s)[3])
+#define J40__ERR(s) j40__set_error(st, J40__4(s))
+#define J40__SHOULD(cond, s) do { \
+		if (J40_UNLIKELY(st->err)) goto J40__ON_ERROR; \
+		if (J40_UNLIKELY(!(cond))) { j40__set_error(st, J40__4(s)); goto J40__ON_ERROR; } \
+	} while (0)
+#define J40__RAISE(s) do { j40__set_error(st, J40__4(s)); goto J40__ON_ERROR; } while (0)
+#define J40__RAISE_DELAYED() do { if (J40_UNLIKELY(st->err)) goto J40__ON_ERROR; } while (0)
+#define J40__TRY(expr) do { if (J40_UNLIKELY(expr)) { J40__ASSERT(st->err); goto J40__ON_ERROR; } } while (0)
+
+// this *should* use casting because C/C++ don't allow comparison between pointers
+// that came from different arrays at all: https://stackoverflow.com/a/39161283
+#define J40__INBOUNDS(ptr, start, size) ((uintptr_t) (ptr) - (uintptr_t) (start) <= (uintptr_t) (size))
+
+#define J40__TRY_REALLOC32(ptr, len, cap) \
 	do { \
-		void *newptr = j40__realloc(st, *(ptr), itemsize, len, cap); \
-		if (J40_LIKELY(newptr)) *(ptr) = newptr; else goto error; \
+		void *newptr = j40__realloc32(st, *(ptr), sizeof(**(ptr)), len, cap); \
+		if (J40_LIKELY(newptr)) *(ptr) = newptr; else goto J40__ON_ERROR; \
+	} while (0)
+
+#define J40__TRY_REALLOC64(ptr, len, cap) \
+	do { \
+		void *newptr = j40__realloc64(st, *(ptr), sizeof(**(ptr)), len, cap); \
+		if (J40_LIKELY(newptr)) *(ptr) = newptr; else goto J40__ON_ERROR; \
 	} while (0)
 
 J40_STATIC j40_err j40__set_error(j40__st *st, j40_err err);
-J40_STATIC void *j40__realloc(j40__st *st, void *ptr, size_t itemsize, int32_t len, int32_t *cap);
+J40_STATIC void *j40__malloc(size_t size);
+J40_STATIC void *j40__calloc(size_t num, size_t size);
+J40_STATIC void *j40__realloc32(j40__st *st, void *ptr, size_t itemsize, int32_t len, int32_t *cap);
+J40_STATIC void *j40__realloc64(j40__st *st, void *ptr, size_t itemsize, int64_t len, int64_t *cap);
+J40_STATIC void j40__free(void *ptr);
 
 #ifdef J40_IMPLEMENTATION
 
@@ -333,20 +502,47 @@ J40_STATIC j40_err j40__set_error(j40__st *st, j40_err err) {
 	return err;
 }
 
-J40_STATIC void *j40__realloc(j40__st *st, void *ptr, size_t itemsize, int32_t len, int32_t *cap) {
+J40_STATIC void *j40__malloc(size_t size) { return J40_MALLOC(size); }
+J40_STATIC void *j40__calloc(size_t num, size_t size) { return J40_CALLOC(num, size); }
+
+J40_STATIC void *j40__realloc32(j40__st *st, void *ptr, size_t itemsize, int32_t len, int32_t *cap) {
 	void *newptr;
 	uint32_t newcap;
+	size_t newsize;
 	J40__ASSERT(len >= 0);
 	if (len <= *cap) return ptr;
 	newcap = (uint32_t) *cap * 2;
 	if (newcap > (uint32_t) INT32_MAX) newcap = (uint32_t) INT32_MAX;
 	if (newcap < (uint32_t) len) newcap = (uint32_t) len;
 	J40__SHOULD(newcap <= SIZE_MAX / itemsize, "!mem");
-	J40__SHOULD(newptr = realloc(ptr, itemsize * newcap), "!mem");
+	newsize = (size_t) (itemsize * newcap);
+	J40__SHOULD(newptr = ptr ? J40_REALLOC(ptr, newsize) : J40_MALLOC(newsize), "!mem");
 	*cap = (int32_t) newcap;
 	return newptr;
 J40__ON_ERROR:
 	return NULL;
+}
+
+J40_STATIC void *j40__realloc64(j40__st *st, void *ptr, size_t itemsize, int64_t len, int64_t *cap) {
+	void *newptr;
+	uint64_t newcap;
+	size_t newsize;
+	J40__ASSERT(len >= 0);
+	if (len <= *cap) return ptr;
+	newcap = (uint64_t) *cap * 2;
+	if (newcap > (uint64_t) INT64_MAX) newcap = (uint64_t) INT64_MAX;
+	if (newcap < (uint64_t) len) newcap = (uint64_t) len;
+	J40__SHOULD(newcap <= SIZE_MAX / itemsize, "!mem");
+	newsize = (size_t) (itemsize * newcap);
+	J40__SHOULD(newptr = ptr ? J40_REALLOC(ptr, newsize) : J40_MALLOC(newsize), "!mem");
+	*cap = (int64_t) newcap;
+	return newptr;
+J40__ON_ERROR:
+	return NULL;
+}
+
+J40_STATIC void j40__free(void *ptr) {
+	J40_FREE(ptr);
 }
 
 #endif // defined J40_IMPLEMENTATION
@@ -365,16 +561,33 @@ J40__ON_ERROR:
 #define J40__(x, V) J40__PARAMETRIC_NAME_(J40__, x, J40__CONCAT(J40__, V))
 
 J40_ALWAYS_INLINE int32_t j40__unpack_signed(int32_t x);
+J40_ALWAYS_INLINE int64_t j40__unpack_signed64(int64_t x);
 J40_ALWAYS_INLINE int32_t j40__ceil_div32(int32_t x, int32_t y);
+J40_ALWAYS_INLINE int64_t j40__ceil_div64(int64_t x, int64_t y);
+J40_ALWAYS_INLINE float j40__minf(float x, float y);
+J40_ALWAYS_INLINE float j40__maxf(float x, float y);
+J40_ALWAYS_INLINE int j40__surely_nonzero(float x);
 
 #ifdef J40_IMPLEMENTATION
 
 J40_ALWAYS_INLINE int32_t j40__unpack_signed(int32_t x) {
 	return (int32_t) (x & 1 ? -(x / 2 + 1) : x / 2);
 }
+J40_ALWAYS_INLINE int64_t j40__unpack_signed64(int64_t x) {
+	return (int64_t) (x & 1 ? -(x / 2 + 1) : x / 2);
+}
 
 // equivalent to ceil(x / y)
 J40_ALWAYS_INLINE int32_t j40__ceil_div32(int32_t x, int32_t y) { return (x + y - 1) / y; }
+J40_ALWAYS_INLINE int64_t j40__ceil_div64(int64_t x, int64_t y) { return (x + y - 1) / y; }
+
+J40_ALWAYS_INLINE float j40__minf(float x, float y) { return (x < y ? x : y); }
+J40_ALWAYS_INLINE float j40__maxf(float x, float y) { return (x > y ? x : y); }
+
+// used to guard against division by zero
+J40_ALWAYS_INLINE int j40__surely_nonzero(float x) {
+	return isfinite(x) && fabs(x) >= 1e-8f;
+}
 
 #endif // defined J40_IMPLEMENTATION
 
@@ -393,81 +606,103 @@ J40_ALWAYS_INLINE int32_t j40__ceil_div32(int32_t x, int32_t y) { return (x + y 
 
 #endif // J40__RECURSING < 0
 #if J40__RECURSING == 100
-	#define j40__intN_t J40__CONCAT3(int, J40__N, _t)
-	#define j40__uintN_t J40__CONCAT3(uint, J40__N, _t)
+	#define j40__intN J40__CONCAT3(int, J40__N, _t)
+	#define j40__uintN J40__CONCAT3(uint, J40__N, _t)
 	#define J40__INTN_MAX J40__CONCAT3(INT, J40__N, _MAX)
 	#define J40__INTN_MIN J40__CONCAT3(INT, J40__N, _MIN)
 // ----------------------------------------
 
-J40_ALWAYS_INLINE j40__intN_t j40__(floor_avg,N)(j40__intN_t x, j40__intN_t y);
-J40_ALWAYS_INLINE j40__intN_t j40__(abs,N)(j40__intN_t x);
-J40_ALWAYS_INLINE j40__intN_t j40__(min,N)(j40__intN_t x, j40__intN_t y);
-J40_ALWAYS_INLINE j40__intN_t j40__(max,N)(j40__intN_t x, j40__intN_t y);
-J40_ALWAYS_INLINE j40__intN_t j40__(add,N)(j40__st *st, j40__intN_t x, j40__intN_t y);
-J40_ALWAYS_INLINE j40__intN_t j40__(sub,N)(j40__st *st, j40__intN_t x, j40__intN_t y);
-J40_ALWAYS_INLINE j40__intN_t j40__(mul,N)(j40__st *st, j40__intN_t x, j40__intN_t y);
+J40_ALWAYS_INLINE j40__intN j40__(floor_avg,N)(j40__intN x, j40__intN y);
+J40_ALWAYS_INLINE j40__intN j40__(abs,N)(j40__intN x);
+J40_ALWAYS_INLINE j40__intN j40__(min,N)(j40__intN x, j40__intN y);
+J40_ALWAYS_INLINE j40__intN j40__(max,N)(j40__intN x, j40__intN y);
+
+// returns 1 if overflow or underflow didn't occur
+J40_ALWAYS_INLINE int j40__(add,N)(j40__intN x, j40__intN y, j40__intN *out);
+J40_ALWAYS_INLINE int j40__(sub,N)(j40__intN x, j40__intN y, j40__intN *out);
+J40_ALWAYS_INLINE int j40__(mul,N)(j40__intN x, j40__intN y, j40__intN *out);
+J40_ALWAYS_INLINE int j40__(add_fallback,N)(j40__intN x, j40__intN y, j40__intN *out);
+J40_ALWAYS_INLINE int j40__(sub_fallback,N)(j40__intN x, j40__intN y, j40__intN *out);
+J40_ALWAYS_INLINE int j40__(mul_fallback,N)(j40__intN x, j40__intN y, j40__intN *out);
+J40_ALWAYS_INLINE j40__intN j40__(clamp_add,N)(j40__intN x, j40__intN y);
 
 #ifdef J40_IMPLEMENTATION
 
 // same to `(a + b) >> 1` but doesn't overflow, useful for tight loops with autovectorization
 // https://devblogs.microsoft.com/oldnewthing/20220207-00/?p=106223
-J40_ALWAYS_INLINE j40__intN_t j40__(floor_avg,N)(j40__intN_t x, j40__intN_t y) {
-	return (j40__intN_t) (x / 2 + y / 2 + (x & y & 1));
+J40_ALWAYS_INLINE j40__intN j40__(floor_avg,N)(j40__intN x, j40__intN y) {
+	return (j40__intN) (x / 2 + y / 2 + (x & y & 1));
 }
 
-J40_ALWAYS_INLINE j40__intN_t j40__(abs,N)(j40__intN_t x) {
-	return (j40__intN_t) (x < 0 ? -x : x);
+J40_ALWAYS_INLINE j40__intN j40__(abs,N)(j40__intN x) {
+	return (j40__intN) (x < 0 ? -x : x);
 }
-J40_ALWAYS_INLINE j40__intN_t j40__(min,N)(j40__intN_t x, j40__intN_t y) {
-	return (j40__intN_t) (x < y ? x : y);
+J40_ALWAYS_INLINE j40__intN j40__(min,N)(j40__intN x, j40__intN y) {
+	return (j40__intN) (x < y ? x : y);
 }
-J40_ALWAYS_INLINE j40__intN_t j40__(max,N)(j40__intN_t x, j40__intN_t y) {
-	return (j40__intN_t) (x > y ? x : y);
+J40_ALWAYS_INLINE j40__intN j40__(max,N)(j40__intN x, j40__intN y) {
+	return (j40__intN) (x > y ? x : y);
 }
 
-J40_ALWAYS_INLINE j40__intN_t j40__(add,N)(j40__st *st, j40__intN_t x, j40__intN_t y) {
+J40_ALWAYS_INLINE int j40__(add,N)(j40__intN x, j40__intN y, j40__intN *out) {
 #ifdef J40_ADD_OVERFLOW
-	j40__intN_t res;
-	if (J40_UNLIKELY(J40_ADD_OVERFLOW(x, y, &res))) J40__ERR("over");
-	return res;
+	// gcc/clang extension uses an opposite convention, which is unnatural to use with J40__SHOULD
+	return !J40_ADD_OVERFLOW(x, y, out);
 #else
-	if (J40_UNLIKELY((x > 0 && y > J40__INTN_MAX - x) || (x < 0 && y < J40__INTN_MIN - x))) {
-		return J40__ERR("over"), x;
-	} else {
-		return (j40__intN_t) (x + y);
-	}
+	return j40__(add_fallback,N)(x, y, out);
 #endif
 }
 
-J40_ALWAYS_INLINE j40__intN_t j40__(sub,N)(j40__st *st, j40__intN_t x, j40__intN_t y) {
+J40_ALWAYS_INLINE int j40__(sub,N)(j40__intN x, j40__intN y, j40__intN *out) {
 #ifdef J40_SUB_OVERFLOW
-	j40__intN_t res;
-	if (J40_UNLIKELY(J40_SUB_OVERFLOW(x, y, &res))) J40__ERR("over");
-	return res;
+	return !J40_SUB_OVERFLOW(x, y, out);
 #else
-	if (J40_UNLIKELY((y < 0 && x > J40__INTN_MAX + y) || (y > 0 && x < J40__INTN_MIN + y))) {
-		return J40__ERR("over"), x;
-	} else {
-		return (j40__intN_t) (x - y);
-	}
+	return j40__(sub_fallback,N)(x, y, out);
 #endif
 }
 
-J40_ALWAYS_INLINE j40__intN_t j40__(mul,N)(j40__st *st, j40__intN_t x, j40__intN_t y) {
+J40_ALWAYS_INLINE int j40__(mul,N)(j40__intN x, j40__intN y, j40__intN *out) {
 #ifdef J40_MUL_OVERFLOW
-	j40__intN_t res;
-	if (J40_UNLIKELY(J40_MUL_OVERFLOW(x, y, &res))) J40__ERR("over");
-	return res;
+	return !J40_MUL_OVERFLOW(x, y, out);
 #else
-	if (J40_UNLIKELY(
-		(x == -1 && y == J40__INTN_MIN) || (y == -1 && x == J40__INTN_MIN) ||
-		(x != 0 && (y > J40__INTN_MAX / x || y < J40__INT_MIN / x))
-	)) {
-		return J40__ERR("over"), x;
-	} else {
-		return (j40__intN_t) (x * y);
-	}
+	return j40__(mul_fallback,N)(x, y, out);
 #endif
+}
+
+J40_ALWAYS_INLINE int j40__(add_fallback,N)(j40__intN x, j40__intN y, j40__intN *out) {
+	if (J40_UNLIKELY((x > 0 && y > J40__INTN_MAX - x) || (x < 0 && y < J40__INTN_MIN - x))) {
+		return 0;
+	} else {
+		*out = (j40__intN) (x + y);
+		return 1;
+	}
+}
+
+J40_ALWAYS_INLINE int j40__(sub_fallback,N)(j40__intN x, j40__intN y, j40__intN *out) {
+	if (J40_UNLIKELY((y < 0 && x > J40__INTN_MAX + y) || (y > 0 && x < J40__INTN_MIN + y))) {
+		return 0;
+	} else {
+		*out = (j40__intN) (x - y);
+		return 1;
+	}
+}
+
+J40_ALWAYS_INLINE int j40__(mul_fallback,N)(j40__intN x, j40__intN y, j40__intN *out) {
+	if (J40_UNLIKELY(
+		x > 0 ?
+			(y > 0 ? x > J40__INTN_MAX / y : y < J40__INTN_MIN / x) :
+			(y > 0 ? x < J40__INTN_MIN / y : y != 0 && x < J40__INTN_MAX / y)
+	)) {
+		return 0;
+	} else {
+		*out = (j40__intN) (x * y);
+		return 1;
+	}
+}
+
+J40_ALWAYS_INLINE j40__intN j40__(clamp_add,N)(j40__intN x, j40__intN y) {
+	j40__intN out;
+	return j40__(add,N)(x, y, &out) ? out : J40__INTN_MAX;
 }
 
 #endif // defined J40_IMPLEMENTATION
@@ -482,15 +717,15 @@ J40_ALWAYS_INLINE j40__intN_t j40__(mul,N)(j40__st *st, j40__intN_t x, j40__intN
 #endif
 #undef J40__UINTN_MAX
 #ifdef J40__CLZN
-	J40_ALWAYS_INLINE int j40__(floor_lg,N)(j40__uintN_t x);
-	J40_ALWAYS_INLINE int j40__(ceil_lg,N)(j40__uintN_t x);
+	J40_ALWAYS_INLINE int j40__(floor_lg,N)(j40__uintN x);
+	J40_ALWAYS_INLINE int j40__(ceil_lg,N)(j40__uintN x);
 
 	#ifdef J40_IMPLEMENTATION
 	// both requires x to be > 0
-	J40_ALWAYS_INLINE int j40__(floor_lg,N)(j40__uintN_t x) {
+	J40_ALWAYS_INLINE int j40__(floor_lg,N)(j40__uintN x) {
 		return J40__N - 1 - J40__CLZN(x);
 	}
-	J40_ALWAYS_INLINE int j40__(ceil_lg,N)(j40__uintN_t x) {
+	J40_ALWAYS_INLINE int j40__(ceil_lg,N)(j40__uintN x) {
 		return x > 1 ? J40__N - J40__CLZN(x - 1) : 0;
 	}
 	#endif
@@ -500,8 +735,8 @@ J40_ALWAYS_INLINE j40__intN_t j40__(mul,N)(j40__st *st, j40__intN_t x, j40__intN
 
 // ----------------------------------------
 // end of recursion
-	#undef j40__intN_t
-	#undef j40__uintN_t
+	#undef j40__intN
+	#undef j40__uintN
 	#undef J40__INTN_MAX
 	#undef J40__INTN_MIN
 	#undef J40__N
@@ -511,8 +746,6 @@ J40_ALWAYS_INLINE j40__intN_t j40__(mul,N)(j40__st *st, j40__intN_t x, j40__intN
 
 ////////////////////////////////////////////////////////////////////////////////
 // aligned pointers
-
-// TODO simplify this if possible
 
 #ifndef J40_ASSUME_ALIGNED
 	#if J40__HAS_BUILTIN_ASSUME_ALIGNED || J40__GCC_VER >= 0x40700
@@ -525,8 +758,8 @@ J40_ALWAYS_INLINE j40__intN_t j40__(mul,N)(j40__st *st, j40__intN_t x, j40__intN
 J40_ALWAYS_INLINE void *j40__alloc_aligned(size_t sz, size_t align, size_t *outmisalign);
 J40_ALWAYS_INLINE void j40__free_aligned(void *ptr, size_t align, size_t misalign);
 
-J40_STATIC void *j40__alloc_aligned_fallback(size_t sz, size_t align, size_t *outmisalign);
-J40_STATIC void j40__free_aligned_fallback(void *ptr, size_t align, size_t misalign);
+J40_MAYBE_UNUSED J40_STATIC void *j40__alloc_aligned_fallback(size_t sz, size_t align, size_t *outmisalign);
+J40_MAYBE_UNUSED J40_STATIC void j40__free_aligned_fallback(void *ptr, size_t align, size_t misalign);
 
 #ifdef J40_IMPLEMENTATION
 
@@ -538,7 +771,7 @@ J40_STATIC void j40__free_aligned_fallback(void *ptr, size_t align, size_t misal
 	}
 	J40_ALWAYS_INLINE void j40__free_aligned(void *ptr, size_t align, size_t misalign) {
 		(void) align; (void) misalign;
-		free(ptr);
+		free(ptr); // important: do not use j40_free!
 	}
 #elif defined _ISOC11_SOURCE
 	J40_ALWAYS_INLINE void *j40__alloc_aligned(size_t sz, size_t align, size_t *outmisalign) {
@@ -548,7 +781,7 @@ J40_STATIC void j40__free_aligned_fallback(void *ptr, size_t align, size_t misal
 	}
 	J40_ALWAYS_INLINE void j40__free_aligned(void *ptr, size_t align, size_t misalign) {
 		(void) align; (void) misalign;
-		free(ptr);
+		free(ptr); // important: do not use j40_free!
 	}
 #else
 	J40_ALWAYS_INLINE void *j40__alloc_aligned(size_t sz, size_t align, size_t *outmisalign) {
@@ -562,13 +795,13 @@ J40_STATIC void j40__free_aligned_fallback(void *ptr, size_t align, size_t misal
 // a fallback implementation; the caller should store the misalign amount [0, align) separately.
 // used when the platform doesn't provide aligned malloc at all, or the platform implementation
 // is not necessarily better; e.g. MSVC _aligned_malloc has the same amount of overhead as of Win10
-J40_STATIC void *j40__alloc_aligned_fallback(size_t sz, size_t align, size_t *outmisalign) {
+J40_MAYBE_UNUSED J40_STATIC void *j40__alloc_aligned_fallback(size_t sz, size_t align, size_t *outmisalign) {
 	// while this is almost surely an overestimate (can be improved if we know the malloc alignment)
 	// there is no standard way to compute a better estimate in C99 so this is inevitable.
 	size_t maxmisalign = align - 1, misalign;
 	void *ptr;
 	if (sz > SIZE_MAX - maxmisalign) return NULL; // overflow
-	ptr = malloc(sz + maxmisalign);
+	ptr = j40__malloc(sz + maxmisalign);
 	if (!ptr) return NULL;
 	misalign = align - (uintptr_t) ptr % align;
 	if (misalign == align) misalign = 0;
@@ -576,10 +809,10 @@ J40_STATIC void *j40__alloc_aligned_fallback(size_t sz, size_t align, size_t *ou
 	return (void*) ((uintptr_t) ptr + misalign);
 }
 
-J40_ALWAYS_INLINE void j40__free_aligned_fallback(void *ptr, size_t align, size_t misalign) {
+J40_MAYBE_UNUSED J40_ALWAYS_INLINE void j40__free_aligned_fallback(void *ptr, size_t align, size_t misalign) {
 	if (!ptr) return;
 	J40__ASSERT((uintptr_t) ptr % align == 0);
-	free((void*) ((uintptr_t) ptr - misalign));
+	j40__free((void*) ((uintptr_t) ptr - misalign));
 }
 
 #endif // defined J40_IMPLEMENTATION
@@ -596,7 +829,7 @@ J40_ALWAYS_INLINE void j40__copy_view_f32(j40__view_f32 *outv, const j40__view_f
 J40_ALWAYS_INLINE void j40__transpose_view_f32(j40__view_f32 *outv, const j40__view_f32 inv);
 J40_ALWAYS_INLINE void j40__oddeven_columns_to_halves_f32(j40__view_f32 *outv, const j40__view_f32 inv);
 J40_ALWAYS_INLINE void j40__oddeven_rows_to_halves_f32(j40__view_f32 *outv, const j40__view_f32 inv);
-J40_STATIC void j40__print_view_f32(j40__view_f32 v, const char *name, const char *file, int32_t line);
+J40_MAYBE_UNUSED J40_STATIC void j40__print_view_f32(j40__view_f32 v, const char *name, const char *file, int32_t line);
 
 #ifdef J40_IMPLEMENTATION
 
@@ -667,7 +900,7 @@ J40_ALWAYS_INLINE void j40__oddeven_rows_to_halves_f32(j40__view_f32 *outv, cons
 	for (y = 0; y < (1 << (view).logh); ++y) \
 		for (x = 0; x < (1 << (view).logw) && (v = (view).ptr + (y << (view).logw | x), 1); ++x)
 
-J40_STATIC void j40__print_view_f32(j40__view_f32 v, const char *name, const char *file, int32_t line) {
+J40_MAYBE_UNUSED J40_STATIC void j40__print_view_f32(j40__view_f32 v, const char *name, const char *file, int32_t line) {
 	int32_t x, y;
 	printf(".--- %s:%d: %s (w=%d h=%d @%p)", file, line, name, 1 << v.logw, 1 << v.logh, v.ptr);
 	for (y = 0; y < (1 << v.logh); ++y) {
@@ -688,6 +921,7 @@ enum {
 	J40__PLANE_U8 = (uint8_t) 0x20,
 	J40__PLANE_U16 = (uint8_t) 0x21,
 	J40__PLANE_I16 = (uint8_t) 0x41,
+	J40__PLANE_U32 = (uint8_t) 0x22,
 	J40__PLANE_I32 = (uint8_t) 0x42,
 	J40__PLANE_F32 = (uint8_t) 0x62,
 };
@@ -707,43 +941,55 @@ typedef struct {
 	(J40__ASSERT((plane)->type == typeconst), \
 	 J40__ASSERT(0 <= (y) && (y) < (plane)->height), \
 	 (pixel_t*) J40_ASSUME_ALIGNED( \
-		(void*) ((plane)->pixels + (size_t) (plane)->stride_bytes * (size_t) (y)), \
+		(void*) ((char*) (plane)->pixels + (size_t) (plane)->stride_bytes * (size_t) (y)), \
 		J40__PIXELS_ALIGN))
 
 #define J40__U8_PIXELS(plane, y) J40__TYPED_PIXELS(plane, y, J40__PLANE_U8, uint8_t)
 #define J40__U16_PIXELS(plane, y) J40__TYPED_PIXELS(plane, y, J40__PLANE_U16, uint16_t)
 #define J40__I16_PIXELS(plane, y) J40__TYPED_PIXELS(plane, y, J40__PLANE_I16, int16_t)
+#define J40__U32_PIXELS(plane, y) J40__TYPED_PIXELS(plane, y, J40__PLANE_U32, uint32_t)
 #define J40__I32_PIXELS(plane, y) J40__TYPED_PIXELS(plane, y, J40__PLANE_I32, int32_t)
 #define J40__F32_PIXELS(plane, y) J40__TYPED_PIXELS(plane, y, J40__PLANE_F32, float)
 
+#define J40__PLANE_PIXEL_SIZE(plane) (1 << ((plane)->type & 31))
 #define J40__PLANE_STRIDE(plane) ((plane)->stride_bytes >> ((plane)->type & 31))
 
-J40_STATIC J40_RETURNS_ERR j40__init_plane(
-	j40__st *st, uint8_t type, int32_t width, int32_t height, j40__plane *out
-);
-J40_STATIC J40_RETURNS_ERR j40__init_and_clear_plane(
-	j40__st *st, uint8_t type, int32_t width, int32_t height, j40__plane *out
+enum j40__plane_flags {
+	J40__PLANE_CLEAR = 1 << 0,
+	// for public facing planes, we always add padding to prevent misconception
+	J40__PLANE_FORCE_PAD = 1 << 1,
+};
+
+J40_STATIC J40__RETURNS_ERR j40__init_plane(
+	j40__st *st, uint8_t type, int32_t width, int32_t height, enum j40__plane_flags flags, j40__plane *out
 );
 J40_STATIC int j40__plane_all_equal_sized(const j40__plane *begin, const j40__plane *end);
+// returns that type if all planes have the same type, otherwise returns 0
+J40_STATIC uint8_t j40__plane_all_equal_typed(const j40__plane *begin, const j40__plane *end);
 J40_STATIC void j40__free_plane(j40__plane *plane);
 
 #ifdef J40_IMPLEMENTATION
 
-J40_STATIC J40_RETURNS_ERR j40__init_plane(
-	j40__st *st, uint8_t type, int32_t width, int32_t height, j40__plane *out
+J40_STATIC J40__RETURNS_ERR j40__init_plane(
+	j40__st *st, uint8_t type, int32_t width, int32_t height, enum j40__plane_flags flags, j40__plane *out
 ) {
-	int32_t pixelsize = 1 << (type & 31);
+	int32_t pixel_size = 1 << (type & 31);
 	void *pixels;
-	int32_t stride_bytes = j40__mul32(st,
-		j40__ceil_div32(j40__mul32(st, width, pixelsize), J40__PIXELS_ALIGN),
-		J40__PIXELS_ALIGN);
-	size_t misalign;
+	int32_t stride_bytes;
+	size_t total, misalign;
 
+	out->type = 0;
 	J40__ASSERT(width > 0 && height > 0);
-	J40__SHOULD((size_t) stride_bytes <= SIZE_MAX / (uint32_t) height, "over");
+
+	J40__SHOULD(j40__mul32(width, pixel_size, &stride_bytes), "over");
+	if (flags & J40__PLANE_FORCE_PAD) J40__SHOULD(j40__add32(stride_bytes, 1, &stride_bytes), "over");
 	J40__SHOULD(
-		pixels = j40__alloc_aligned((size_t) stride_bytes * (size_t) height, J40__PIXELS_ALIGN, &misalign),
-		"!mem");
+		j40__mul32(j40__ceil_div32(stride_bytes, J40__PIXELS_ALIGN), J40__PIXELS_ALIGN, &stride_bytes),
+		"over");
+	J40__SHOULD((size_t) stride_bytes <= SIZE_MAX / (uint32_t) height, "over");
+	total = (size_t) stride_bytes * (size_t) height;
+	J40__SHOULD(pixels = j40__alloc_aligned(total, J40__PIXELS_ALIGN, &misalign), "!mem");
+
 	out->stride_bytes = stride_bytes;
 	out->width = width;
 	out->height = height;
@@ -751,15 +997,8 @@ J40_STATIC J40_RETURNS_ERR j40__init_plane(
 	out->vshift = out->hshift = 0;
 	out->misalign = (uint8_t) misalign;
 	out->pixels = (uintptr_t) pixels;
-J40__ON_ERROR:
-	return st->err;
-}
+	if (flags & J40__PLANE_CLEAR) memset(pixels, 0, total);
 
-J40_STATIC J40_RETURNS_ERR j40__init_and_clear_plane(
-	j40__st *st, uint8_t type, int32_t width, int32_t height, j40__plane *out
-) {
-	J40__TRY(j40__init_plane(st, type, width, height, out));
-	memset((void*) out->pixels, 0, (size_t) out->stride_bytes * (size_t) height);
 J40__ON_ERROR:
 	return st->err;
 }
@@ -780,9 +1019,19 @@ J40_STATIC int j40__plane_all_equal_sized(const j40__plane *begin, const j40__pl
 	return 1;
 }
 
+J40_STATIC uint8_t j40__plane_all_equal_typed(const j40__plane *begin, const j40__plane *end) {
+	uint8_t type;
+	if (begin >= end) return 0;
+	type = begin->type;
+	while (++begin < end) {
+		if (type != begin->type) return 0;
+	}
+	return type;
+}
+
 J40_STATIC void j40__free_plane(j40__plane *plane) {
 	// we don't touch pixels if plane is zero-initialized via memset, because while `plane->type` is
-	// definitely zero in this case but `(void*) plane->pixels` might NOT be a null pointer!
+	// definitely zero in this case `(void*) plane->pixels` might NOT be a null pointer!
 	if (plane->type) j40__free_aligned((void*) plane->pixels, J40__PIXELS_ALIGN, plane->misalign);
 	plane->width = plane->height = plane->stride_bytes = 0;
 	plane->type = 0;
@@ -796,54 +1045,60 @@ J40_STATIC void j40__free_plane(j40__plane *plane) {
 ////////////////////////////////////////////////////////////////////////////////
 // input source
 
-typedef void (*j40_memory_free_func)(void *data);
+typedef int (*j40_source_read_func)(uint8_t *buf, int64_t fileoff, size_t maxsize, size_t *size, void *data);
+typedef int (*j40_source_seek_func)(int64_t fileoff, void *data);
+typedef void (*j40_source_free_func)(void *data); // intentionally same to j40_memory_free_func
 
-typedef j40_err (*j40_source_read_func)(uint8_t *buf, size_t maxsize, size_t *size, void *data);
-//typedef j40_err (*j40_source_jump_func)(size_t offset, void *data, void **outdata);
-typedef void (*j40_source_free_func)(void *data);
-
-typedef struct j40__source {
-	// the backing buffer for `ptr`. the user may directly provide the buffer, optionally owned,
-	// or the input source may allocate an appropriate amount of the backing buffer.
-	uint8_t *buf;
-	j40_memory_free_func buf_free_func; // set if the buffer is owned, used to deallocate `buf`
-	size_t size, capacity;
-
-	// the first position where the parser can ever backtrack. should point to the backing buffer.
-	uint8_t *checkpoint;
-
-	// the number of bytes read before the backing buffer has been replenished; diagnostics only.
-	size_t bytes_before_buf;
-
-	// callbacks used when the backing buffer has been exhausted and the retry has been scheduled.
+typedef struct j40__source_st {
 	j40_source_read_func read_func;
-	//j40_source_jump_func jump_func;
+	j40_source_seek_func seek_func;
 	j40_source_free_func free_func;
 	void *data;
-} j40__source;
 
-J40_STATIC void j40__init_memory_source(uint8_t *, size_t, j40_memory_free_func, j40__source *);
-J40_STATIC J40_RETURNS_ERR j40__init_file_source(j40__st *, const char *, size_t, j40__source *);
-J40_STATIC J40_RETURNS_ERR j40__refill_backing_buffer(j40__st *);
-J40_STATIC void j40__free_source(j40__source *);
+	int64_t fileoff; // absolute file offset, assumed to be 0 at the initialization
+	int64_t fileoff_limit; // fileoff can't exceed this; otherwise will behave as if EOF has occurred
+} j40__source_st;
+
+J40_STATIC J40__RETURNS_ERR j40__init_memory_source(
+	j40__st *st, uint8_t *buf, size_t size, j40_memory_free_func freefunc, j40__source_st *source
+);
+J40_STATIC J40__RETURNS_ERR j40__init_file_source(j40__st *st, const char *path, j40__source_st *source);
+J40_STATIC J40__RETURNS_ERR j40__try_read_from_source(
+	j40__st *st, uint8_t *buf, int64_t minsize, int64_t maxsize, int64_t *size
+);
+J40_STATIC J40__RETURNS_ERR j40__read_from_source(j40__st *st, uint8_t *buf, int64_t size);
+J40_STATIC J40__RETURNS_ERR j40__seek_from_source(j40__st *st, int64_t fileoff);
+J40_STATIC void j40__free_source(j40__source_st *source);
 
 #ifdef J40_IMPLEMENTATION
 
-J40_STATIC void j40__init_memory_source(
-	uint8_t *buf, size_t size, j40_memory_free_func freefunc, j40__source *s
-) {
-	s->checkpoint = s->buf = buf;
-	s->buf_free_func = freefunc;
-	s->size = s->capacity = size;
-	s->bytes_before_buf = 0;
-	s->read_func = NULL;
-	s->free_func = NULL;
-	s->data = NULL;
+J40_STATIC int j40__memory_source_read(uint8_t *buf, int64_t fileoff, size_t maxsize, size_t *size, void *data) {
+	uint8_t *mem = data;
+	memcpy(buf, mem + fileoff, maxsize);
+	*size = maxsize;
+	return 0;
 }
 
-J40_STATIC J40_RETURNS_ERR j40__file_source_read(uint8_t *buf, size_t maxsize, size_t *size, void *data) {
+J40_STATIC J40__RETURNS_ERR j40__init_memory_source(
+	j40__st *st, uint8_t *buf, size_t size, j40_memory_free_func freefunc, j40__source_st *source
+) {
+	J40__SHOULD(size <= (uint64_t) INT64_MAX, "over");
+	source->read_func = j40__memory_source_read;
+	source->seek_func = NULL;
+	source->free_func = freefunc;
+	source->data = buf;
+	source->fileoff = 0;
+	source->fileoff_limit = (int64_t) size;
+J40__ON_ERROR:
+	return st->err;
+}
+
+J40_STATIC int j40__file_source_read(uint8_t *buf, int64_t fileoff, size_t maxsize, size_t *size, void *data) {
 	FILE *fp = data;
-	size_t read = fread(buf, 1, maxsize, fp);
+	size_t read;
+
+	(void) fileoff;
+	read = fread(buf, 1, maxsize, fp);
 	if (read > 0) {
 		*size = read;
 		return 0;
@@ -851,8 +1106,25 @@ J40_STATIC J40_RETURNS_ERR j40__file_source_read(uint8_t *buf, size_t maxsize, s
 		*size = 0;
 		return 0;
 	} else {
-		return J40__4("read");
+		return 1;
 	}
+}
+
+J40_STATIC int j40__file_source_seek(int64_t fileoff, void *data) {
+	FILE *fp = data;
+	if (fileoff < 0) return 1;
+	if (fileoff <= LONG_MAX) {
+		if (fseek(fp, (long) fileoff, SEEK_SET) != 0) return 1;
+	} else {
+		if (fseek(fp, LONG_MAX, SEEK_SET) != 0) return 1;
+		fileoff -= LONG_MAX;
+		while (fileoff >= LONG_MAX) {
+			if (fseek(fp, LONG_MAX, SEEK_CUR) != 0) return 1;
+			fileoff -= LONG_MAX;
+		}
+		if (fseek(fp, (long) fileoff, SEEK_CUR) != 0) return 1;
+	}
+	return 0;
 }
 
 J40_STATIC void j40__file_source_free(void *data) {
@@ -860,21 +1132,26 @@ J40_STATIC void j40__file_source_free(void *data) {
 	fclose(fp);
 }
 
-J40_STATIC J40_RETURNS_ERR j40__init_file_source(j40__st *st, const char *path, size_t bufsize, j40__source *s) {
-	FILE *fp = fopen(path, "rb");
+J40_STATIC J40__RETURNS_ERR j40__init_file_source(j40__st *st, const char *path, j40__source_st *source) {
+	FILE *fp;
+	int saved_errno;
+	
+	saved_errno = errno;
+	errno = 0;
+	fp = fopen(path, "rb");
 	if (!fp) {
 		st->saved_errno = errno;
+		if (errno == 0) errno = saved_errno;
 		J40__RAISE("open");
 	}
+	errno = saved_errno;
 
-	J40__SHOULD(s->checkpoint = s->buf = malloc(bufsize), "!mem");
-	s->buf_free_func = free;
-	s->size = 0;
-	s->capacity = bufsize;
-	s->bytes_before_buf = 0;
-	s->read_func = j40__file_source_read;
-	s->free_func = j40__file_source_free;
-	s->data = fp;
+	source->read_func = j40__file_source_read;
+	source->seek_func = j40__file_source_seek;
+	source->free_func = j40__file_source_free;
+	source->data = fp;
+	source->fileoff = 0;
+	source->fileoff_limit = ((uint64_t) INT64_MAX < SIZE_MAX ? INT64_MAX : (int64_t) SIZE_MAX);
 	return 0;
 
 J40__ON_ERROR:
@@ -882,64 +1159,80 @@ J40__ON_ERROR:
 	return st->err;
 }
 
-J40_STATIC J40_RETURNS_ERR j40__refill_backing_buffer(j40__st *st) {
-	j40__source *source = st->source;
-	size_t committed_size, ptr_pos;
+J40_STATIC J40__RETURNS_ERR j40__try_read_from_source(
+	j40__st *st, uint8_t *buf, int64_t minsize, int64_t maxsize, int64_t *size
+) {
+	j40__source_st *source = st->source;
+	int64_t read_size = 0;
+	int saved_errno = errno;
+	errno = 0;
+	*size = 0;
 
-	if (!source->read_func) {
-		st->cannot_retry = 1;
-		return J40__ERR("shrt");
+	J40__ASSERT(0 <= minsize && minsize <= maxsize);
+	J40__ASSERT(0 <= source->fileoff && source->fileoff <= source->fileoff_limit);
+
+	// clamp maxsize if fileoff_limit is set
+	J40__ASSERT((uint64_t) source->fileoff_limit <= SIZE_MAX); // so maxsize fits in size_t
+	if (maxsize > source->fileoff_limit - source->fileoff) {
+		maxsize = source->fileoff_limit - source->fileoff;
+		J40__SHOULD(minsize <= maxsize, "shrt"); // `minsize` bytes can't be read due to virtual EOF
 	}
 
-	if (!st->ptr) { // initial state
-		source->checkpoint = st->ptr = source->buf;
-		st->remaining = 0;
-	}
-
-	J40__ASSERT(J40__INBOUNDS(st->ptr, source->buf, source->size));
-	J40__ASSERT(J40__INBOUNDS(source->checkpoint, source->buf, source->size));
-	J40__ASSERT(source->checkpoint <= st->ptr);
-
-	// trim the committed portion from the backing buffer
-	source->bytes_before_buf += committed_size = (size_t) (source->checkpoint - source->buf);
-	ptr_pos = (size_t) (st->ptr - source->checkpoint);
-	memmove(source->buf, source->checkpoint, source->size - committed_size);
-	source->checkpoint = source->buf;
-	source->size -= committed_size;
-	st->ptr = source->checkpoint + ptr_pos;
-
-	// if there is no room left in the backing buffer, it's time to grow it
-	if (source->size == source->capacity) {
-		size_t newcap = (source->capacity <= SIZE_MAX / 2 ? source->capacity * 2 : SIZE_MAX);
-		uint8_t *newbuf;
-		J40__SHOULD(newcap < source->capacity, "!mem");
-		newbuf = realloc(source->buf, newcap);
-		J40__SHOULD(newbuf, "!mem");
-		source->checkpoint = source->buf = newbuf;
-		source->capacity = newcap;
-		st->ptr = source->checkpoint + ptr_pos;
-	}
-
-	while (source->size < source->capacity) {
+	while (read_size < maxsize) {
 		size_t added_size;
-		st->err = source->read_func(
-			source->buf + source->size, source->capacity - source->size, &added_size, source->data);
-		J40__RAISE_DELAYED();
+		if (J40_UNLIKELY(source->read_func(
+			buf + read_size, source->fileoff, (size_t) (maxsize - read_size), &added_size, source->data
+		))) {
+			st->saved_errno = errno;
+			if (errno == 0) errno = saved_errno;
+			J40__RAISE("read");
+		}
 		if (added_size == 0) break; // EOF or blocking condition
-		source->size += added_size;
+		J40__SHOULD(added_size <= (uint64_t) INT64_MAX, "over");
+		read_size += (int64_t) added_size;
+		J40__SHOULD(j40__add64(source->fileoff, (int64_t) read_size, &source->fileoff), "over");
 	}
 
+	J40__SHOULD(read_size >= minsize, "shrt");
+	errno = saved_errno;
+	*size = read_size;
 J40__ON_ERROR:
 	return st->err;
 }
 
-J40_STATIC void j40__free_source(j40__source *s) {
-	if (s->buf_free_func) s->buf_free_func(s->buf);
-	if (s->free_func) s->free_func(s->data);
-	s->buf = NULL;
-	s->buf_free_func = NULL;
-	s->read_func = NULL;
-	s->free_func = NULL;
+J40_STATIC J40__RETURNS_ERR j40__read_from_source(j40__st *st, uint8_t *buf, int64_t size) {
+	int64_t read_size;
+	return j40__try_read_from_source(st, buf, size, size, &read_size);
+}
+
+J40_STATIC J40__RETURNS_ERR j40__seek_from_source(j40__st *st, int64_t fileoff) {
+	j40__source_st *source = st->source;
+	int saved_errno;
+
+	J40__ASSERT(fileoff >= 0);
+	if (fileoff == source->fileoff) return 0;
+
+	saved_errno = errno;
+	errno = 0;
+
+	if (J40_UNLIKELY(source->seek_func(fileoff, source->data))) {
+		st->saved_errno = errno;
+		if (errno == 0) errno = saved_errno;
+		J40__RAISE("seek");
+	}
+
+	source->fileoff = fileoff;
+	errno = saved_errno;
+J40__ON_ERROR:
+	return st->err;
+}
+
+J40_STATIC void j40__free_source(j40__source_st *source) {
+	if (source->free_func) source->free_func(source->data);
+	source->read_func = NULL;
+	source->seek_func = NULL;
+	source->free_func = NULL;
+	source->data = NULL;
 }
 
 #endif // defined J40_IMPLEMENTATION
@@ -947,12 +1240,9 @@ J40_STATIC void j40__free_source(j40__source *s) {
 ////////////////////////////////////////////////////////////////////////////////
 // container
 
-typedef struct j40__container_st {
-	// the remaining number of bytes in the current box with respect to the reference point,
-	// which is `ptr + remaining` in the codestream mode and `ptr` in the container mode.
-	// this can be also `UINT64_MAX` in which case this box extends to the end of the file.
-	uint64_t box_remaining;
+typedef struct { int64_t codeoff, fileoff; } j40__map;
 
+typedef struct j40__container_st {
 	enum {
 		// if set, initial jxl & ftyp boxes have been read
 		J40__CONTAINER_CONFIRMED = 1 << 0,
@@ -963,66 +1253,79 @@ typedef struct j40__container_st {
 		J40__SEEN_JXLC = 1 << 3, // precludes jxlp, at most once
 		J40__SEEN_JXLP = 1 << 4, // precludes jxlc
 
-		// if set, no more jxlc/jxlp boxes are allowed
+		// if set, no more jxlc/jxlp boxes are allowed (and map no longer changes)
 		J40__NO_MORE_CODESTREAM_BOX = 1 << 5,
+
+		// if set, there is an implied entry for `map[nmap]`. this is required when the last
+		// codestream box has an unknown length and thus it extends to the (unknown) end of file.
+		J40__IMPLIED_LAST_MAP_ENTRY = 1 << 6,
+
+		// if set, there is no more box past `map[nmap-1]` (or an implied `map[nmap]` if any)
+		J40__NO_MORE_BOX = 1 << 7,
 	} flags;
 
-	// only applicable after J40__CONTAINER_CONFIRMED is set
-	enum {
-		J40__BOX_HEADER = 0,
-		J40__CODESTREAM_BOX = 1, // box contents of jxlc/jxlp
-		J40__NON_CODESTREAM_BOX = 2, // box contents of everything else
-	} next;
+	// map[0..nmap) encodes two arrays C[i] = map[i].codeoff and F[i] = map[i].fileoff,
+	// so that codestream offsets [C[k], C[k+1]) map to file offsets [F[k], F[k] + (C[k+1] - C[k])).
+	// all codestream offsets less than the largest C[i] are 1-to-1 mapped to file offsets.
+	//
+	// the last entry, in particular F[nmap-1], has multiple interpretations.
+	// if the mapping is still being built, F[nmap-1] is the start of the next box to be read.
+	// if an implicit map entry flag is set, F[nmap] = L and C[nmap] = C[nmap-1] + (L - F[nmap-1])
+	// where L is the file length (which is not directly available).
+	j40__map *map;
+	int32_t nmap, map_cap;
 } j40__container_st;
 
-J40_STATIC J40_RETURNS_ERR j40__container(j40__st *st);
+J40_ALWAYS_INLINE uint32_t j40__u32be(uint8_t *p);
+J40_STATIC J40__RETURNS_ERR j40__box_header(j40__st *st, uint32_t *type, int64_t *size);
+J40_STATIC J40__RETURNS_ERR j40__container(j40__st *st, int64_t wanted_codeoff);
+J40_STATIC int32_t j40__search_codestream_offset(const j40__st *st, int64_t codeoff);
+J40_STATIC J40__RETURNS_ERR j40__map_codestream_offset(j40__st *st, int64_t codeoff, int64_t *fileoff);
+J40_STATIC void j40__free_container(j40__container_st *container);
 
 #ifdef J40_IMPLEMENTATION
 
-J40_STATIC J40_RETURNS_ERR j40__container_u32(j40__st *st, uint32_t *v) {
-	J40__SHOULD(st->remaining >= 4, "shrt");
-	*v = ((uint32_t) st->ptr[0] << 24) | ((uint32_t) st->ptr[1] << 16) | ((uint32_t) st->ptr[2] << 8) | (uint32_t) st->ptr[3];
-	st->ptr += 4;
-	st->remaining -= 4;
-J40__ON_ERROR:
-	return st->err;
+J40_ALWAYS_INLINE uint32_t j40__u32be(uint8_t *p) {
+	return ((uint32_t) p[0] << 24) | ((uint32_t) p[1] << 16) | ((uint32_t) p[2] << 8) | (uint32_t) p[3];
 }
 
-// size is UINT64_MAX if the box extends indefinitely until the end of file
-J40_STATIC J40_RETURNS_ERR j40__box_header(j40__st *st, uint32_t *type, int *brotli, uint64_t *size) {
+// size is < 0 if EOF, or INT64_MAX if the box extends indefinitely until the end of file
+J40_STATIC J40__RETURNS_ERR j40__box_header(j40__st *st, uint32_t *type, int64_t *size) {
+	uint8_t buf[8];
 	uint32_t size32;
+	uint64_t size64;
+	int64_t headersize;
 
-	J40__TRY(j40__container_u32(st, &size32));
-	J40__TRY(j40__container_u32(st, type));
+	J40__TRY(j40__try_read_from_source(st, buf, 0, 8, &headersize));
+	if (headersize == 0) {
+		*size = -1;
+		return 0;
+	}
+	J40__SHOULD(headersize == 8, "shrt"); // if not EOF, the full header should have been read
+
+	size32 = j40__u32be(buf);
+	*type = j40__u32be(buf + 4);
 	if (size32 == 0) {
-		*size = UINT64_MAX;
+		*size = INT64_MAX;
 	} else if (size32 == 1) {
-		uint32_t sizehi, sizelo;
-		J40__TRY(j40__container_u32(st, &sizehi));
-		J40__TRY(j40__container_u32(st, &sizelo));
-		*size = ((uint64_t) sizehi << 32) | (uint64_t) sizelo;
-		J40__SHOULD(*size >= 16, "boxx");
-		*size -= 16;
-		J40__SHOULD(st->remaining >= *size, "shrt");
+		J40__TRY(j40__read_from_source(st, buf, 8));
+		size64 = ((uint64_t) j40__u32be(buf) << 32) | (uint64_t) j40__u32be(buf + 4);
+		J40__SHOULD(size64 >= 16, "boxx");
+		J40__SHOULD(size64 <= INT64_MAX, "over");
+		*size = (int64_t) size64 - 16;
 	} else {
 		J40__SHOULD(size32 >= 8, "boxx");
-		*size = size32 - 8;
-		J40__SHOULD(st->remaining >= *size, "shrt");
-	}
-
-	*brotli = (*type == 0x62726f62 /*brob*/);
-	if (*brotli) {
-		J40__SHOULD(*size > 4, "brot"); // Brotli stream is never empty so 4 is also out
-		J40__TRY(j40__container_u32(st, type));
-		J40__SHOULD(*type != 0x62726f62 /*brob*/ && (*type >> 8) != 0x6a786c /*jxl*/, "brot");
-		if (*size != UINT64_MAX) *size -= 4;
+		*size = (int64_t) size32 - 8;
 	}
 
 J40__ON_ERROR:
 	return st->err;
 }
 
-J40_STATIC J40_RETURNS_ERR j40__container(j40__st *st) {
+// scans as many boxes as required to map given codestream offset (i.e. the inclusive limit).
+// this is done in the best effort basis, so even after this
+// `j40__map_codestream_offset(st, wanted_codeoff)` may still fail.
+J40_STATIC J40__RETURNS_ERR j40__container(j40__st *st, int64_t wanted_codeoff) {
 	static const uint8_t JXL_BOX[12] = { // type `JXL `, value 0D 0A 87 0A
 		0x00, 0x00, 0x00, 0x0c, 0x4a, 0x58, 0x4c, 0x20, 0x0d, 0x0a, 0x87, 0x0a,
 	}, FTYP_BOX[20] = { // type `ftyp`, brand `jxl `, version 0, only compatible w/ brand `jxl `
@@ -1030,137 +1333,351 @@ J40_STATIC J40_RETURNS_ERR j40__container(j40__st *st) {
 		0x00, 0x00, 0x00, 0x00, 0x6a, 0x78, 0x6c, 0x20,
 	};
 
-	j40__source *source = st->source;
-	j40__container_st *container = st->container;
+	j40__source_st *source = st->source;
+	j40__container_st *c = st->container;
+	uint8_t buf[32];
 
-	// ensure that we came here because the logical buffer has been exhausted...
-	J40__ASSERT(st->remaining == 0);
-	// ...because in the container mode the logical buffer may have to hold multiple boxes
-	J40__ASSERT(J40__INBOUNDS(st->ptr, source->buf, source->size));
-	st->remaining = source->size - (size_t) (st->ptr - source->buf);
-
-	if (!(container->flags & J40__CONTAINER_CONFIRMED)) {
-		// format identification, which should work correctly even with a partial input!
-		J40__SHOULD(st->remaining > 0, "shrt");
-		if (st->ptr[0] == 0xff) return 0; // a bare codestream
-		if (st->remaining < sizeof(JXL_BOX)) {
-			// should be a partial container input, otherwise this file stands no chance
-			J40__SHOULD(memcmp(st->ptr, JXL_BOX, st->remaining) == 0, "!jxl");
-			J40__RAISE("shrt");
-		}
-
-		J40__SHOULD(memcmp(st->ptr, JXL_BOX, sizeof(JXL_BOX)) == 0, "!jxl");
-		st->ptr += sizeof(JXL_BOX);
-		st->remaining -= sizeof(JXL_BOX);
-		J40__SHOULD(st->remaining >= sizeof(FTYP_BOX), "shrt");
-		J40__SHOULD(memcmp(st->ptr, FTYP_BOX, sizeof(FTYP_BOX)) == 0, "ftyp");
-		st->ptr += sizeof(FTYP_BOX);
-		st->remaining -= sizeof(FTYP_BOX);
-
-		source->checkpoint = st->ptr;
-		container->flags |= J40__CONTAINER_CONFIRMED;
+	if (!c->map) {
+		c->map_cap = 8;
+		c->nmap = 1;
+		J40__SHOULD(c->map = j40__malloc(sizeof(j40__map) * (size_t) c->map_cap), "!mem");
+		c->map[0].codeoff = c->map[0].fileoff = 0; // fileoff will be updated
 	}
 
-	while (st->remaining > 0) {
-		if (container->next == J40__BOX_HEADER) {
-			uint32_t type;
-			int brotli;
-			uint64_t size;
-			unsigned new_flags = 0;
+	// immediately return if given codeoff is already mappable
+	if (c->flags & J40__IMPLIED_LAST_MAP_ENTRY) return 0;
+	if (wanted_codeoff < c->map[c->nmap - 1].codeoff) return 0;
 
-			J40__TRY(j40__box_header(st, &type, &brotli, &size));
+	// read the file header (if not yet read) and skip to the next box header
+	if (c->flags & J40__CONTAINER_CONFIRMED) {
+		J40__TRY(j40__seek_from_source(st, c->map[c->nmap - 1].fileoff));
+	} else {
+		J40__TRY(j40__seek_from_source(st, 0));
 
-			// TODO the ordering rule for jxll/jxli may change in the future version of 18181-2
-			switch (type) {
-			case 0x6a786c6c: // jxll: codestream level
-				J40__SHOULD(!(container->flags & J40__SEEN_JXLL), "box?");
-				new_flags = J40__SEEN_JXLL;
-				break;
-
-			case 0x6a786c69: // jxli: frame index
-				J40__SHOULD(!(container->flags & J40__SEEN_JXLI), "box?");
-				new_flags = J40__SEEN_JXLI;
-				break;
-
-			case 0x6a786c63: // jxlc: single codestream
-				J40__ASSERT(!brotli);
-				J40__SHOULD(!(container->flags & J40__NO_MORE_CODESTREAM_BOX), "box?");
-				J40__SHOULD(!(container->flags & (J40__SEEN_JXLP | J40__SEEN_JXLC)), "box?");
-				new_flags = J40__SEEN_JXLC;
-				break;
-
-			case 0x6a786c70: // jxlp: partial codestreams
-				J40__ASSERT(!brotli);
-				J40__SHOULD(!(container->flags & J40__NO_MORE_CODESTREAM_BOX), "box?");
-				J40__SHOULD(!(container->flags & J40__SEEN_JXLC), "box?");
-				new_flags = J40__SEEN_JXLP;
-				J40__SHOULD(size >= 4, "jxlp");
-				J40__SHOULD(st->remaining >= 4, "shrt");
-				// TODO the partial codestream index is ignored right now
-				if (!(st->ptr[0] >> 7)) new_flags |= J40__NO_MORE_CODESTREAM_BOX;
-				st->ptr += 4;
-				st->remaining -= 4;
-				if (size < SIZE_MAX) size -= 4;
-				break;
-			} // other boxes have no additional requirements and are simply skipped
-
-			container->flags |= new_flags;
-			if (new_flags & (J40__SEEN_JXLP | J40__SEEN_JXLC)) {
-				container->next = J40__CODESTREAM_BOX;
-			} else {
-				container->next = J40__NON_CODESTREAM_BOX;
-			}
-			container->box_remaining = size;
-			source->checkpoint = st->ptr;
-		}
-
-		J40__ASSERT(container->next != J40__BOX_HEADER);
-		if (container->next == J40__CODESTREAM_BOX) {
-			// immediately switch to the codestream mode and resume parsing
-			if (st->remaining > container->box_remaining) st->remaining = container->box_remaining;
-			if (container->box_remaining < SIZE_MAX) {
-				container->box_remaining -= st->remaining;
-				if (container->box_remaining == 0) container->next = J40__BOX_HEADER;
-			}
+		J40__TRY(j40__read_from_source(st, buf, 2));
+		if (buf[0] == 0xff && buf[1] == 0x0a) { // bare codestream
+			c->flags = J40__CONTAINER_CONFIRMED | J40__IMPLIED_LAST_MAP_ENTRY;
 			return 0;
-		} else {
-			// try to skip the whole box (and even if it's not possible, commit as much as possible)
-			size_t skipsize = st->remaining;
-			if (skipsize > container->box_remaining) skipsize = container->box_remaining;
-			source->checkpoint = st->ptr += skipsize;
-			st->remaining -= skipsize;
-			if (container->box_remaining < SIZE_MAX) {
-				container->box_remaining -= skipsize;
-				J40__SHOULD(container->box_remaining == 0, "shrt");
-				container->next = J40__BOX_HEADER;
-			}
 		}
+
+		J40__SHOULD(buf[0] == JXL_BOX[0] && buf[1] == JXL_BOX[1], "!jxl");
+		J40__TRY(j40__read_from_source(st, buf, sizeof(JXL_BOX) + sizeof(FTYP_BOX) - 2));
+		J40__SHOULD(memcmp(buf, JXL_BOX + 2, sizeof(JXL_BOX) - 2) == 0, "!jxl");
+		J40__SHOULD(memcmp(buf + (sizeof(JXL_BOX) - 2), FTYP_BOX, sizeof(FTYP_BOX)) == 0, "ftyp");
+		c->flags |= J40__CONTAINER_CONFIRMED;
+		c->map[0].fileoff = source->fileoff;
 	}
 
-	J40__SHOULD(container->flags & J40__NO_MORE_CODESTREAM_BOX, "shrt");
+	while (wanted_codeoff >= c->map[c->nmap - 1].codeoff) {
+		uint32_t type;
+		int64_t size;
+		int codestream_box = 0;
+
+		J40__TRY(j40__box_header(st, &type, &size));
+		if (size < 0) break;
+
+		// TODO the ordering rule for jxll/jxli may change in the future version of 18181-2
+		switch (type) {
+		case 0x6a786c6c: // jxll: codestream level
+			J40__SHOULD(!(c->flags & J40__SEEN_JXLL), "box?");
+			c->flags |= J40__SEEN_JXLL;
+			break;
+
+		case 0x6a786c69: // jxli: frame index
+			J40__SHOULD(!(c->flags & J40__SEEN_JXLI), "box?");
+			c->flags |= J40__SEEN_JXLI;
+			break;
+
+		case 0x6a786c63: // jxlc: single codestream
+			J40__SHOULD(!(c->flags & J40__NO_MORE_CODESTREAM_BOX), "box?");
+			J40__SHOULD(!(c->flags & (J40__SEEN_JXLP | J40__SEEN_JXLC)), "box?");
+			c->flags |= J40__SEEN_JXLC | J40__NO_MORE_CODESTREAM_BOX;
+			codestream_box = 1;
+			break;
+
+		case 0x6a786c70: // jxlp: partial codestreams
+			J40__SHOULD(!(c->flags & J40__NO_MORE_CODESTREAM_BOX), "box?");
+			J40__SHOULD(!(c->flags & J40__SEEN_JXLC), "box?");
+			c->flags |= J40__SEEN_JXLP;
+			codestream_box = 1;
+			J40__SHOULD(size >= 4, "jxlp");
+			J40__TRY(j40__read_from_source(st, buf, 4));
+			// TODO the partial codestream index is ignored right now
+			if (!(buf[0] >> 7)) c->flags |= J40__NO_MORE_CODESTREAM_BOX;
+			if (size < INT64_MAX) size -= 4;
+			break;
+
+		case 0x62726f62: // brob: brotli-compressed box
+			J40__SHOULD(size > 4, "brot"); // Brotli stream is never empty so 4 is also out
+			J40__TRY(j40__read_from_source(st, buf, 4));
+			type = j40__u32be(buf);
+			J40__SHOULD(type != 0x62726f62 /*brob*/ && (type >> 8) != 0x6a786c /*jxl*/, "brot");
+			if (size < INT64_MAX) size -= 4;
+			break;
+		} // other boxes have no additional requirements and are simply skipped
+
+		// this box has an indeterminate size and thus there is no more box following
+		if (size == INT64_MAX) {
+			if (codestream_box) c->flags |= J40__IMPLIED_LAST_MAP_ENTRY;
+			c->flags |= J40__NO_MORE_BOX;
+			break;
+		}
+
+		if (codestream_box) {
+			// add a new entry. at this point C[nmap-1] is the first codestream offset in this box
+			// and F[nmap-1] points to the beginning of this box, which should be updated to
+			// the beginning of the box *contents*.
+			J40__TRY_REALLOC32(&c->map, c->nmap + 1, &c->map_cap);
+			c->map[c->nmap - 1].fileoff = source->fileoff;
+			J40__SHOULD(j40__add64(c->map[c->nmap - 1].codeoff, size, &c->map[c->nmap].codeoff), "over");
+			// F[nmap] gets updated in the common case.
+			J40__SHOULD(j40__add32(c->nmap, 1, &c->nmap), "over");
+		}
+
+		// always maintains F[nmap-1] to be the beginning of the next box (and seek to that point).
+		// we've already read the previous box header, so this should happen even if seek fails.
+		J40__SHOULD(j40__add64(source->fileoff, size, &c->map[c->nmap - 1].fileoff), "over");
+		J40__TRY(j40__seek_from_source(st, c->map[c->nmap - 1].fileoff));
+	}
+
+	// now the EOF has been reached or the last box had an indeterminate size.
+	// EOF condition can be recovered (i.e. we can add more boxes to get it correctly decoded)
+	// so it's not a hard error, but we can't recover from an indeterminately sized box.
+	if ((c->flags & J40__NO_MORE_BOX) && !(c->flags & (J40__SEEN_JXLC | J40__SEEN_JXLP))) {
+		st->cannot_retry = 1;
+		J40__RAISE("shrt");
+	}
 
 J40__ON_ERROR:
 	return st->err;
 }
 
-// TODO j40__finish_container
+// returns i such that codeoff is in [C[i], C[i+1]), or nmap-1 if there is no such map entry
+J40_STATIC int32_t j40__search_codestream_offset(const j40__st *st, int64_t codeoff) {
+	j40__map *map = st->container->map;
+	int32_t nmap = st->container->nmap, i;
+	J40__ASSERT(map && nmap > 0);
+	// TODO use a binary search instead
+	for (i = 1; i < nmap; ++i) {
+		if (codeoff < map[i].codeoff) break;
+	}
+	return i - 1;
+}
+
+J40_STATIC J40__RETURNS_ERR j40__map_codestream_offset(j40__st *st, int64_t codeoff, int64_t *fileoff) {
+	j40__map *map = st->container->map;
+	int32_t nmap = st->container->nmap, i;
+
+	i = j40__search_codestream_offset(st, codeoff);
+	if (i < nmap - 1) {
+		J40__ASSERT(codeoff - map[i].codeoff < map[i+1].fileoff - map[i].fileoff);
+		*fileoff = map[i].fileoff + (codeoff - map[i].codeoff); // thus this never overflows
+	} else if (st->container->flags & J40__IMPLIED_LAST_MAP_ENTRY) {
+		J40__SHOULD(j40__add64(map[nmap-1].fileoff, codeoff - map[nmap-1].codeoff, fileoff), "over");
+	} else if (st->container->flags & J40__NO_MORE_CODESTREAM_BOX) {
+		// TODO is this valid to do? j40__end_of_frame depends on this.
+		if (codeoff == map[nmap-1].codeoff) {
+			*fileoff = map[nmap-1].fileoff;
+		} else {
+			st->cannot_retry = 1;
+			J40__RAISE("shrt");
+		}
+	} else {
+		J40__RAISE("shrt");
+	}
+
+J40__ON_ERROR:
+	return st->err;
+}
+
+J40_STATIC void j40__free_container(j40__container_st *container) {
+	j40__free(container->map);
+	container->map = NULL;
+	container->nmap = container->map_cap = 0;
+}
+
+#endif // defined J40_IMPLEMENTATION
+
+////////////////////////////////////////////////////////////////////////////////
+// backing buffer
+
+typedef struct j40__buffer_st {
+	uint8_t *buf;
+	int64_t size, capacity;
+
+	int64_t next_codeoff; // the codestream offset right past the backing buffer (i.e. `buf[size]`)
+	int64_t codeoff_limit; // codestream offset can't exceed this; used for per-section decoding
+
+	j40__bits_st checkpoint; // the earliest point that the parser can ever backtrack
+} j40__buffer_st;
+
+J40_STATIC J40__RETURNS_ERR j40__init_buffer(j40__st *st, int64_t codeoff, int64_t codeoff_limit);
+J40_STATIC J40__RETURNS_ERR j40__refill_buffer(j40__st *st);
+J40_STATIC J40__RETURNS_ERR j40__seek_buffer(j40__st *st, int64_t codeoff);
+J40_STATIC int64_t j40__codestream_offset(const j40__st *st);
+J40_STATIC int64_t j40__bits_read(const j40__st *st);
+J40_STATIC void j40__free_buffer(j40__buffer_st *buffer);
+
+#ifdef J40_IMPLEMENTATION
+
+#define J40__INITIAL_BUFSIZE 0x10000
+
+J40_STATIC J40__RETURNS_ERR j40__init_buffer(j40__st *st, int64_t codeoff, int64_t codeoff_limit) {
+	j40__bits_st *bits = &st->bits, *checkpoint = &st->buffer->checkpoint;
+	j40__buffer_st *buffer = st->buffer;
+
+	J40__ASSERT(!buffer->buf);
+	J40__SHOULD(bits->ptr = bits->end = buffer->buf = j40__malloc(J40__INITIAL_BUFSIZE), "!mem");
+	buffer->size = 0;
+	buffer->capacity = J40__INITIAL_BUFSIZE;
+	buffer->next_codeoff = codeoff;
+	buffer->codeoff_limit = codeoff_limit;
+	bits->bits = 0;
+	bits->nbits = 0;
+	*checkpoint = *bits;
+J40__ON_ERROR:
+	return st->err;
+}
+
+J40_STATIC J40__RETURNS_ERR j40__refill_buffer(j40__st *st) {
+	j40__bits_st *bits = &st->bits, *checkpoint = &st->buffer->checkpoint;
+	j40__buffer_st *buffer = st->buffer;
+	j40__container_st *container = st->container;
+	int64_t available, wanted_codeoff;
+	int32_t i;
+
+	J40__ASSERT(J40__INBOUNDS(bits->ptr, buffer->buf, buffer->size));
+	J40__ASSERT(J40__INBOUNDS(checkpoint->ptr, buffer->buf, buffer->size));
+	J40__ASSERT(checkpoint->ptr <= bits->ptr);
+
+	// trim the committed portion from the backing buffer
+	if (checkpoint->ptr > buffer->buf) {
+		int64_t committed_size = (int64_t) (checkpoint->ptr - buffer->buf);
+		J40__ASSERT(committed_size <= buffer->size); // so committed_size can't overflow
+		// this also can't overflow, because buffer->size never exceeds SIZE_MAX
+		memmove(buffer->buf, checkpoint->ptr, (size_t) (buffer->size - committed_size));
+		buffer->size -= committed_size;
+		bits->ptr -= committed_size;
+		checkpoint->ptr = buffer->buf;
+	}
+
+	// if there is no room left in the backing buffer, it's time to grow it
+	if (buffer->size == buffer->capacity) {
+		int64_t newcap = j40__clamp_add64(buffer->capacity, buffer->capacity);
+		ptrdiff_t relptr = bits->ptr - buffer->buf;
+		J40__TRY_REALLOC64(&buffer->buf, newcap, &buffer->capacity);
+		bits->ptr = buffer->buf + relptr;
+		checkpoint->ptr = buffer->buf;
+	}
+
+	wanted_codeoff = j40__min64(buffer->codeoff_limit,
+		j40__clamp_add64(buffer->next_codeoff, buffer->capacity - buffer->size));
+	available = wanted_codeoff - buffer->next_codeoff;
+	--wanted_codeoff; // ensure that this is inclusive, i.e. the last byte offset *allowed*
+
+	// do the initial mapping if no map is available
+	if (!container->map) J40__TRY(j40__container(st, wanted_codeoff));
+
+	i = j40__search_codestream_offset(st, buffer->next_codeoff);
+	while (available > 0) {
+		j40__map *map = container->map;
+		int32_t nmap = container->nmap;
+		int64_t fileoff, readable_size, read_size;
+
+		if (i < nmap - 1) {
+			int64_t box_size = map[i+1].codeoff - map[i].codeoff;
+			J40__ASSERT(box_size > 0);
+			readable_size = j40__min64(available, map[i+1].codeoff - buffer->next_codeoff);
+			J40__ASSERT(buffer->next_codeoff - map[i].codeoff < map[i+1].fileoff - map[i].fileoff);
+			fileoff = map[i].fileoff + (buffer->next_codeoff - map[i].codeoff); // thus can't overflow
+		} else if (container->flags & J40__IMPLIED_LAST_MAP_ENTRY) {
+			readable_size = available;
+			J40__SHOULD(
+				j40__add64(map[i].fileoff, buffer->next_codeoff - map[nmap-1].codeoff, &fileoff),
+				"over");
+		} else {
+			// we have reached past the last mapped box, but there may be more boxes to map
+			J40__TRY(j40__container(st, wanted_codeoff));
+			if (nmap == container->nmap && !(container->flags & J40__IMPLIED_LAST_MAP_ENTRY)) {
+				break; // no additional box mapped, nothing can be done
+			}
+			continue;
+		}
+		J40__ASSERT(readable_size > 0);
+
+		J40__TRY(j40__seek_from_source(st, fileoff));
+		J40__TRY(j40__try_read_from_source(st, buffer->buf + buffer->size, 0, readable_size, &read_size));
+		if (read_size == 0) break; // EOF or blocking condition, can't continue
+
+		buffer->size += read_size;
+		J40__SHOULD(j40__add64(buffer->next_codeoff, read_size, &buffer->next_codeoff), "over");
+		bits->end = checkpoint->end = buffer->buf + buffer->size;
+		available -= read_size;
+		if (read_size == readable_size) ++i; // try again if read is somehow incomplete
+	}
+
+J40__ON_ERROR:
+	return st->err;
+}
+
+J40_STATIC J40__RETURNS_ERR j40__seek_buffer(j40__st *st, int64_t codeoff) {
+	int64_t reusable_size = st->buffer->next_codeoff - codeoff, fileoff;
+	st->bits.bits = 0;
+	st->bits.nbits = 0;
+	if (0 < reusable_size && reusable_size <= st->buffer->size) {
+		st->bits.ptr = st->buffer->buf + (st->buffer->size - reusable_size);
+		st->bits.end = st->buffer->buf + st->buffer->size;
+	} else {
+		st->bits.ptr = st->bits.end = st->buffer->buf;
+		st->buffer->size = 0;
+		st->buffer->next_codeoff = codeoff;
+		J40__TRY(j40__map_codestream_offset(st, codeoff, &fileoff));
+		J40__TRY(j40__seek_from_source(st, fileoff));
+	}
+J40__ON_ERROR:
+	return st->err;
+}
+
+J40_STATIC int64_t j40__codestream_offset(const j40__st *st) {
+	J40__ASSERT(st->bits.nbits % 8 == 0);
+	return st->buffer->next_codeoff - st->buffer->size + (st->bits.ptr - st->buffer->buf) - st->bits.nbits / 8;
+}
+
+// diagnostic only, doesn't check for overflow or anything
+J40_STATIC int64_t j40__bits_read(const j40__st *st) {
+	int32_t nbytes = j40__ceil_div32(st->bits.nbits, 8), nbits = 8 * nbytes - st->bits.nbits;
+	// the codestream offset for the byte that contains the first bit to read
+	int64_t codeoff = st->buffer->next_codeoff - st->buffer->size + (st->bits.ptr - st->buffer->buf) - nbytes;
+	j40__map map = st->container->map[j40__search_codestream_offset(st, codeoff)];
+	return (map.fileoff + (codeoff - map.codeoff)) * 8 + nbits;
+}
+
+J40_STATIC void j40__free_buffer(j40__buffer_st *buffer) {
+	j40__free(buffer->buf);
+	buffer->buf = NULL;
+	buffer->size = buffer->capacity = 0;
+}
 
 #endif // defined J40_IMPLEMENTATION
 
 ////////////////////////////////////////////////////////////////////////////////
 // bitstream
 
-J40_STATIC size_t j40__bits_read(const j40__st *st);
+J40_STATIC J40__RETURNS_ERR j40__always_refill(j40__st *st, int32_t n);
+// ensure st->bits.nbits is at least n; otherwise pull as many bytes as possible into st->bits.bits
+#define j40__refill(st, n) (J40_UNLIKELY(st->bits.nbits < (n)) ? j40__always_refill(st, n) : st->err)
 
-J40_STATIC J40_RETURNS_ERR j40__always_refill(j40__st *st, int32_t n);
-// ensure st->nbits is at least n; otherwise pull as many bytes as possible into st->bits
-#define j40__refill(st, n) (J40_UNLIKELY(st->nbits < (n)) ? j40__always_refill(st, n) : st->err)
-
-J40_INLINE J40_RETURNS_ERR j40__zero_pad_to_byte(j40__st *st);
-J40_STATIC J40_RETURNS_ERR j40__skip(j40__st *st, uint64_t n);
+J40_INLINE J40__RETURNS_ERR j40__zero_pad_to_byte(j40__st *st);
+J40_STATIC J40__RETURNS_ERR j40__skip(j40__st *st, int64_t n);
 
 J40_INLINE int32_t j40__u(j40__st *st, int32_t n);
+J40_INLINE int64_t j40__64u(j40__st *st, int32_t n);
 J40_INLINE int32_t j40__u32(
+	j40__st *st,
+	int32_t o0, int32_t n0, int32_t o1, int32_t n1,
+	int32_t o2, int32_t n2, int32_t o3, int32_t n3
+);
+J40_INLINE int64_t j40__64u32(
 	j40__st *st,
 	int32_t o0, int32_t n0, int32_t o1, int32_t n1,
 	int32_t o2, int32_t n2, int32_t o3, int32_t n3
@@ -1171,84 +1688,92 @@ J40_INLINE float j40__f16(j40__st *st);
 J40_STATIC uint64_t j40__varint(j40__st *st);
 J40_INLINE int32_t j40__u8(j40__st *st);
 J40_INLINE int32_t j40__at_most(j40__st *st, int32_t max);
+J40_STATIC J40__RETURNS_ERR j40__no_more_bytes(j40__st *st);
 
 #ifdef J40_IMPLEMENTATION
 
-J40_STATIC size_t j40__bits_read(const j40__st *st) {
-	return (st->source->bytes_before_buf + (size_t) (st->ptr - st->source->buf)) * 8 - (size_t) st->nbits;
-}
+J40_STATIC J40__RETURNS_ERR j40__always_refill(j40__st *st, int32_t n) {
+	static const int32_t NBITS = 64;
+	j40__bits_st *bits = &st->bits;
 
-J40_STATIC J40_RETURNS_ERR j40__always_refill(j40__st *st, int32_t n) {
-	J40__ASSERT(0 <= n && n <= 31);
-	do {
-		size_t consumed = (size_t) ((32 - st->nbits) >> 3);
-		if (st->remaining < consumed) {
-			while (st->remaining > 0) {
-				st->bits |= (uint32_t) *st->ptr++ << st->nbits;
-				st->nbits += 8;
-				--st->remaining;
-			}
-			if (st->nbits < n) {
-				J40__SHOULD(st->container, "shrt");
-				J40__SHOULD(!(st->container->flags & J40__NO_MORE_CODESTREAM_BOX), "shrt");
-				J40__TRY(j40__container(st));
-				continue; // now we have possibly more bits to refill, try again
-			}
-		} else {
-			st->remaining -= consumed;
-			J40__ASSERT(st->nbits <= 24);
+	J40__ASSERT(0 <= n && n < NBITS);
+	while (1) {
+		int32_t consumed = (NBITS - bits->nbits) >> 3;
+		if (J40_LIKELY(bits->end - bits->ptr >= consumed)) {
+			// fast case: consume `consumed` bytes from the logical buffer
+			J40__ASSERT(bits->nbits <= NBITS - 8);
 			do {
-				st->bits |= (uint32_t) *st->ptr++ << st->nbits;
-				st->nbits += 8;
-			} while (st->nbits <= 24);
+				bits->bits |= (uint64_t) *bits->ptr++ << bits->nbits;
+				bits->nbits += 8;
+			} while (bits->nbits <= NBITS - 8);
+			break;
 		}
-	} while (0);
+
+		// slow case: the logical buffer has been exhausted, try to refill the backing buffer
+		while (bits->ptr < bits->end) {
+			bits->bits |= (uint64_t) *bits->ptr++ << bits->nbits;
+			bits->nbits += 8;
+		}
+		if (bits->nbits >= n) break;
+		J40__SHOULD(st->buffer, "shrt");
+		J40__TRY(j40__refill_buffer(st));
+		// now we have possibly more bits to refill, try again
+	}
+
 J40__ON_ERROR:
 	return st->err;
 }
 
-J40_INLINE J40_RETURNS_ERR j40__zero_pad_to_byte(j40__st *st) {
-	int32_t n = st->nbits & 7;
-	if (st->bits & ((1u << n) - 1)) return J40__ERR("pad0");
-	st->bits >>= n;
-	st->nbits -= n;
+J40_INLINE J40__RETURNS_ERR j40__zero_pad_to_byte(j40__st *st) {
+	int32_t n = st->bits.nbits & 7;
+	if (st->bits.bits & ((1u << n) - 1)) return J40__ERR("pad0");
+	st->bits.bits >>= n;
+	st->bits.nbits -= n;
 	return st->err;
 }
 
-J40_STATIC J40_RETURNS_ERR j40__skip(j40__st *st, uint64_t n) {
-	uint64_t bytes;
-	if ((uint64_t) st->nbits >= n) {
-		st->bits >>= (int32_t) n;
-		st->nbits -= (int32_t) n;
+J40_STATIC J40__RETURNS_ERR j40__skip(j40__st *st, int64_t n) {
+	j40__bits_st *bits = &st->bits;
+	int64_t bytes;
+	if (bits->nbits >= n) {
+		bits->bits >>= (int32_t) n;
+		bits->nbits -= (int32_t) n;
 	} else {
-		n -= (uint64_t) st->nbits;
-		st->bits = 0;
-		st->nbits = 0;
+		n -= bits->nbits;
+		bits->bits = 0;
+		bits->nbits = 0;
 	}
-	bytes = (uint64_t) (n >> 3);
+	bytes = n >> 3;
 	// TODO honor containers
-	if (st->remaining < bytes) return J40__ERR("shrt");
-	st->remaining -= bytes;
-	st->ptr += bytes;
+	if (bits->end - bits->ptr < (int64_t) bytes) return J40__ERR("shrt");
+	bits->ptr += bytes;
 	n &= 7;
 	if (j40__refill(st, (int32_t) n)) return st->err;
-	st->bits >>= (int32_t) n;
-	st->nbits -= (int32_t) n;
+	bits->bits >>= (int32_t) n;
+	bits->nbits -= (int32_t) n;
 	return st->err;
 }
 
-// TODO there are cases where n > 31
 J40_INLINE int32_t j40__u(j40__st *st, int32_t n) {
 	int32_t ret;
 	J40__ASSERT(0 <= n && n <= 31);
 	if (j40__refill(st, n)) return 0;
-	ret = (int32_t) (st->bits & ((1u << n) - 1));
-	st->bits >>= n;
-	st->nbits -= n;
+	ret = (int32_t) (st->bits.bits & ((1u << n) - 1));
+	st->bits.bits >>= n;
+	st->bits.nbits -= n;
 	return ret;
 }
 
-// the maximum value U32() actually reads is 2^30 + 4211711, so int32_t should be enough
+J40_INLINE int64_t j40__64u(j40__st *st, int32_t n) {
+	int64_t ret;
+	J40__ASSERT(0 <= n && n <= 63);
+	if (j40__refill(st, n)) return 0;
+	ret = (int64_t) (st->bits.bits & (((uint64_t) 1u << n) - 1));
+	st->bits.bits >>= n;
+	st->bits.nbits -= n;
+	return ret;
+}
+
 J40_INLINE int32_t j40__u32(
 	j40__st *st,
 	int32_t o0, int32_t n0, int32_t o1, int32_t n1,
@@ -1263,6 +1788,22 @@ J40_INLINE int32_t j40__u32(
 	J40__ASSERT(0 <= n3 && n3 <= 30 && o3 <= 0x7fffffff - (1 << n3));
 	sel = j40__u(st, 2);
 	return j40__u(st, n[sel]) + o[sel];
+}
+
+J40_INLINE int64_t j40__64u32(
+	j40__st *st,
+	int32_t o0, int32_t n0, int32_t o1, int32_t n1,
+	int32_t o2, int32_t n2, int32_t o3, int32_t n3
+) {
+	const int32_t o[4] = { o0, o1, o2, o3 };
+	const int32_t n[4] = { n0, n1, n2, n3 };
+	int32_t sel;
+	J40__ASSERT(0 <= n0 && n0 <= 62);
+	J40__ASSERT(0 <= n1 && n1 <= 62);
+	J40__ASSERT(0 <= n2 && n2 <= 62);
+	J40__ASSERT(0 <= n3 && n3 <= 62);
+	sel = j40__u(st, 2);
+	return (j40__64u(st, n[sel]) + (int64_t) o[sel]) & (int64_t) 0xffffffff;
 }
 
 J40_STATIC uint64_t j40__u64(j40__st *st) {
@@ -1297,7 +1838,7 @@ J40_STATIC uint64_t j40__varint(j40__st *st) { // ICC only
 	uint64_t value = 0;
 	int32_t shift = 0;
 	do {
-		if (st->remaining == 0) return J40__ERR("shrt"), (uint64_t) 0;
+		if (st->bits.ptr == st->bits.end) return J40__ERR("shrt"), (uint64_t) 0;
 		int32_t b = j40__u(st, 8);
 		value |= (uint64_t) (b & 0x7f) << shift;
 		if (b < 128) return value;
@@ -1322,22 +1863,25 @@ J40_INLINE int32_t j40__at_most(j40__st *st, int32_t max) {
 	return v;
 }
 
+// ensures that we have reached the end of file or advertised section with proper padding
+J40_STATIC J40__RETURNS_ERR j40__no_more_bytes(j40__st *st) {
+	J40__TRY(j40__zero_pad_to_byte(st));
+	J40__SHOULD(st->bits.nbits == 0 && st->bits.ptr == st->bits.end, "excs");
+J40__ON_ERROR:
+	return st->err;
+}
+
 #endif // defined J40_IMPLEMENTATION
 
 ////////////////////////////////////////////////////////////////////////////////
 // prefix code
 
-J40_STATIC J40_RETURNS_ERR j40__init_prefix_code(
+J40_STATIC J40__RETURNS_ERR j40__prefix_code_tree(
 	j40__st *st, int32_t l2size, int32_t *out_fast_len, int32_t *out_max_len, int32_t **out_table
 );
 J40_INLINE int32_t j40__prefix_code(j40__st *st, int32_t fast_len, int32_t max_len, const int32_t *table);
 
 #ifdef J40_IMPLEMENTATION
-
-static const uint8_t J40__REV5[32] = {
-	0, 16, 8, 24, 4, 20, 12, 28, 2, 18, 10, 26, 6, 22, 14, 30,
-	1, 17, 9, 25, 5, 21, 13, 29, 3, 19, 11, 27, 7, 23, 15, 31,
-};
 
 // a prefix code tree is represented by max_len (max code length), fast_len (explained below),
 // and an int32_t table either statically or dynamically constructed.
@@ -1351,16 +1895,21 @@ static const uint8_t J40__REV5[32] = {
 //
 // a direct or overflow entry format:
 // - bits 0..3: codeword length - fast_len
-// - bits 4..15: codeword, skipping first fast_len bits, ordered like st->bits (overflow only)
+// - bits 4..15: codeword, skipping first fast_len bits, ordered like st->bits.bits (overflow only)
 // - bits 16..30: corresponding alphabet
 
 enum { J40__MAX_TYPICAL_FAST_LEN = 7 }; // limit fast_len for typical cases
 enum { J40__MAX_TABLE_GROWTH = 2 }; // we can afford 2x the table size if beneficial though
 
 // read a prefix code tree, as specified in RFC 7932 section 3
-J40_STATIC J40_RETURNS_ERR j40__init_prefix_code(
+J40_STATIC J40__RETURNS_ERR j40__prefix_code_tree(
 	j40__st *st, int32_t l2size, int32_t *out_fast_len, int32_t *out_max_len, int32_t **out_table
 ) {
+	static const uint8_t REV5[32] = {
+		0, 16, 8, 24, 4, 20, 12, 28, 2, 18, 10, 26, 6, 22, 14, 30,
+		1, 17, 9, 25, 5, 21, 13, 29, 3, 19, 11, 27, 7, 23, 15, 31,
+	};
+
 	// for ordinary cases we have three different prefix codes:
 	// layer 0 (fixed): up to 4 bits, decoding into 0..5, used L1SIZE = 18 times
 	// layer 1: up to 5 bits, decoding into 0..17, used l2size times
@@ -1382,7 +1931,7 @@ J40_STATIC J40_RETURNS_ERR j40__init_prefix_code(
 	J40__ASSERT(l2size > 0 && l2size <= 0x8000);
 	if (l2size == 1) { // SPEC missing this case
 		*out_fast_len = *out_max_len = 0;
-		J40__SHOULD(*out_table = malloc(sizeof(int32_t)), "!mem");
+		J40__SHOULD(*out_table = j40__malloc(sizeof(int32_t)), "!mem");
 		(*out_table)[0] = 0;
 		return 0;
 	}
@@ -1414,7 +1963,7 @@ J40_STATIC J40_RETURNS_ERR j40__init_prefix_code(
 		}
 
 		*out_fast_len = *out_max_len = TEMPLATES[nsym].maxlen;
-		J40__SHOULD(*out_table = malloc(sizeof(int32_t) << *out_max_len), "!mem");
+		J40__SHOULD(*out_table = j40__malloc(sizeof(int32_t) << *out_max_len), "!mem");
 		for (i = 0; i < (1 << *out_max_len); ++i) {
 			(*out_table)[i] = (syms[TEMPLATES[nsym].symref[i]] << 16) | (int32_t) TEMPLATES[nsym].len[i];
 		}
@@ -1443,7 +1992,7 @@ J40_STATIC J40_RETURNS_ERR j40__init_prefix_code(
 		for (i = 0; i < L1SIZE; ++i) {
 			int32_t n = l1lengths[i], *start = &l1starts[n];
 			if (n == 0) continue;
-			for (code = (int32_t) J40__REV5[*start]; code < L1CODESUM; code += 1 << n) {
+			for (code = (int32_t) REV5[*start]; code < L1CODESUM; code += 1 << n) {
 				l1table[code] = (i << 16) | n;
 			}
 			*start += L1CODESUM >> n;
@@ -1452,7 +2001,7 @@ J40_STATIC J40_RETURNS_ERR j40__init_prefix_code(
 
 	{ // read layer 2 code lengths using the layer 1 code
 		int32_t prev = 8, rep, prev_rep = 0; // prev_rep: prev repeat count of 16(pos)/17(neg) so far
-		J40__SHOULD(l2lengths = calloc((size_t) l2size, sizeof(int32_t)), "!mem");
+		J40__SHOULD(l2lengths = j40__calloc((size_t) l2size, sizeof(int32_t)), "!mem");
 		for (i = total = 0; i < l2size && total < L2CODESUM; ) {
 			code = j40__prefix_code(st, L1MAXLEN, L1MAXLEN, l1table);
 			if (code < 16) {
@@ -1490,7 +2039,7 @@ J40_STATIC J40_RETURNS_ERR j40__init_prefix_code(
 	}
 	if (*out_max_len <= J40__MAX_TYPICAL_FAST_LEN) {
 		fast_len = *out_max_len;
-		J40__SHOULD(l2table = malloc(sizeof(int32_t) << fast_len), "!mem");
+		J40__SHOULD(l2table = j40__malloc(sizeof(int32_t) << fast_len), "!mem");
 	} else {
 		// if the distribution is flat enough the max fast_len might be slow
 		// because most LUT entries will be overflow refs so we will hit slow paths for most cases.
@@ -1511,7 +2060,7 @@ J40_STATIC J40_RETURNS_ERR j40__init_prefix_code(
 		}
 		l2overflows[fast_len + 1] = 1 << fast_len;
 		for (i = fast_len + 2; i <= *out_max_len; ++i) l2overflows[i] = l2overflows[i - 1] + l2counts[i - 1];
-		J40__SHOULD(l2table = malloc(sizeof(int32_t) * (size_t) (size_used + 1)), "!mem");
+		J40__SHOULD(l2table = j40__malloc(sizeof(int32_t) * (size_t) (size_used + 1)), "!mem");
 		// this entry should be unreachable, but should work as a stopper if there happens to be a logic bug
 		l2table[size_used] = 0;
 	}
@@ -1520,9 +2069,9 @@ J40_STATIC J40_RETURNS_ERR j40__init_prefix_code(
 	for (i = 0; i < l2size; ++i) {
 		int32_t n = l2lengths[i], *start = &l2starts[n];
 		if (n == 0) continue;
-		code = (int32_t) J40__REV5[*start & 31] << 10 |
-			(int32_t) J40__REV5[*start >> 5 & 31] << 5 |
-			(int32_t) J40__REV5[*start >> 10];
+		code = ((int32_t) REV5[*start & 31] << 10) |
+			((int32_t) REV5[*start >> 5 & 31] << 5) |
+			((int32_t) REV5[*start >> 10]);
 		if (n <= fast_len) {
 			for (; code < (1 << fast_len); code += 1 << n) l2table[code] = (i << 16) | n;
 			*start += L2CODESUM >> n;
@@ -1537,34 +2086,35 @@ J40_STATIC J40_RETURNS_ERR j40__init_prefix_code(
 
 	*out_fast_len = fast_len;
 	*out_table = l2table;
+	j40__free(l2lengths);
 	return 0;
 
 J40__ON_ERROR:
-	free(l2lengths);
-	free(l2table);
+	j40__free(l2lengths);
+	j40__free(l2table);
 	return st->err;
 }
 
 J40_STATIC int32_t j40__match_overflow(j40__st *st, int32_t fast_len, const int32_t *table) {
 	int32_t entry, code, code_len;
-	st->nbits -= fast_len;
-	st->bits >>= fast_len;
+	st->bits.nbits -= fast_len;
+	st->bits.bits >>= fast_len;
 	do {
 		entry = *table++;
 		code = (entry >> 4) & 0xfff;
 		code_len = entry & 15;
-	} while (code != (int32_t) (st->bits & ((1u << code_len) - 1)));
+	} while (code != (int32_t) (st->bits.bits & ((1u << code_len) - 1)));
 	return entry;
 }
 
 J40_INLINE int32_t j40__prefix_code(j40__st *st, int32_t fast_len, int32_t max_len, const int32_t *table) {
 	int32_t entry, code_len;
-	if (st->nbits < max_len && j40__always_refill(st, 0)) return 0;
-	entry = table[st->bits & ((1u << fast_len) - 1)];
+	if (st->bits.nbits < max_len && j40__always_refill(st, 0)) return 0;
+	entry = table[st->bits.bits & ((1u << fast_len) - 1)];
 	if (entry < 0 && fast_len < max_len) entry = j40__match_overflow(st, fast_len, table - entry);
 	code_len = entry & 15;
-	st->nbits -= code_len;
-	st->bits >>= code_len;
+	st->bits.nbits -= code_len;
+	st->bits.bits >>= code_len;
 	return entry >> 16;
 }
 
@@ -1576,14 +2126,22 @@ J40_INLINE int32_t j40__prefix_code(j40__st *st, int32_t fast_len, int32_t max_l
 // token < 2^split_exp is interpreted as is.
 // otherwise (token - 2^split_exp) is split into NNHHHLLL where config determines H/L lengths.
 // then MMMMM = u(NN + split_exp - H/L lengths) is read; the decoded value is 1HHHMMMMMLLL.
-typedef struct { int8_t split_exp, msb_in_token, lsb_in_token; } j40__hybrid_int_config_t;
+typedef struct {
+	int8_t split_exp; // [0, 15]
+	int8_t msb_in_token, lsb_in_token; // msb_in_token + lsb_in_token <= split_exp
+} j40__hybrid_int_config;
 
-J40_STATIC J40_RETURNS_ERR j40__hybrid_int_config(j40__st *st, int32_t log_alpha_size, j40__hybrid_int_config_t *out);
-J40_INLINE int32_t j40__hybrid_int(j40__st *st, int32_t token, j40__hybrid_int_config_t config);
+J40_STATIC J40__RETURNS_ERR j40__read_hybrid_int_config(
+	j40__st *st, int32_t log_alpha_size, j40__hybrid_int_config *out
+);
+J40_INLINE int32_t j40__hybrid_int(j40__st *st, int32_t token, j40__hybrid_int_config config);
 
 #ifdef J40_IMPLEMENTATION
 
-J40_STATIC J40_RETURNS_ERR j40__hybrid_int_config(j40__st *st, int32_t log_alpha_size, j40__hybrid_int_config_t *out) {
+J40_STATIC J40__RETURNS_ERR j40__read_hybrid_int_config(
+	j40__st *st, int32_t log_alpha_size, j40__hybrid_int_config *out
+) {
+	J40__ASSERT(log_alpha_size <= 15);
 	out->split_exp = (int8_t) j40__at_most(st, log_alpha_size);
 	if (out->split_exp != log_alpha_size) {
 		out->msb_in_token = (int8_t) j40__at_most(st, out->split_exp);
@@ -1594,7 +2152,7 @@ J40_STATIC J40_RETURNS_ERR j40__hybrid_int_config(j40__st *st, int32_t log_alpha
 	return st->err;
 }
 
-J40_INLINE int32_t j40__hybrid_int(j40__st *st, int32_t token, j40__hybrid_int_config_t config) {
+J40_INLINE int32_t j40__hybrid_int(j40__st *st, int32_t token, j40__hybrid_int_config config) {
 	int32_t midbits, lo, mid, hi, top, bits_in_token, split = 1 << config.split_exp;
 	if (token < split) return token;
 	bits_in_token = config.msb_in_token + config.lsb_in_token;
@@ -1630,7 +2188,7 @@ enum {
 //  output range: 0     cutoff|offset    offset+bucket_size
 typedef struct { int16_t cutoff, offset_or_next, symbol; } j40__alias_bucket;
 
-J40_STATIC J40_RETURNS_ERR j40__init_alias_map(
+J40_STATIC J40__RETURNS_ERR j40__init_alias_map(
 	j40__st *st, const int16_t *D, int32_t log_alpha_size, j40__alias_bucket **out
 );
 J40_STATIC int32_t j40__ans_code(
@@ -1640,7 +2198,7 @@ J40_STATIC int32_t j40__ans_code(
 
 #ifdef J40_IMPLEMENTATION
 
-J40_STATIC J40_RETURNS_ERR j40__init_alias_map(
+J40_STATIC J40__RETURNS_ERR j40__init_alias_map(
 	j40__st *st, const int16_t *D, int32_t log_alpha_size, j40__alias_bucket **out
 ) {
 	int16_t log_bucket_size = (int16_t) (J40__DIST_BITS - log_alpha_size);
@@ -1652,7 +2210,7 @@ J40_STATIC J40_RETURNS_ERR j40__init_alias_map(
 	int16_t u = -1, o = -1, i, j;
 
 	J40__ASSERT(5 <= log_alpha_size && log_alpha_size <= 8);
-	J40__SHOULD(buckets = malloc(sizeof(j40__alias_bucket) << log_alpha_size), "!mem");
+	J40__SHOULD(buckets = j40__malloc(sizeof(j40__alias_bucket) << log_alpha_size), "!mem");
 
 	for (i = 0; i < table_size && !D[i]; ++i);
 	for (j = (int16_t) (i + 1); j < table_size && !D[j]; ++j);
@@ -1715,7 +2273,7 @@ J40_STATIC J40_RETURNS_ERR j40__init_alias_map(
 	return 0;
 
 J40__ON_ERROR:
-	free(buckets);
+	j40__free(buckets);
 	return st->err;
 }
 
@@ -1747,22 +2305,22 @@ J40_STATIC int32_t j40__ans_code(
 // entropy code
 
 typedef union {
-	j40__hybrid_int_config_t config;
+	j40__hybrid_int_config config;
 	struct {
-		j40__hybrid_int_config_t config;
+		j40__hybrid_int_config config;
 		int32_t count;
 	} init; // only used during the initialization
 	struct {
-		j40__hybrid_int_config_t config;
+		j40__hybrid_int_config config;
 		int16_t *D;
 		j40__alias_bucket *aliases;
 	} ans; // if parent use_prefix_code is false
 	struct {
-		j40__hybrid_int_config_t config;
+		j40__hybrid_int_config config;
 		int16_t fast_len, max_len;
 		int32_t *table;
 	} prefix; // if parent use_prefix_code is true
-} j40__code_cluster_t;
+} j40__code_cluster;
 
 typedef struct {
 	int32_t num_dist;
@@ -1771,39 +2329,40 @@ typedef struct {
 	int32_t log_alpha_size; // only used when use_prefix_code is false
 	int32_t num_clusters; // in [1, min(num_dist, 256)]
 	uint8_t *cluster_map; // each in [0, num_clusters)
-	j40__hybrid_int_config_t lz_len_config;
-	j40__code_cluster_t *clusters;
-} j40__code_spec_t;
+	j40__hybrid_int_config lz_len_config;
+	j40__code_cluster *clusters;
+} j40__code_spec;
 
 typedef struct {
-	const j40__code_spec_t *spec;
+	const j40__code_spec *spec;
 	// LZ77 states
 	int32_t num_to_copy, copy_pos, num_decoded;
 	int32_t window_cap, *window;
 	// ANS state (SPEC there is a single such state throughout the whole ANS stream)
 	uint32_t ans_state; // 0 if uninitialized
-} j40__code_t;
+} j40__code_st;
 
-J40_STATIC J40_RETURNS_ERR j40__cluster_map(
+J40_STATIC J40__RETURNS_ERR j40__cluster_map(
 	j40__st *st, int32_t num_dist, int32_t max_allowed, int32_t *num_clusters, uint8_t *map
 );
-J40_STATIC J40_RETURNS_ERR j40__code_spec(j40__st *st, int32_t num_dist, j40__code_spec_t *spec);
+J40_STATIC J40__RETURNS_ERR j40__ans_table(j40__st *st, int32_t log_alpha_size, int16_t **outtable);
+J40_STATIC J40__RETURNS_ERR j40__read_code_spec(j40__st *st, int32_t num_dist, j40__code_spec *spec);
 J40_STATIC int32_t j40__entropy_code_cluster(
 	j40__st *st, int use_prefix_code, int32_t log_alpha_size,
-	j40__code_cluster_t *cluster, uint32_t *ans_state
+	j40__code_cluster *cluster, uint32_t *ans_state
 );
-J40_STATIC int32_t j40__code(j40__st *st, int32_t ctx, int32_t dist_mult, j40__code_t *code);
-J40_STATIC void j40__free_code(j40__code_t *code);
-J40_STATIC J40_RETURNS_ERR j40__finish_and_free_code(j40__st *st, j40__code_t *code);
-J40_STATIC void j40__free_code_spec(j40__code_spec_t *spec);
+J40_STATIC int32_t j40__code(j40__st *st, int32_t ctx, int32_t dist_mult, j40__code_st *code);
+J40_STATIC void j40__free_code(j40__code_st *code);
+J40_STATIC J40__RETURNS_ERR j40__finish_and_free_code(j40__st *st, j40__code_st *code);
+J40_STATIC void j40__free_code_spec(j40__code_spec *spec);
 
 #ifdef J40_IMPLEMENTATION
 
-J40_STATIC J40_RETURNS_ERR j40__cluster_map(
+J40_STATIC J40__RETURNS_ERR j40__cluster_map(
 	j40__st *st, int32_t num_dist, int32_t max_allowed, int32_t *num_clusters, uint8_t *map
 ) {
-	j40__code_spec_t codespec = {0}; // cluster map might be recursively coded
-	j40__code_t code = { .spec = &codespec };
+	j40__code_spec codespec = {0}; // cluster map might be recursively coded
+	j40__code_st code = { .spec = &codespec };
 	uint32_t seen[8] = {0};
 	int32_t i, j;
 
@@ -1826,7 +2385,7 @@ J40_STATIC J40_RETURNS_ERR j40__cluster_map(
 		int use_mtf = j40__u(st, 1);
 
 		// num_dist=1 prevents further recursion
-		J40__TRY(j40__code_spec(st, 1, &codespec));
+		J40__TRY(j40__read_code_spec(st, 1, &codespec));
 		for (i = 0; i < num_dist; ++i) {
 			int32_t index = j40__code(st, 0, 0, &code); // SPEC context (always 0) is missing
 			J40__SHOULD(index < max_allowed, "clst");
@@ -1863,8 +2422,112 @@ J40__ON_ERROR:
 	return st->err;
 }
 
-J40_STATIC J40_RETURNS_ERR j40__code_spec(j40__st *st, int32_t num_dist, j40__code_spec_t *spec) {
-	int32_t i, j;
+J40_STATIC J40__RETURNS_ERR j40__ans_table(j40__st *st, int32_t log_alpha_size, int16_t **outtable) {
+	enum { DISTBITS = J40__DIST_BITS, DISTSUM = 1 << DISTBITS };
+	int32_t table_size = 1 << log_alpha_size;
+	int32_t i;
+	int16_t *D = NULL;
+
+	J40__SHOULD(D = j40__malloc(sizeof(int16_t) * (size_t) table_size), "!mem");
+
+	switch (j40__u(st, 2)) {
+	case 1: // one entry
+		memset(D, 0, sizeof(int16_t) * (size_t) table_size);
+		D[j40__u8(st)] = DISTSUM;
+		break;
+
+	case 3: { // two entries
+		int32_t v1 = j40__u8(st);
+		int32_t v2 = j40__u8(st);
+		J40__SHOULD(v1 != v2 && v1 < table_size && v2 < table_size, "ansd");
+		memset(D, 0, sizeof(int16_t) * (size_t) table_size);
+		D[v1] = (int16_t) j40__u(st, DISTBITS);
+		D[v2] = (int16_t) (DISTSUM - D[v1]);
+		break;
+	}
+
+	case 2: { // evenly distribute to first `alpha_size` entries (false -> true)
+		int32_t alpha_size = j40__u8(st) + 1;
+		int16_t d = (int16_t) (DISTSUM / alpha_size);
+		int16_t bias_size = (int16_t) (DISTSUM - d * alpha_size);
+		for (i = 0; i < bias_size; ++i) D[i] = (int16_t) (d + 1);
+		for (; i < alpha_size; ++i) D[i] = d;
+		for (; i < table_size; ++i) D[i] = 0;
+		break;
+	}
+
+	case 0: { // bit counts + RLE (false -> false)
+		int32_t len, shift, alpha_size, omit_log, omit_pos, code, total, n;
+		int32_t ncodes, codes[259]; // exponents if >= 0, negated repeat count if < 0
+
+		len = j40__u(st, 1) ? j40__u(st, 1) ? j40__u(st, 1) ? 3 : 2 : 1 : 0;
+		shift = j40__u(st, len) + (1 << len) - 1;
+		J40__SHOULD(shift <= 13, "ansd");
+		alpha_size = j40__u8(st) + 3;
+
+		omit_log = -1; // there should be at least one non-RLE code
+		for (i = ncodes = 0; i < alpha_size; ) {
+			static const int32_t TABLE[] = { // reinterpretation of kLogCountLut
+				0xa0003,     -16, 0x70003, 0x30004, 0x60003, 0x80003, 0x90003, 0x50004,
+				0xa0003, 0x40004, 0x70003, 0x10004, 0x60003, 0x80003, 0x90003, 0x20004,
+				0x00011, 0xb0022, 0xc0003, 0xd0043, // overflow for ...0001
+			};
+			code = j40__prefix_code(st, 4, 7, TABLE);
+			if (code < 13) {
+				++i;
+				codes[ncodes++] = code;
+				if (omit_log < code) omit_log = code;
+			} else {
+				i += code = j40__u8(st) + 4;
+				codes[ncodes++] = -code;
+			}
+		}
+		J40__SHOULD(i == alpha_size && omit_log >= 0, "ansd");
+
+		omit_pos = -1;
+		for (i = n = total = 0; i < ncodes; ++i) {
+			code = codes[i];
+			if (code < 0) { // repeat
+				int16_t prev = n > 0 ? D[n - 1] : 0;
+				J40__SHOULD(prev >= 0, "ansd"); // implicit D[n] followed by RLE
+				total += (int32_t) prev * (int32_t) -code;
+				while (code++ < 0) D[n++] = prev;
+			} else if (code == omit_log) { // the first longest D[n] is "omitted" (implicit)
+				omit_pos = n;
+				omit_log = -1; // this branch runs at most once
+				D[n++] = -1;
+			} else if (code < 2) {
+				total += code;
+				D[n++] = (int16_t) code;
+			} else {
+				int32_t bitcount;
+				--code;
+				bitcount = j40__min32(j40__max32(0, shift - ((DISTBITS - code) >> 1)), code);
+				code = (1 << code) + (j40__u(st, bitcount) << (code - bitcount));
+				total += code;
+				D[n++] = (int16_t) code;
+			}
+		}
+		for (; n < table_size; ++n) D[n] = 0;
+		J40__ASSERT(omit_pos >= 0);
+		J40__SHOULD(total <= DISTSUM, "ansd");
+		D[omit_pos] = (int16_t) (DISTSUM - total);
+		break;
+	}
+
+	default: J40__UNREACHABLE();
+	}
+
+	*outtable = D;
+	return 0;
+
+J40__ON_ERROR:
+	j40__free(D);
+	return st->err;
+}
+
+J40_STATIC J40__RETURNS_ERR j40__read_code_spec(j40__st *st, int32_t num_dist, j40__code_spec *spec) {
+	int32_t i;
 
 	spec->cluster_map = NULL;
 	spec->clusters = NULL;
@@ -1874,22 +2537,22 @@ J40_STATIC J40_RETURNS_ERR j40__code_spec(j40__st *st, int32_t num_dist, j40__co
 	if (spec->lz77_enabled) {
 		spec->min_symbol = j40__u32(st, 224, 0, 512, 0, 4096, 0, 8, 15);
 		spec->min_length = j40__u32(st, 3, 0, 4, 0, 5, 2, 9, 8);
-		J40__TRY(j40__hybrid_int_config(st, 8, &spec->lz_len_config));
+		J40__TRY(j40__read_hybrid_int_config(st, 8, &spec->lz_len_config));
 		++num_dist; // num_dist - 1 is a synthesized LZ77 length distribution
 	} else {
 		spec->min_symbol = spec->min_length = 0x7fffffff;
 	}
 
 	// cluster_map: a mapping from context IDs to actual distributions
-	J40__SHOULD(spec->cluster_map = malloc(sizeof(uint8_t) * (size_t) num_dist), "!mem");
+	J40__SHOULD(spec->cluster_map = j40__malloc(sizeof(uint8_t) * (size_t) num_dist), "!mem");
 	J40__TRY(j40__cluster_map(st, num_dist, 256, &spec->num_clusters, spec->cluster_map));
 
-	J40__SHOULD(spec->clusters = calloc((size_t) spec->num_clusters, sizeof(j40__code_cluster_t)), "!mem");
+	J40__SHOULD(spec->clusters = j40__calloc((size_t) spec->num_clusters, sizeof(j40__code_cluster)), "!mem");
 
 	spec->use_prefix_code = j40__u(st, 1);
 	if (spec->use_prefix_code) {
 		for (i = 0; i < spec->num_clusters; ++i) { // SPEC the count is off by one
-			J40__TRY(j40__hybrid_int_config(st, 15, &spec->clusters[i].config));
+			J40__TRY(j40__read_hybrid_int_config(st, 15, &spec->clusters[i].config));
 		}
 
 		for (i = 0; i < spec->num_clusters; ++i) {
@@ -1904,115 +2567,22 @@ J40_STATIC J40_RETURNS_ERR j40__code_spec(j40__st *st, int32_t num_dist, j40__co
 
 		// SPEC this should happen after reading *all* count[i]
 		for (i = 0; i < spec->num_clusters; ++i) {
-			j40__code_cluster_t *c = &spec->clusters[i];
+			j40__code_cluster *c = &spec->clusters[i];
 			int32_t fast_len, max_len;
-			J40__TRY(j40__init_prefix_code(st, c->init.count, &fast_len, &max_len, &c->prefix.table));
+			J40__TRY(j40__prefix_code_tree(st, c->init.count, &fast_len, &max_len, &c->prefix.table));
 			c->prefix.fast_len = (int16_t) fast_len;
 			c->prefix.max_len = (int16_t) max_len;
 		}
 	} else {
-		enum { DISTBITS = J40__DIST_BITS, DISTSUM = 1 << DISTBITS };
-
 		spec->log_alpha_size = 5 + j40__u(st, 2);
 		for (i = 0; i < spec->num_clusters; ++i) { // SPEC the count is off by one
-			J40__TRY(j40__hybrid_int_config(st, spec->log_alpha_size, &spec->clusters[i].config));
+			J40__TRY(j40__read_hybrid_int_config(st, spec->log_alpha_size, &spec->clusters[i].config));
 		}
 
 		for (i = 0; i < spec->num_clusters; ++i) {
-			int32_t table_size = 1 << spec->log_alpha_size;
-			int16_t *D;
-			J40__SHOULD(D = malloc(sizeof(int16_t) * (size_t) table_size), "!mem");
-			spec->clusters[i].ans.D = D;
-
-			switch (j40__u(st, 2)) {
-			case 1: // one entry
-				memset(D, 0, sizeof(int16_t) * (size_t) table_size);
-				D[j40__u8(st)] = DISTSUM;
-				break;
-
-			case 3: { // two entries
-				int32_t v1 = j40__u8(st);
-				int32_t v2 = j40__u8(st);
-				J40__SHOULD(v1 != v2 && v1 < table_size && v2 < table_size, "ansd");
-				memset(D, 0, sizeof(int16_t) * (size_t) table_size);
-				D[v1] = (int16_t) j40__u(st, DISTBITS);
-				D[v2] = (int16_t) (DISTSUM - D[v1]);
-				break;
-			}
-
-			case 2: { // evenly distribute to first `alpha_size` entries (false -> true)
-				int32_t alpha_size = j40__u8(st) + 1;
-				int16_t d = (int16_t) (DISTSUM / alpha_size);
-				int16_t bias_size = (int16_t) (DISTSUM - d * alpha_size);
-				for (j = 0; j < bias_size; ++j) D[j] = (int16_t) (d + 1);
-				for (; j < alpha_size; ++j) D[j] = d;
-				for (; j < table_size; ++j) D[j] = 0;
-				break;
-			}
-
-			case 0: { // bit counts + RLE (false -> false)
-				int32_t len, shift, alpha_size, omit_log, omit_pos, code, total, n;
-				int32_t ncodes, codes[259]; // exponents if >= 0, negated repeat count if < 0
-
-				len = j40__u(st, 1) ? j40__u(st, 1) ? j40__u(st, 1) ? 3 : 2 : 1 : 0;
-				shift = j40__u(st, len) + (1 << len) - 1;
-				J40__SHOULD(shift <= 13, "ansd");
-				alpha_size = j40__u8(st) + 3;
-
-				omit_log = -1; // there should be at least one non-RLE code
-				for (j = ncodes = 0; j < alpha_size; ) {
-					static const int32_t TABLE[] = { // reinterpretation of kLogCountLut
-						0xa0003,     -16, 0x70003, 0x30004, 0x60003, 0x80003, 0x90003, 0x50004,
-						0xa0003, 0x40004, 0x70003, 0x10004, 0x60003, 0x80003, 0x90003, 0x20004,
-						0x00011, 0xb0022, 0xc0003, 0xd0043, // overflow for ...0001
-					};
-					code = j40__prefix_code(st, 4, 7, TABLE);
-					if (code < 13) {
-						++j;
-						codes[ncodes++] = code;
-						if (omit_log < code) omit_log = code;
-					} else {
-						j += code = j40__u8(st) + 4;
-						codes[ncodes++] = -code;
-					}
-				}
-				J40__SHOULD(j == alpha_size && omit_log >= 0, "ansd");
-
-				omit_pos = -1;
-				for (j = n = total = 0; j < ncodes; ++j) {
-					code = codes[j];
-					if (code < 0) { // repeat
-						int16_t prev = n > 0 ? D[n - 1] : 0;
-						J40__SHOULD(prev >= 0, "ansd"); // implicit D[n] followed by RLE
-						total += (int32_t) prev * (int32_t) -code;
-						while (code++ < 0) D[n++] = prev;
-					} else if (code == omit_log) { // the first longest D[n] is "omitted" (implicit)
-						omit_pos = n;
-						omit_log = -1; // this branch runs at most once
-						D[n++] = -1;
-					} else if (code < 2) {
-						total += code;
-						D[n++] = (int16_t) code;
-					} else {
-						int32_t bitcount;
-						--code;
-						bitcount = j40__min32(j40__max32(0, shift - ((DISTBITS - code) >> 1)), code);
-						code = (1 << code) + (j40__u(st, bitcount) << (code - bitcount));
-						total += code;
-						D[n++] = (int16_t) code;
-					}
-				}
-				for (; n < table_size; ++n) D[n] = 0;
-				J40__ASSERT(omit_pos >= 0);
-				J40__SHOULD(total <= DISTSUM, "ansd");
-				D[omit_pos] = (int16_t) (DISTSUM - total);
-				break;
-			}
-
-			default: J40__UNREACHABLE();
-			}
-
-			J40__TRY(j40__init_alias_map(st, D, spec->log_alpha_size, &spec->clusters[i].ans.aliases));
+			j40__code_cluster *c = &spec->clusters[i];
+			J40__TRY(j40__ans_table(st, spec->log_alpha_size, &c->ans.D));
+			J40__TRY(j40__init_alias_map(st, c->ans.D, spec->log_alpha_size, &c->ans.aliases));
 		}
 	}
 
@@ -2026,7 +2596,7 @@ J40__ON_ERROR:
 
 J40_STATIC int32_t j40__entropy_code_cluster(
 	j40__st *st, int use_prefix_code, int32_t log_alpha_size,
-	j40__code_cluster_t *cluster, uint32_t *ans_state
+	j40__code_cluster *cluster, uint32_t *ans_state
 ) {
 	if (use_prefix_code) {
 		return j40__prefix_code(st, cluster->prefix.fast_len, cluster->prefix.max_len, cluster->prefix.table);
@@ -2036,10 +2606,10 @@ J40_STATIC int32_t j40__entropy_code_cluster(
 }
 
 // aka DecodeHybridVarLenUint
-J40_STATIC int32_t j40__code(j40__st *st, int32_t ctx, int32_t dist_mult, j40__code_t *code) {
-	const j40__code_spec_t *spec = code->spec;
+J40_STATIC int32_t j40__code(j40__st *st, int32_t ctx, int32_t dist_mult, j40__code_st *code) {
+	const j40__code_spec *spec = code->spec;
 	int32_t token, distance, log_alpha_size;
-	j40__code_cluster_t *cluster;
+	j40__code_cluster *cluster;
 	int use_prefix_code;
 
 	if (code->num_to_copy > 0) {
@@ -2054,7 +2624,7 @@ continue_lz77:
 	cluster = &spec->clusters[spec->cluster_map[ctx]];
 	token = j40__entropy_code_cluster(st, use_prefix_code, log_alpha_size, cluster, &code->ans_state);
 	if (token >= spec->min_symbol) { // this is large enough if lz77_enabled is false
-		j40__code_cluster_t *lz_cluster = &spec->clusters[spec->cluster_map[spec->num_dist - 1]];
+		j40__code_cluster *lz_cluster = &spec->clusters[spec->cluster_map[spec->num_dist - 1]];
 		code->num_to_copy = j40__hybrid_int(st, token - spec->min_symbol, spec->lz_len_config) + spec->min_length;
 		token = j40__entropy_code_cluster(st, use_prefix_code, log_alpha_size, lz_cluster, &code->ans_state);
 		distance = j40__hybrid_int(st, token, lz_cluster->config);
@@ -2079,8 +2649,7 @@ continue_lz77:
 			int32_t special = (int32_t) SPECIAL_DISTANCES[distance];
 			distance = ((special >> 4) - 7) + dist_mult * (special & 7);
 		}
-		if (distance > code->num_decoded) distance = code->num_decoded;
-		if (distance > (1 << 20)) distance = 1 << 20;
+		distance = j40__min32(j40__min32(distance, code->num_decoded), 1 << 20);
 		code->copy_pos = code->num_decoded - distance;
 		goto continue_lz77;
 	}
@@ -2089,7 +2658,7 @@ continue_lz77:
 	if (st->err) return 0;
 	if (spec->lz77_enabled) {
 		if (!code->window) { // XXX should be dynamically resized
-			code->window = malloc(sizeof(int32_t) << 20);
+			code->window = j40__malloc(sizeof(int32_t) << 20);
 			if (!code->window) return J40__ERR("!mem"), 0;
 		}
 		code->window[code->num_decoded++ & 0xfffff] = token;
@@ -2097,13 +2666,13 @@ continue_lz77:
 	return token;
 }
 
-J40_STATIC void j40__free_code(j40__code_t *code) {
-	free(code->window);
+J40_STATIC void j40__free_code(j40__code_st *code) {
+	j40__free(code->window);
 	code->window = NULL;
 	code->window_cap = 0;
 }
 
-J40_STATIC J40_RETURNS_ERR j40__finish_and_free_code(j40__st *st, j40__code_t *code) {
+J40_STATIC J40__RETURNS_ERR j40__finish_and_free_code(j40__st *st, j40__code_st *code) {
 	if (!code->spec->use_prefix_code) {
 		if (code->ans_state) {
 			J40__SHOULD(code->ans_state == J40__ANS_INIT_STATE, "ans?");
@@ -2118,21 +2687,21 @@ J40__ON_ERROR:
 	return st->err;
 }
 
-J40_STATIC void j40__free_code_spec(j40__code_spec_t *spec) {
+J40_STATIC void j40__free_code_spec(j40__code_spec *spec) {
 	int32_t i;
 	if (spec->clusters) {
 		for (i = 0; i < spec->num_clusters; ++i) {
 			if (spec->use_prefix_code) {
-				free(spec->clusters[i].prefix.table);
+				j40__free(spec->clusters[i].prefix.table);
 			} else {
-				free(spec->clusters[i].ans.D);
-				free(spec->clusters[i].ans.aliases);
+				j40__free(spec->clusters[i].ans.D);
+				j40__free(spec->clusters[i].ans.aliases);
 			}
 		}
-		free(spec->clusters);
+		j40__free(spec->clusters);
 		spec->clusters = NULL;
 	}
-	free(spec->cluster_map);
+	j40__free(spec->cluster_map);
 	spec->cluster_map = NULL;
 }
 
@@ -2147,7 +2716,7 @@ enum {
 };
 
 typedef struct {
-	enum {
+	enum j40__ec_type {
 		J40__EC_ALPHA = 0, J40__EC_DEPTH = 1, J40__EC_SPOT_COLOUR = 2,
 		J40__EC_SELECTION_MASK = 3, J40__EC_BLACK = 4, J40__EC_CFA = 5,
 		J40__EC_THERMAL = 6, J40__EC_NON_OPTIONAL = 15, J40__EC_OPTIONAL = 16,
@@ -2163,7 +2732,7 @@ typedef struct {
 
 typedef struct j40__image_st {
 	int32_t width, height;
-	enum {
+	enum j40__orientation {
 		J40__ORIENT_TL = 1, J40__ORIENT_TR = 2, J40__ORIENT_BR = 3, J40__ORIENT_BL = 4,
 		J40__ORIENT_LT = 5, J40__ORIENT_RT = 6, J40__ORIENT_RB = 7, J40__ORIENT_LB = 8,
 	} orientation;
@@ -2171,7 +2740,7 @@ typedef struct j40__image_st {
 	int bpp, exp_bits;
 
 	int32_t anim_tps_num, anim_tps_denom; // num=denom=0 if not animated
-	int32_t anim_nloops; // 0 if infinity
+	int64_t anim_nloops; // 0 if infinity
 	int anim_have_timecodes;
 
 	char *icc;
@@ -2183,7 +2752,9 @@ typedef struct j40__image_st {
 		J40__TF_PQ = -16, J40__TF_DCI = -17, J40__TF_HLG = -18,
 		J40__GAMMA_MAX = 10000000,
 	} gamma_or_tf; // gamma if > 0, transfer function if <= 0
-	enum { J40__INTENT_PERC = 0, J40__INTENT_REL = 1, J40__INTENT_SAT = 2, J40__INTENT_ABS = 3 } render_intent;
+	enum j40__render_intent {
+		J40__INTENT_PERC = 0, J40__INTENT_REL = 1, J40__INTENT_SAT = 2, J40__INTENT_ABS = 3
+	} render_intent;
 	float intensity_target, min_nits; // 0 < min_nits <= intensity_target
 	float linear_below; // absolute (nits) if >= 0; a negated ratio of max display brightness if [-1,0]
 
@@ -2195,16 +2766,25 @@ typedef struct j40__image_st {
 	int want_icc;
 } j40__image_st;
 
-J40_STATIC J40_RETURNS_ERR j40__size_header(j40__st *st, int32_t *outw, int32_t *outh);
-J40_STATIC J40_RETURNS_ERR j40__bit_depth(j40__st *st, int32_t *outbpp, int32_t *outexpbits);
-J40_STATIC J40_RETURNS_ERR j40__name(j40__st *st, int32_t *outlen, char **outbuf);
-J40_STATIC J40_RETURNS_ERR j40__customxy(j40__st *st, float xy[2]);
-J40_STATIC J40_RETURNS_ERR j40__extensions(j40__st *st);
-J40_STATIC J40_RETURNS_ERR j40__image_metadata(j40__st *st);
+J40_STATIC J40__RETURNS_ERR j40__signature(j40__st *st);
+J40_STATIC J40__RETURNS_ERR j40__size_header(j40__st *st, int32_t *outw, int32_t *outh);
+J40_STATIC J40__RETURNS_ERR j40__bit_depth(j40__st *st, int32_t *outbpp, int32_t *outexpbits);
+J40_STATIC J40__RETURNS_ERR j40__name(j40__st *st, int32_t *outlen, char **outbuf);
+J40_STATIC J40__RETURNS_ERR j40__customxy(j40__st *st, float xy[2]);
+J40_STATIC J40__RETURNS_ERR j40__extensions(j40__st *st);
+J40_STATIC J40__RETURNS_ERR j40__image_metadata(j40__st *st);
+J40_STATIC void j40__free_image_state(j40__image_st *im);
 
 #ifdef J40_IMPLEMENTATION
 
-J40_STATIC J40_RETURNS_ERR j40__size_header(j40__st *st, int32_t *outw, int32_t *outh) {
+J40_STATIC J40__RETURNS_ERR j40__signature(j40__st *st) {
+	int32_t sig = j40__u(st, 16);
+	J40__SHOULD(sig == 0x0aff, "!jxl"); // FF 0A in the byte sequence
+J40__ON_ERROR:
+	return st->err;
+}
+
+J40_STATIC J40__RETURNS_ERR j40__size_header(j40__st *st, int32_t *outw, int32_t *outh) {
 	int32_t div8 = j40__u(st, 1);
 	*outh = div8 ? (j40__u(st, 5) + 1) * 8 : j40__u32(st, 1, 9, 1, 13, 1, 18, 1, 30);
 	switch (j40__u(st, 3)) { // ratio
@@ -2229,7 +2809,7 @@ J40__ON_ERROR:
 	return st->err;
 }
 
-J40_STATIC J40_RETURNS_ERR j40__bit_depth(j40__st *st, int32_t *outbpp, int32_t *outexpbits) {
+J40_STATIC J40__RETURNS_ERR j40__bit_depth(j40__st *st, int32_t *outbpp, int32_t *outexpbits) {
 	if (j40__u(st, 1)) { // float_sample
 		int32_t mantissa_bits;
 		*outbpp = j40__u32(st, 32, 0, 16, 0, 24, 0, 1, 6);
@@ -2246,12 +2826,12 @@ J40__ON_ERROR:
 	return st->err;
 }
 
-J40_STATIC J40_RETURNS_ERR j40__name(j40__st *st, int32_t *outlen, char **outbuf) {
+J40_STATIC J40__RETURNS_ERR j40__name(j40__st *st, int32_t *outlen, char **outbuf) {
 	char *buf = NULL;
 	int32_t i, c, cc, len;
 	len = j40__u32(st, 0, 0, 0, 4, 16, 5, 48, 10);
 	if (len > 0) {
-		J40__SHOULD(buf = malloc((size_t) len + 1), "!mem");
+		J40__SHOULD(buf = j40__malloc((size_t) len + 1), "!mem");
 		for (i = 0; i < len; ++i) {
 			buf[i] = (char) j40__u(st, 8);
 			J40__RAISE_DELAYED();
@@ -2274,26 +2854,25 @@ J40_STATIC J40_RETURNS_ERR j40__name(j40__st *st, int32_t *outlen, char **outbuf
 	*outlen = len;
 	return 0;
 J40__ON_ERROR:
-	free(buf);
+	j40__free(buf);
 	return st->err;
 }
 
-J40_STATIC J40_RETURNS_ERR j40__customxy(j40__st *st, float xy[2]) {
+J40_STATIC J40__RETURNS_ERR j40__customxy(j40__st *st, float xy[2]) {
 	xy[0] = (float)j40__unpack_signed(j40__u32(st, 0, 19, 0x80000, 19, 0x100000, 20, 0x200000, 21)) / 100000.0f;
 	xy[1] = (float)j40__unpack_signed(j40__u32(st, 0, 19, 0x80000, 19, 0x100000, 20, 0x200000, 21)) / 100000.0f;
 	return st->err;
 }
 
-J40_STATIC J40_RETURNS_ERR j40__extensions(j40__st *st) {
+J40_STATIC J40__RETURNS_ERR j40__extensions(j40__st *st) {
 	uint64_t extensions = j40__u64(st);
-	uint64_t nbits = 0;
+	int64_t nbits = 0;
 	int32_t i;
 	for (i = 0; i < 64; ++i) {
 		if (extensions >> i & 1) {
 			uint64_t n = j40__u64(st);
 			J40__RAISE_DELAYED();
-			if (nbits > UINT64_MAX - n) J40__RAISE("over");
-			nbits += n;
+			J40__SHOULD(n <= (uint64_t) INT64_MAX && j40__add64(nbits, (int64_t) n, &nbits), "over");
 		}
 	}
 	return j40__skip(st, nbits);
@@ -2301,10 +2880,15 @@ J40__ON_ERROR:
 	return st->err;
 }
 
-J40_STATIC J40_RETURNS_ERR j40__image_metadata(j40__st *st) {
+J40_STATIC J40__RETURNS_ERR j40__image_metadata(j40__st *st) {
 	static const float SRGB_CHROMA[4][2] = { // default chromacity (kD65, kSRGB)
 		{0.3127f, 0.3290f}, {0.639998686f, 0.330010138f},
 		{0.300003784f, 0.600003357f}, {0.150002046f, 0.059997204f},
+	};
+	static const float OPSIN_INV_MAT[3][3] = { // default opsin inverse matrix
+		{11.031566901960783f, -9.866943921568629f, -0.16462299647058826f},
+		{-3.254147380392157f, 4.418770392156863f, -0.16462299647058826f},
+		{-3.6588512862745097f, 2.7129230470588235f, 1.9459282392156863f},
 	};
 
 	j40__image_st *im = st->image;
@@ -2328,11 +2912,19 @@ J40_STATIC J40_RETURNS_ERR j40__image_metadata(j40__st *st) {
 	im->intensity_target = 255.0f;
 	im->min_nits = 0.0f;
 	im->linear_below = 0.0f;
+	im->modular_16bit_buffers = 1;
+	im->xyb_encoded = 1;
+	memcpy(im->opsin_inv_mat, OPSIN_INV_MAT, sizeof OPSIN_INV_MAT);
+	im->opsin_bias[0] = im->opsin_bias[1] = im->opsin_bias[2] = -0.0037930732552754493f;
+	im->quant_bias[0] = 1.0f - 0.05465007330715401f;
+	im->quant_bias[1] = 1.0f - 0.07005449891748593f;
+	im->quant_bias[2] = 1.0f - 0.049935103337343655f;
+	im->quant_bias_num = 0.145f;
 
 	if (!j40__u(st, 1)) { // !all_default
 		int32_t extra_fields = j40__u(st, 1);
 		if (extra_fields) {
-			im->orientation = j40__u(st, 3) + 1;
+			im->orientation = (enum j40__orientation) (j40__u(st, 3) + 1);
 			if (j40__u(st, 1)) { // have_intr_size
 				J40__TRY(j40__size_header(st, &im->intr_width, &im->intr_height));
 			}
@@ -2342,14 +2934,14 @@ J40_STATIC J40_RETURNS_ERR j40__image_metadata(j40__st *st) {
 			if (j40__u(st, 1)) { // have_animation
 				im->anim_tps_num = j40__u32(st, 100, 0, 1000, 0, 1, 10, 1, 30);
 				im->anim_tps_denom = j40__u32(st, 1, 0, 1001, 0, 1, 8, 1, 10);
-				im->anim_nloops = j40__u32(st, 0, 0, 0, 3, 0, 16, 0, 32);
+				im->anim_nloops = j40__64u32(st, 0, 0, 0, 3, 0, 16, 0, 32);
 				im->anim_have_timecodes = j40__u(st, 1);
 			}
 		}
 		J40__TRY(j40__bit_depth(st, &im->bpp, &im->exp_bits));
 		im->modular_16bit_buffers = j40__u(st, 1);
 		im->num_extra_channels = j40__u32(st, 0, 0, 1, 0, 2, 4, 1, 12);
-		J40__SHOULD(im->ec_info = calloc((size_t) im->num_extra_channels, sizeof(j40__ec_info)), "!mem");
+		J40__SHOULD(im->ec_info = j40__calloc((size_t) im->num_extra_channels, sizeof(j40__ec_info)), "!mem");
 		for (i = 0; i < im->num_extra_channels; ++i) {
 			j40__ec_info *ec = &im->ec_info[i];
 			if (j40__u(st, 1)) { // d_alpha
@@ -2359,7 +2951,7 @@ J40_STATIC J40_RETURNS_ERR j40__image_metadata(j40__st *st) {
 				ec->name = NULL;
 				ec->data.alpha_associated = 0;
 			} else {
-				ec->type = j40__enum(st);
+				ec->type = (enum j40__ec_type) j40__enum(st);
 				J40__TRY(j40__bit_depth(st, &ec->bpp, &ec->exp_bits));
 				ec->dim_shift = j40__u32(st, 0, 0, 3, 0, 4, 0, 1, 3);
 				J40__TRY(j40__name(st, &ec->name_len, &ec->name));
@@ -2386,11 +2978,11 @@ J40_STATIC J40_RETURNS_ERR j40__image_metadata(j40__st *st) {
 		}
 		im->xyb_encoded = j40__u(st, 1);
 		if (!j40__u(st, 1)) { // ColourEncoding.all_default
-			enum { CS_RGB = 0, CS_GREY = 1, CS_XYB = 2, CS_UNKNOWN = 3 } cspace;
+			enum j40__cspace { CS_RGB = 0, CS_GREY = 1, CS_XYB = 2, CS_UNKNOWN = 3 } cspace;
 			enum { WP_D65 = 1, WP_CUSTOM = 2, WP_E = 10, WP_DCI = 11 };
 			enum { PR_SRGB = 1, PR_CUSTOM = 2, PR_2100 = 9, PR_P3 = 11 };
 			im->want_icc = j40__u(st, 1);
-			cspace = j40__enum(st);
+			cspace = (enum j40__cspace) j40__enum(st);
 			switch (cspace) {
 			case CS_RGB: case CS_UNKNOWN: im->cspace = J40__CS_CHROMA; break;
 			case CS_GREY: im->cspace = J40__CS_GREY; break;
@@ -2436,7 +3028,7 @@ J40_STATIC J40_RETURNS_ERR j40__image_metadata(j40__st *st) {
 						1 << -J40__TF_HLG
 					) >> -im->gamma_or_tf & 1, "tfn?");
 				}
-				im->render_intent = j40__enum(st);
+				im->render_intent = (enum j40__render_intent) j40__enum(st);
 				J40__SHOULD((
 					1 << J40__INTENT_PERC | 1 << J40__INTENT_REL |
 					1 << J40__INTENT_SAT | 1 << J40__INTENT_ABS
@@ -2488,23 +3080,33 @@ J40__ON_ERROR:
 	return st->err;
 }
 
+J40_STATIC void j40__free_image_state(j40__image_st *im) {
+	int32_t i;
+	for (i = 0; i < im->num_extra_channels; ++i) j40__free(im->ec_info[i].name);
+	j40__free(im->icc);
+	j40__free(im->ec_info);
+	im->icc = NULL;
+	im->ec_info = NULL;
+	im->num_extra_channels = 0;
+}
+
 #endif // defined J40_IMPLEMENTATION
 
 ////////////////////////////////////////////////////////////////////////////////
 // ICC
 
-J40_STATIC J40_RETURNS_ERR j40__icc(j40__st *st);
+J40_STATIC J40__RETURNS_ERR j40__icc(j40__st *st);
 
 #ifdef J40_IMPLEMENTATION
 
-J40_STATIC J40_RETURNS_ERR j40__icc(j40__st *st) {
+J40_STATIC J40__RETURNS_ERR j40__icc(j40__st *st) {
 	size_t enc_size, index;
-	j40__code_spec_t codespec = {0};
-	j40__code_t code = { .spec = &codespec };
+	j40__code_spec codespec = {0};
+	j40__code_st code = { .spec = &codespec };
 	int32_t byte = 0, prev = 0, pprev = 0, ctx;
 
 	enc_size = j40__u64(st);
-	J40__TRY(j40__code_spec(st, 41, &codespec));
+	J40__TRY(j40__read_code_spec(st, 41, &codespec));
 
 	for (index = 0; index < enc_size; ++index) {
 		pprev = prev;
@@ -2587,24 +3189,24 @@ typedef union {
 		int32_t predictor;
 		int32_t offset, multiplier;
 	} leaf;
-} j40__tree_t;
+} j40__tree_node;
 
-J40_STATIC J40_RETURNS_ERR j40__tree(j40__st *st, j40__tree_t **tree, j40__code_spec_t *codespec);
+J40_STATIC J40__RETURNS_ERR j40__tree(j40__st *st, j40__tree_node **tree, j40__code_spec *codespec);
 
 #ifdef J40_IMPLEMENTATION
 
-J40_STATIC J40_RETURNS_ERR j40__tree(j40__st *st, j40__tree_t **tree, j40__code_spec_t *codespec) {
-	j40__code_t code = { .spec = codespec };
-	j40__tree_t *t = NULL;
+J40_STATIC J40__RETURNS_ERR j40__tree(j40__st *st, j40__tree_node **tree, j40__code_spec *codespec) {
+	j40__code_st code = { .spec = codespec };
+	j40__tree_node *t = NULL;
 	int32_t tree_idx = 0, tree_cap = 8;
 	int32_t ctx_id = 0, nodes_left = 1;
 
-	J40__TRY(j40__code_spec(st, 6, codespec));
-	J40__SHOULD(t = malloc(sizeof(j40__tree_t) * (size_t) tree_cap), "!mem");
+	J40__TRY(j40__read_code_spec(st, 6, codespec));
+	J40__SHOULD(t = j40__malloc(sizeof(j40__tree_node) * (size_t) tree_cap), "!mem");
 	while (nodes_left-- > 0) { // depth-first, left-to-right ordering
-		j40__tree_t *n;
+		j40__tree_node *n;
 		int32_t prop = j40__code(st, 1, 0, &code), val, shift;
-		J40__TRY_REALLOC(&t, sizeof(j40__tree_t), tree_idx + 1, &tree_cap);
+		J40__TRY_REALLOC32(&t, tree_idx + 1, &tree_cap);
 		n = &t[tree_idx++];
 		if (prop > 0) {
 			n->branch.prop = -prop;
@@ -2618,7 +3220,7 @@ J40_STATIC J40_RETURNS_ERR j40__tree(j40__st *st, j40__tree_t **tree, j40__code_
 			shift = j40__code(st, 4, 0, &code);
 			J40__SHOULD(shift < 31, "tree");
 			val = j40__code(st, 5, 0, &code);
-			J40__SHOULD(val < (1 << (31 - shift)) - 1, "tree");
+			J40__SHOULD(((val + 1) >> (31 - shift)) == 0, "tree");
 			n->leaf.multiplier = (val + 1) << shift;
 		}
 		J40__SHOULD(tree_idx + nodes_left <= (1 << 26), "tree");
@@ -2626,12 +3228,12 @@ J40_STATIC J40_RETURNS_ERR j40__tree(j40__st *st, j40__tree_t **tree, j40__code_
 	J40__TRY(j40__finish_and_free_code(st, &code));
 	j40__free_code_spec(codespec);
 	memset(codespec, 0, sizeof(*codespec)); // XXX is it required?
-	J40__TRY(j40__code_spec(st, ctx_id, codespec));
+	J40__TRY(j40__read_code_spec(st, ctx_id, codespec));
 	*tree = t;
 	return 0;
 
 J40__ON_ERROR:
-	free(t);
+	j40__free(t);
 	j40__free_code(&code);
 	j40__free_code_spec(codespec);
 	return st->err;
@@ -2662,7 +3264,7 @@ typedef union {
 		int horizontal, in_place;
 		int32_t begin_c, num_c;
 	} sq;
-} j40__transform_t;
+} j40__transform;
 
 typedef struct { int8_t p1, p2, p3[5], w[4]; } j40__wp_params;
 
@@ -2670,59 +3272,59 @@ typedef struct {
 	int use_global_tree;
 	j40__wp_params wp;
 	int32_t nb_transforms;
-	j40__transform_t *transform;
-	j40__tree_t *tree; // owned only if use_global_tree is false
-	j40__code_spec_t codespec;
-	j40__code_t code;
+	j40__transform *transform;
+	j40__tree_node *tree; // owned only if use_global_tree is false
+	j40__code_spec codespec;
+	j40__code_st code;
 	int32_t num_channels, nb_meta_channels;
-	j40__plane *channel;
+	j40__plane *channel; // should use the same type, either i16 or i32
 	int32_t max_width; // aka dist_multiplier, excludes meta channels
-} j40__modular_t;
+} j40__modular;
 
-J40_STATIC void j40__init_modular_common(j40__modular_t *m);
-J40_STATIC J40_RETURNS_ERR j40__init_modular(
-	j40__st *st, int32_t num_channels, const int32_t *w, const int32_t *h, j40__modular_t *m
+J40_STATIC void j40__init_modular_common(j40__modular *m);
+J40_STATIC J40__RETURNS_ERR j40__init_modular(
+	j40__st *st, int32_t num_channels, const int32_t *w, const int32_t *h, j40__modular *m
 );
-J40_STATIC J40_RETURNS_ERR j40__init_modular_for_global(
+J40_STATIC J40__RETURNS_ERR j40__init_modular_for_global(
 	j40__st *st, int frame_is_modular, int frame_do_ycbcr,
 	int32_t frame_log_upsampling, const int32_t *frame_ec_log_upsampling,
-	int32_t frame_width, int32_t frame_height, j40__modular_t *m
+	int32_t frame_width, int32_t frame_height, j40__modular *m
 );
-J40_STATIC J40_RETURNS_ERR j40__init_modular_for_pass_group(
+J40_STATIC J40__RETURNS_ERR j40__init_modular_for_pass_group(
 	j40__st *st, int32_t num_gm_channels, int32_t gw, int32_t gh,
-	int32_t minshift, int32_t maxshift, const j40__modular_t *gm, j40__modular_t *m
+	int32_t minshift, int32_t maxshift, const j40__modular *gm, j40__modular *m
 );
 J40_STATIC void j40__combine_modular_from_pass_group(
-	j40__st *st, int32_t num_gm_channels, int32_t gy, int32_t gx,
-	int32_t minshift, int32_t maxshift, const j40__modular_t *gm, j40__modular_t *m
+	int32_t num_gm_channels, int32_t gy, int32_t gx,
+	int32_t minshift, int32_t maxshift, const j40__modular *gm, j40__modular *m
 );
-J40_STATIC J40_RETURNS_ERR j40__modular_header(
-	j40__st *st, j40__tree_t *global_tree, const j40__code_spec_t *global_codespec,
-	j40__modular_t *m
+J40_STATIC J40__RETURNS_ERR j40__modular_header(
+	j40__st *st, j40__tree_node *global_tree, const j40__code_spec *global_codespec,
+	j40__modular *m
 );
-J40_STATIC J40_RETURNS_ERR j40__allocate_modular(j40__st *st, j40__modular_t *m);
-J40_STATIC void j40__free_modular(j40__modular_t *m);
+J40_STATIC J40__RETURNS_ERR j40__allocate_modular(j40__st *st, j40__modular *m);
+J40_STATIC void j40__free_modular(j40__modular *m);
 
 #ifdef J40_IMPLEMENTATION
 
-J40_STATIC void j40__init_modular_common(j40__modular_t *m) {
+J40_STATIC void j40__init_modular_common(j40__modular *m) {
 	m->transform = NULL;
 	m->tree = NULL;
-	memset(&m->codespec, 0, sizeof(j40__code_spec_t));
-	memset(&m->code, 0, sizeof(j40__code_t));
+	memset(&m->codespec, 0, sizeof(j40__code_spec));
+	memset(&m->code, 0, sizeof(j40__code_st));
 	m->code.spec = &m->codespec;
 	m->channel = NULL;
 }
 
-J40_STATIC J40_RETURNS_ERR j40__init_modular(
-	j40__st *st, int32_t num_channels, const int32_t *w, const int32_t *h, j40__modular_t *m
+J40_STATIC J40__RETURNS_ERR j40__init_modular(
+	j40__st *st, int32_t num_channels, const int32_t *w, const int32_t *h, j40__modular *m
 ) {
 	int32_t i;
 
 	j40__init_modular_common(m);
 	m->num_channels = num_channels;
 	J40__ASSERT(num_channels > 0);
-	J40__SHOULD(m->channel = calloc((size_t) num_channels, sizeof(j40__plane)), "!mem");
+	J40__SHOULD(m->channel = j40__calloc((size_t) num_channels, sizeof(j40__plane)), "!mem");
 	for (i = 0; i < num_channels; ++i) {
 		m->channel[i].width = w[i];
 		m->channel[i].height = h[i];
@@ -2732,10 +3334,10 @@ J40__ON_ERROR:
 	return st->err;
 }
 
-J40_STATIC J40_RETURNS_ERR j40__init_modular_for_global(
+J40_STATIC J40__RETURNS_ERR j40__init_modular_for_global(
 	j40__st *st, int frame_is_modular, int frame_do_ycbcr,
 	int32_t frame_log_upsampling, const int32_t *frame_ec_log_upsampling,
-	int32_t frame_width, int32_t frame_height, j40__modular_t *m
+	int32_t frame_width, int32_t frame_height, j40__modular *m
 ) {
 	j40__image_st *im = st->image;
 	int32_t i;
@@ -2747,7 +3349,7 @@ J40_STATIC J40_RETURNS_ERR j40__init_modular_for_global(
 	}
 	if (m->num_channels == 0) return 0;
 
-	J40__SHOULD(m->channel = calloc((size_t) m->num_channels, sizeof(j40__plane)), "!mem");
+	J40__SHOULD(m->channel = j40__calloc((size_t) m->num_channels, sizeof(j40__plane)), "!mem");
 	for (i = 0; i < im->num_extra_channels; ++i) {
 		int32_t log_upsampling = (frame_ec_log_upsampling ? frame_ec_log_upsampling[i] : 0) + im->ec_info[i].dim_shift;
 		J40__SHOULD(log_upsampling >= frame_log_upsampling, "usmp");
@@ -2764,14 +3366,14 @@ J40_STATIC J40_RETURNS_ERR j40__init_modular_for_global(
 	return 0;
 
 J40__ON_ERROR:
-	free(m->channel);
+	j40__free(m->channel);
 	m->channel = NULL;
 	return st->err;
 }
 
-J40_STATIC J40_RETURNS_ERR j40__init_modular_for_pass_group(
+J40_STATIC J40__RETURNS_ERR j40__init_modular_for_pass_group(
 	j40__st *st, int32_t num_gm_channels, int32_t gw, int32_t gh,
-	int32_t minshift, int32_t maxshift, const j40__modular_t *gm, j40__modular_t *m
+	int32_t minshift, int32_t maxshift, const j40__modular *gm, j40__modular *m
 ) {
 	int32_t i, max_channels;
 
@@ -2779,7 +3381,7 @@ J40_STATIC J40_RETURNS_ERR j40__init_modular_for_pass_group(
 	m->num_channels = 0;
 	max_channels = gm->num_channels - num_gm_channels;
 	J40__ASSERT(max_channels >= 0);
-	J40__SHOULD(m->channel = calloc((size_t) max_channels, sizeof(j40__plane)), "!mem");
+	J40__SHOULD(m->channel = j40__calloc((size_t) max_channels, sizeof(j40__plane)), "!mem");
 	for (i = num_gm_channels; i < gm->num_channels; ++i) {
 		j40__plane *gc = &gm->channel[i], *c = &m->channel[m->num_channels];
 		if (gc->hshift < 3 || gc->vshift < 3) {
@@ -2794,7 +3396,7 @@ J40_STATIC J40_RETURNS_ERR j40__init_modular_for_pass_group(
 		}
 	}
 	if (m->num_channels == 0) {
-		free(m->channel);
+		j40__free(m->channel);
 		m->channel = NULL;
 	}
 J40__ON_ERROR:
@@ -2802,14 +3404,16 @@ J40__ON_ERROR:
 }
 
 J40_STATIC void j40__combine_modular_from_pass_group(
-	j40__st *st, int32_t num_gm_channels, int32_t gy, int32_t gx,
-	int32_t minshift, int32_t maxshift, const j40__modular_t *gm, j40__modular_t *m
+	int32_t num_gm_channels, int32_t gy, int32_t gx,
+	int32_t minshift, int32_t maxshift, const j40__modular *gm, j40__modular *m
 ) {
-	size_t pixel_size = st->image->modular_16bit_buffers ? sizeof(int16_t) : sizeof(int32_t);
 	int32_t gcidx, cidx, y, gx0, gy0;
 	for (gcidx = num_gm_channels, cidx = 0; gcidx < gm->num_channels; ++gcidx) {
 		j40__plane *gc = &gm->channel[gcidx], *c = &m->channel[cidx];
+		J40__ASSERT(gc->type == c->type);
 		if (gc->hshift < 3 || gc->vshift < 3) {
+			size_t pixel_size = (size_t) J40__PLANE_PIXEL_SIZE(gc);
+			size_t gc_stride = (size_t) gc->stride_bytes, c_stride = (size_t) c->stride_bytes;
 			(void) minshift; (void) maxshift;
 			// TODO check minshift/maxshift!!!
 			J40__ASSERT(gc->hshift == c->hshift && gc->vshift == c->vshift);
@@ -2818,8 +3422,8 @@ J40_STATIC void j40__combine_modular_from_pass_group(
 			J40__ASSERT(gx0 + c->width <= gc->width && gy0 + c->height <= gc->height);
 			for (y = 0; y < c->height; ++y) {
 				memcpy(
-					(char*) gc->pixels + pixel_size * (size_t) ((gy0 + y) * gc->width + gx0),
-					(char*) c->pixels + pixel_size * (size_t) (y * c->width),
+					(void*) (gc->pixels + gc_stride * (size_t) (gy0 + y) + pixel_size * (size_t) gx0),
+					(void*) (c->pixels + c_stride * (size_t) y),
 					pixel_size * (size_t) c->width);
 			}
 			printf("combined channel %d with w=%d h=%d to channel %d with w=%d h=%d gx0=%d gy0=%d\n", cidx, c->width, c->height, gcidx, gc->width, gc->height, gx0, gy0); fflush(stdout);
@@ -2829,9 +3433,9 @@ J40_STATIC void j40__combine_modular_from_pass_group(
 	J40__ASSERT(cidx == m->num_channels);
 }
 
-J40_STATIC J40_RETURNS_ERR j40__modular_header(
-	j40__st *st, j40__tree_t *global_tree, const j40__code_spec_t *global_codespec,
-	j40__modular_t *m
+J40_STATIC J40__RETURNS_ERR j40__modular_header(
+	j40__st *st, j40__tree_node *global_tree, const j40__code_spec *global_codespec,
+	j40__modular *m
 ) {
 	j40__plane *channel = m->channel;
 	int32_t num_channels = m->num_channels, nb_meta_channels = 0;
@@ -2854,9 +3458,9 @@ J40_STATIC J40_RETURNS_ERR j40__modular_header(
 	}
 
 	transform_cap = m->nb_transforms = j40__u32(st, 0, 0, 1, 0, 2, 4, 18, 8);
-	J40__SHOULD(m->transform = malloc(sizeof(j40__transform_t) * (size_t) transform_cap), "!mem");
+	J40__SHOULD(m->transform = j40__malloc(sizeof(j40__transform) * (size_t) transform_cap), "!mem");
 	for (i = 0; i < m->nb_transforms; ++i) {
-		j40__transform_t *tr = &m->transform[i];
+		j40__transform *tr = &m->transform[i];
 		int32_t num_sq;
 
 		tr->tr = (enum j40__transform_id) j40__u(st, 2);
@@ -2892,7 +3496,7 @@ J40_STATIC J40_RETURNS_ERR j40__modular_header(
 			}
 			J40__SHOULD(j40__plane_all_equal_sized(channel + begin_c, channel + end_c), "pald");
 			// inverse palette transform always requires one more channel slot
-			J40__TRY_REALLOC(&channel, sizeof(*channel), num_channels + 1, &channel_cap);
+			J40__TRY_REALLOC32(&channel, num_channels + 1, &channel_cap);
 			input = channel[begin_c];
 			memmove(channel + 1, channel, sizeof(*channel) * (size_t) begin_c);
 			memmove(channel + begin_c + 2, channel + end_c, sizeof(*channel) * (size_t) (num_channels - end_c));
@@ -2912,8 +3516,7 @@ J40_STATIC J40_RETURNS_ERR j40__modular_header(
 			if (num_sq == 0) {
 				tr->sq.implicit = 1;
 			} else {
-				J40__TRY_REALLOC(&m->transform, sizeof(j40__transform_t),
-					m->nb_transforms + num_sq - 1, &transform_cap);
+				J40__TRY_REALLOC32(&m->transform, m->nb_transforms + num_sq - 1, &transform_cap);
 				for (j = 0; j < num_sq; ++j) {
 					tr = &m->transform[i + j];
 					tr->sq.tr = J40__TR_SQUEEZE;
@@ -2937,7 +3540,7 @@ J40_STATIC J40_RETURNS_ERR j40__modular_header(
 
 	if (m->use_global_tree) {
 		m->tree = global_tree;
-		memcpy(&m->codespec, global_codespec, sizeof(j40__code_spec_t));
+		memcpy(&m->codespec, global_codespec, sizeof(j40__code_spec));
 	} else {
 		J40__TRY(j40__tree(st, &m->tree, &m->codespec));
 	}
@@ -2952,44 +3555,44 @@ J40_STATIC J40_RETURNS_ERR j40__modular_header(
 	return 0;
 
 J40__ON_ERROR:
-	free(channel);
-	free(m->transform);
+	j40__free(channel);
+	j40__free(m->transform);
 	if (!m->use_global_tree) {
-		free(m->tree);
+		j40__free(m->tree);
 		j40__free_code_spec(&m->codespec);
 	}
 	m->num_channels = 0;
 	m->channel = NULL;
 	m->transform = NULL;
 	m->tree = NULL;
-	memset(&m->codespec, 0, sizeof(j40__code_spec_t));
+	memset(&m->codespec, 0, sizeof(j40__code_spec));
 	return st->err;
 }
 
-J40_STATIC J40_RETURNS_ERR j40__allocate_modular(j40__st *st, j40__modular_t *m) {
+J40_STATIC J40__RETURNS_ERR j40__allocate_modular(j40__st *st, j40__modular *m) {
 	uint8_t pixel_type = st->image->modular_16bit_buffers ? J40__PLANE_I16 : J40__PLANE_I32;
 	int32_t i;
 	for (i = 0; i < m->num_channels; ++i) {
 		j40__plane *c = &m->channel[i];
-		J40__TRY(j40__init_plane(st, pixel_type, c->width, c->height, c));
+		J40__TRY(j40__init_plane(st, pixel_type, c->width, c->height, J40__PLANE_FORCE_PAD, c));
 	}
 J40__ON_ERROR:
 	return st->err;
 }
 
-J40_STATIC void j40__free_modular(j40__modular_t *m) {
+J40_STATIC void j40__free_modular(j40__modular *m) {
 	int32_t i;
 	j40__free_code(&m->code);
 	if (!m->use_global_tree) {
-		free(m->tree);
+		j40__free(m->tree);
 		j40__free_code_spec(&m->codespec);
 	}
 	for (i = 0; i < m->num_channels; ++i) j40__free_plane(&m->channel[i]);
-	free(m->transform);
-	free(m->channel);
+	j40__free(m->transform);
+	j40__free(m->channel);
 	m->use_global_tree = 0;
 	m->tree = NULL;
-	memset(&m->codespec, 0, sizeof(j40__code_spec_t));
+	memset(&m->codespec, 0, sizeof(j40__code_spec));
 	m->transform = NULL;
 	m->num_channels = 0;
 	m->channel = NULL;
@@ -3000,7 +3603,7 @@ J40_STATIC void j40__free_modular(j40__modular_t *m) {
 ////////////////////////////////////////////////////////////////////////////////
 // modular prediction
 
-J40_STATIC J40_RETURNS_ERR j40__modular_channel(j40__st *st, j40__modular_t *m, int32_t cidx, int32_t sidx);
+J40_STATIC J40__RETURNS_ERR j40__modular_channel(j40__st *st, j40__modular *m, int32_t cidx, int64_t sidx);
 
 #ifdef J40_IMPLEMENTATION
 static const int32_t J40__24DIVP1[64] = { // [i] = floor(2^24 / (i+1))
@@ -3030,42 +3633,42 @@ static const int32_t J40__24DIVP1[64] = { // [i] = floor(2^24 / (i+1))
 
 #endif // J40__RECURSING < 0
 #if J40__RECURSING == 200
-	#define j40__intP_t J40__CONCAT3(int, J40__P, _t)
-	#define j40__int2P_t J40__CONCAT3(int, J40__2P, _t)
-	#define j40__uint2P_t J40__CONCAT3(uint, J40__2P, _t)
+	#define j40__intP J40__CONCAT3(int, J40__P, _t)
+	#define j40__int2P J40__CONCAT3(int, J40__2P, _t)
+	#define j40__uint2P J40__CONCAT3(uint, J40__2P, _t)
 	#define J40__PIXELS J40__CONCAT3(J40__I, J40__P, _PIXELS)
 // ----------------------------------------
 
 typedef struct {
 	int32_t width;
 	j40__wp_params params;
-	j40__int2P_t (*errors)[5], pred[5]; // [0..3] = sub-predictions, [4] = final prediction
-	j40__int2P_t trueerrw, trueerrn, trueerrnw, trueerrne;
+	j40__int2P (*errors)[5], pred[5]; // [0..3] = sub-predictions, [4] = final prediction
+	j40__int2P trueerrw, trueerrn, trueerrnw, trueerrne;
 } j40__(wp,2P);
 
-typedef struct { j40__intP_t w, n, nw, ne, nn, nee, ww, nww; } j40__(neighbors_t,P);
-J40_ALWAYS_INLINE j40__(neighbors_t,P) j40__(neighbors,P)(const j40__plane *plane, int32_t x, int32_t y);
+typedef struct { j40__intP w, n, nw, ne, nn, nee, ww, nww; } j40__(neighbors,P);
+J40_ALWAYS_INLINE j40__(neighbors,P) j40__(init_neighbors,P)(const j40__plane *plane, int32_t x, int32_t y);
 
-J40_INLINE j40__int2P_t j40__(gradient,2P)(j40__int2P_t w, j40__int2P_t n, j40__int2P_t nw);
-J40_STATIC J40_RETURNS_ERR j40__(init_wp,2P)(j40__st *st, j40__wp_params params, int32_t width, j40__(wp,2P) *wp);
+J40_INLINE j40__int2P j40__(gradient,2P)(j40__int2P w, j40__int2P n, j40__int2P nw);
+J40_STATIC J40__RETURNS_ERR j40__(init_wp,2P)(j40__st *st, j40__wp_params params, int32_t width, j40__(wp,2P) *wp);
 J40_STATIC void j40__(wp_before_predict_internal,2P)(
 	j40__(wp,2P) *wp, int32_t x, int32_t y,
-	j40__intP_t pw, j40__intP_t pn, j40__intP_t pnw, j40__intP_t pne, j40__intP_t pnn
+	j40__intP pw, j40__intP pn, j40__intP pnw, j40__intP pne, j40__intP pnn
 );
-J40_INLINE void j40__(wp_before_predict,2P)(j40__(wp,2P) *wp, int32_t x, int32_t y, j40__(neighbors_t,P) *p);
-J40_INLINE j40__int2P_t j40__(predict,2P)(
-	j40__st *st, int32_t pred, const j40__(wp,2P) *wp, const j40__(neighbors_t,P) *p
+J40_INLINE void j40__(wp_before_predict,2P)(j40__(wp,2P) *wp, int32_t x, int32_t y, j40__(neighbors,P) *p);
+J40_INLINE j40__int2P j40__(predict,2P)(
+	j40__st *st, int32_t pred, const j40__(wp,2P) *wp, const j40__(neighbors,P) *p
 );
-J40_INLINE void j40__(wp_after_predict,2P)(j40__(wp,2P) *wp, int32_t x, int32_t y, j40__int2P_t val);
+J40_INLINE void j40__(wp_after_predict,2P)(j40__(wp,2P) *wp, int32_t x, int32_t y, j40__int2P val);
 J40_STATIC void j40__(reset_wp,2P)(j40__(wp,2P) *wp);
 J40_STATIC void j40__(free_wp,2P)(j40__(wp,2P) *wp);
-J40_STATIC J40_RETURNS_ERR j40__(modular_channel,P)(j40__st *st, j40__modular_t *m, int32_t cidx, int32_t sidx);
+J40_STATIC J40__RETURNS_ERR j40__(modular_channel,P)(j40__st *st, j40__modular *m, int32_t cidx, int64_t sidx);
 
 #ifdef J40_IMPLEMENTATION
 
-J40_ALWAYS_INLINE j40__(neighbors_t,P) j40__(neighbors,P)(const j40__plane *plane, int32_t x, int32_t y) {
-	j40__(neighbors_t,P) p;
-	const j40__intP_t *pixels = J40__PIXELS(plane, y);
+J40_ALWAYS_INLINE j40__(neighbors,P) j40__(init_neighbors,P)(const j40__plane *plane, int32_t x, int32_t y) {
+	j40__(neighbors,P) p;
+	const j40__intP *pixels = J40__PIXELS(plane, y);
 	int32_t width = plane->width, stride = J40__PLANE_STRIDE(plane);
 
 	/*            NN
@@ -3090,17 +3693,17 @@ J40_ALWAYS_INLINE j40__(neighbors_t,P) j40__(neighbors,P)(const j40__plane *plan
 	return p;
 }
 
-J40_INLINE j40__int2P_t j40__(gradient,2P)(j40__int2P_t w, j40__int2P_t n, j40__int2P_t nw) {
-	j40__int2P_t lo = j40__(min,2P)(w, n), hi = j40__(max,2P)(w, n);
+J40_INLINE j40__int2P j40__(gradient,2P)(j40__int2P w, j40__int2P n, j40__int2P nw) {
+	j40__int2P lo = j40__(min,2P)(w, n), hi = j40__(max,2P)(w, n);
 	return j40__(min,2P)(j40__(max,2P)(lo, w + n - nw), hi);
 }
 
-J40_STATIC J40_RETURNS_ERR j40__(init_wp,2P)(j40__st *st, j40__wp_params params, int32_t width, j40__(wp,2P) *wp) {
+J40_STATIC J40__RETURNS_ERR j40__(init_wp,2P)(j40__st *st, j40__wp_params params, int32_t width, j40__(wp,2P) *wp) {
 	int32_t i;
 	J40__ASSERT(width > 0);
 	wp->width = width;
 	wp->params = params;
-	J40__SHOULD(wp->errors = calloc((size_t) width * 2, sizeof(j40__int2P_t[5])), "!mem");
+	J40__SHOULD(wp->errors = j40__calloc((size_t) width * 2, sizeof(j40__int2P[5])), "!mem");
 	for (i = 0; i < 5; ++i) wp->pred[i] = 0;
 	wp->trueerrw = wp->trueerrn = wp->trueerrnw = wp->trueerrne = 0;
 J40__ON_ERROR:
@@ -3110,10 +3713,10 @@ J40__ON_ERROR:
 // also works when wp is zero-initialized (in which case does nothing)
 J40_STATIC void j40__(wp_before_predict_internal,2P)(
 	j40__(wp,2P) *wp, int32_t x, int32_t y,
-	j40__intP_t pw, j40__intP_t pn, j40__intP_t pnw, j40__intP_t pne, j40__intP_t pnn
+	j40__intP pw, j40__intP pn, j40__intP pnw, j40__intP pne, j40__intP pnn
 ) {
-	typedef j40__int2P_t int2P_t;
-	typedef j40__uint2P_t uint2P_t;
+	typedef j40__int2P int2P_t;
+	typedef j40__uint2P uint2P_t;
 
 	static const int2P_t ZERO[4] = {0, 0, 0, 0};
 
@@ -3142,13 +3745,14 @@ J40_STATIC void j40__(wp_before_predict_internal,2P)(
 	wp->trueerrnw = x > 0 && y > 0 ? nerr[x - 1][4] : wp->trueerrn;
 	wp->trueerrne = x + 1 < wp->width && y > 0 ? nerr[x + 1][4] : wp->trueerrn;
 
-	wp->pred[0] = (pw + pne - pn) << 3;
-	wp->pred[1] = (pn << 3) - (((wp->trueerrw + wp->trueerrn + wp->trueerrne) * wp->params.p1) >> 5);
-	wp->pred[2] = (pw << 3) - (((wp->trueerrw + wp->trueerrn + wp->trueerrnw) * wp->params.p2) >> 5);
-	wp->pred[3] = (pn << 3) - // SPEC negated (was `+`)
+	// TODO spec issue: (expr << 3) is used throughout wp, but it's an UB when expr is negative
+	wp->pred[0] = (pw + pne - pn) * 8;
+	wp->pred[1] = pn * 8 - (((wp->trueerrw + wp->trueerrn + wp->trueerrne) * wp->params.p1) >> 5);
+	wp->pred[2] = pw * 8 - (((wp->trueerrw + wp->trueerrn + wp->trueerrnw) * wp->params.p2) >> 5);
+	wp->pred[3] = pn * 8 - // SPEC negated (was `+`)
 		((wp->trueerrnw * wp->params.p3[0] + wp->trueerrn * wp->params.p3[1] +
-		  wp->trueerrne * wp->params.p3[2] + ((pnn - pn) << 3) * wp->params.p3[3] +
-		  ((pnw - pw) << 3) * wp->params.p3[4]) >> 5);
+		  wp->trueerrne * wp->params.p3[2] + (pnn - pn) * 8 * wp->params.p3[3] +
+		  (pnw - pw) * 8 * wp->params.p3[4]) >> 5);
 	for (i = 0; i < 4; ++i) {
 		int2P_t errsum = errn[i] + errw[i] + errnw[i] + errww[i] + errne[i] + errw2[i];
 		int32_t shift = j40__max32(j40__(floor_lg,2P)((uint2P_t) errsum + 1) - 5, 0);
@@ -3164,20 +3768,20 @@ J40_STATIC void j40__(wp_before_predict_internal,2P)(
 	// SPEC missing `- 1` before scaling
 	wp->pred[4] = (int2P_t) (((int64_t) sum + (wsum >> 1) - 1) * J40__24DIVP1[wsum - 1] >> 24);
 	if (((wp->trueerrn ^ wp->trueerrw) | (wp->trueerrn ^ wp->trueerrnw)) <= 0) {
-		int2P_t lo = j40__(min,2P)(pw, j40__(min,2P)(pn, pne)) << 3; // SPEC missing shifts
-		int2P_t hi = j40__(max,2P)(pw, j40__(max,2P)(pn, pne)) << 3;
+		int2P_t lo = j40__(min,2P)(pw, j40__(min,2P)(pn, pne)) * 8; // SPEC missing shifts
+		int2P_t hi = j40__(max,2P)(pw, j40__(max,2P)(pn, pne)) * 8;
 		wp->pred[4] = j40__(min,2P)(j40__(max,2P)(lo, wp->pred[4]), hi);
 	}
 }
 
 J40_INLINE void j40__(wp_before_predict,2P)(
-	j40__(wp,2P) *wp, int32_t x, int32_t y, j40__(neighbors_t,P) *p
+	j40__(wp,2P) *wp, int32_t x, int32_t y, j40__(neighbors,P) *p
 ) {
 	j40__(wp_before_predict_internal,2P)(wp, x, y, p->w, p->n, p->nw, p->ne, p->nn);
 }
 
-J40_INLINE j40__int2P_t j40__(predict,2P)(
-	j40__st *st, int32_t pred, const j40__(wp,2P) *wp, const j40__(neighbors_t,P) *p
+J40_INLINE j40__int2P j40__(predict,2P)(
+	j40__st *st, int32_t pred, const j40__(wp,2P) *wp, const j40__(neighbors,P) *p
 ) {
 	switch (pred) {
 	case 0: return 0;
@@ -3199,35 +3803,35 @@ J40_INLINE j40__int2P_t j40__(predict,2P)(
 }
 
 // also works when wp is zero-initialized (in which case does nothing)
-J40_INLINE void j40__(wp_after_predict,2P)(j40__(wp,2P) *wp, int32_t x, int32_t y, j40__int2P_t val) {
+J40_INLINE void j40__(wp_after_predict,2P)(j40__(wp,2P) *wp, int32_t x, int32_t y, j40__int2P val) {
 	if (wp->errors) {
-		j40__int2P_t *err = wp->errors[(y & 1 ? wp->width : 0) + x];
+		j40__int2P *err = wp->errors[(y & 1 ? wp->width : 0) + x];
 		int32_t i;
 		// SPEC approximated differently from the spec
-		for (i = 0; i < 4; ++i) err[i] = (j40__(abs,2P)(wp->pred[i] - (val << 3)) + 3) >> 3;
-		err[4] = wp->pred[4] - (val << 3); // SPEC this is a *signed* difference
+		for (i = 0; i < 4; ++i) err[i] = (j40__(abs,2P)(wp->pred[i] - val * 8) + 3) >> 3;
+		err[4] = wp->pred[4] - val * 8; // SPEC this is a *signed* difference
 	}
 }
 
 // also works when wp is zero-initialized (in which case does nothing)
 J40_STATIC void j40__(reset_wp,2P)(j40__(wp,2P) *wp) {
 	int32_t i;
-	if (wp->errors) memset(wp->errors, 0, (size_t) wp->width * 2 * sizeof(j40__int2P_t[5]));
+	if (wp->errors) memset(wp->errors, 0, (size_t) wp->width * 2 * sizeof(j40__int2P[5]));
 	for (i = 0; i < 5; ++i) wp->pred[i] = 0;
 	wp->trueerrw = wp->trueerrn = wp->trueerrnw = wp->trueerrne = 0;
 }
 
 J40_STATIC void j40__(free_wp,2P)(j40__(wp,2P) *wp) {
-	free(wp->errors);
+	j40__free(wp->errors);
 	wp->errors = NULL;
 	wp->width = 0;
 }
 
-J40_STATIC J40_RETURNS_ERR j40__(modular_channel,P)(
-	j40__st *st, j40__modular_t *m, int32_t cidx, int32_t sidx
+J40_STATIC J40__RETURNS_ERR j40__(modular_channel,P)(
+	j40__st *st, j40__modular *m, int32_t cidx, int64_t sidx
 ) {
-	typedef j40__intP_t intP_t;
-	typedef j40__int2P_t int2P_t;
+	typedef j40__intP intP_t;
+	typedef j40__int2P int2P_t;
 
 	j40__plane *c = &m->channel[cidx];
 	int32_t width = c->width, height = c->height;
@@ -3253,7 +3857,7 @@ J40_STATIC J40_RETURNS_ERR j40__(modular_channel,P)(
 
 	// compute indices for additional "previous channel" properties
 	// SPEC incompatible channels are skipped and never result in unusable but numbered properties
-	J40__SHOULD(refcmap = malloc(sizeof(int32_t) * (size_t) cidx), "!mem");
+	J40__SHOULD(refcmap = j40__malloc(sizeof(int32_t) * (size_t) cidx), "!mem");
 	nrefcmap = 0;
 	for (i = cidx - 1; i >= 0; --i) {
 		j40__plane *refc = &m->channel[i];
@@ -3265,8 +3869,8 @@ J40_STATIC J40_RETURNS_ERR j40__(modular_channel,P)(
 	for (y = 0; y < height; ++y) {
 		intP_t *outpixels = J40__PIXELS(c, y);
 		for (x = 0; x < width; ++x) {
-			j40__tree_t *n = m->tree;
-			j40__(neighbors_t,P) p = j40__(neighbors,P)(c, x, y);
+			j40__tree_node *n = m->tree;
+			j40__(neighbors,P) p = j40__(init_neighbors,P)(c, x, y);
 			int2P_t val;
 
 			// wp should be calculated before any property testing due to max_error (property 15)
@@ -3278,7 +3882,7 @@ J40_STATIC J40_RETURNS_ERR j40__(modular_channel,P)(
 
 				switch (~n->branch.prop) {
 				case 0: val = cidx; break;
-				case 1: val = sidx; break;
+				case 1: val = (int2P_t) sidx; break; // TODO check overflow
 				case 2: val = y; break;
 				case 3: val = x; break;
 				case 4: val = j40__(abs,2P)(p.n); break;
@@ -3317,24 +3921,21 @@ J40_STATIC J40_RETURNS_ERR j40__(modular_channel,P)(
 			}
 
 			val = j40__code(st, n->leaf.ctx, m->max_width, &m->code);
-			//printf("%d ", val);
 			val = j40__unpack_signed((int32_t) val) * n->leaf.multiplier + n->leaf.offset;
 			val += j40__(predict,2P)(st, n->leaf.predictor, &wp, &p);
 			J40__SHOULD(INT16_MIN <= val && val <= INT16_MAX, "povf");
 			outpixels[x] = (intP_t) val;
 			j40__(wp_after_predict,2P)(&wp, x, y, val);
 		}
-			//printf("\n");
 	}
-			//printf("--\n"); fflush(stdout);
 
 	j40__(free_wp,2P)(&wp);
-	free(refcmap);
+	j40__free(refcmap);
 	return 0;
 
 J40__ON_ERROR:
 	j40__(free_wp,2P)(&wp);
-	free(refcmap);
+	j40__free(refcmap);
 	j40__free_plane(c);
 	return st->err;
 }
@@ -3343,9 +3944,9 @@ J40__ON_ERROR:
 
 // ----------------------------------------
 // end of recursion
-	#undef j40__intP_t
-	#undef j40__int2P_t
-	#undef j40__uint2P_t
+	#undef j40__intP
+	#undef j40__int2P
+	#undef j40__uint2P
 	#undef J40__PIXELS
 	#undef J40__P
 	#undef J40__2P
@@ -3354,8 +3955,8 @@ J40__ON_ERROR:
 // ----------------------------------------
 
 #ifdef J40_IMPLEMENTATION
-J40_STATIC J40_RETURNS_ERR j40__modular_channel(j40__st *st, j40__modular_t *m, int32_t cidx, int32_t sidx) {
-	if (st->image->modular_16bit_buffers) {
+J40_STATIC J40__RETURNS_ERR j40__modular_channel(j40__st *st, j40__modular *m, int32_t cidx, int64_t sidx) {
+	if (m->channel[cidx].type == J40__PLANE_I16) {
 		return j40__modular_channel16(st, m, cidx, sidx);
 	} else {
 		return j40__modular_channel32(st, m, cidx, sidx);
@@ -3366,7 +3967,7 @@ J40_STATIC J40_RETURNS_ERR j40__modular_channel(j40__st *st, j40__modular_t *m, 
 ////////////////////////////////////////////////////////////////////////////////
 // modular (inverse) transform
 
-J40_STATIC J40_RETURNS_ERR j40__inverse_transform(j40__st *st, j40__modular_t *m);
+J40_STATIC J40__RETURNS_ERR j40__inverse_transform(j40__st *st, j40__modular *m);
 
 #ifdef J40_IMPLEMENTATION
 #define J40__X(x,y,z) {x,y,z}, {-(x),-(y),-(z)}
@@ -3404,19 +4005,19 @@ static const int16_t J40__PALETTE_DELTAS[144][3] = { // the first entry is a dup
 
 #endif // J40__RECURSING < 0
 #if J40__RECURSING == 300
-	#define j40__intP_t J40__CONCAT3(int, J40__P, _t)
-	#define j40__int2P_t J40__CONCAT3(int, J40__2P, _t)
+	#define j40__intP J40__CONCAT3(int, J40__P, _t)
+	#define j40__int2P J40__CONCAT3(int, J40__2P, _t)
 	#define J40__PIXELS J40__CONCAT3(J40__I, J40__P, _PIXELS)
 // ----------------------------------------
 
-J40_STATIC void j40__(inverse_rct,P)(j40__modular_t *m, const j40__transform_t *tr);
-J40_STATIC J40_RETURNS_ERR j40__(inverse_palette,P)(j40__st *st, j40__modular_t *m, const j40__transform_t *tr);
+J40_STATIC void j40__(inverse_rct,P)(j40__modular *m, const j40__transform *tr);
+J40_STATIC J40__RETURNS_ERR j40__(inverse_palette,P)(j40__st *st, j40__modular *m, const j40__transform *tr);
 
 #ifdef J40_IMPLEMENTATION
 
-J40_STATIC void j40__(inverse_rct,P)(j40__modular_t *m, const j40__transform_t *tr) {
-	typedef j40__intP_t intP_t;
-	typedef j40__int2P_t int2P_t;
+J40_STATIC void j40__(inverse_rct,P)(j40__modular *m, const j40__transform *tr) {
+	typedef j40__intP intP_t;
+	typedef j40__int2P int2P_t;
 
 	// SPEC permutation psuedocode is missing parentheses; better done with a LUT anyway
 	static const uint8_t PERMUTATIONS[6][3] = {{0,1,2},{1,2,0},{2,0,1},{0,2,1},{1,0,2},{2,1,0}};
@@ -3490,11 +4091,11 @@ J40_STATIC void j40__(inverse_rct,P)(j40__modular_t *m, const j40__transform_t *
 	}
 }
 
-J40_STATIC J40_RETURNS_ERR j40__(inverse_palette,P)(
-	j40__st *st, j40__modular_t *m, const j40__transform_t *tr
+J40_STATIC J40__RETURNS_ERR j40__(inverse_palette,P)(
+	j40__st *st, j40__modular *m, const j40__transform *tr
 ) {
-	typedef j40__intP_t intP_t;
-	typedef j40__int2P_t int2P_t;
+	typedef j40__intP intP_t;
+	typedef j40__int2P int2P_t;
 
 	// `first` is the index channel index; restored color channels will be at indices [first,last],
 	// where the original index channel is relocated to the index `last` and then repurposed.
@@ -3514,7 +4115,7 @@ J40_STATIC J40_RETURNS_ERR j40__(inverse_palette,P)(
 
 	for (i = first; i < last; ++i) m->channel[i].type = 0;
 	for (i = first; i < last; ++i) {
-		J40__TRY(j40__init_plane(st, J40__(PLANE_I,P), width, height, &m->channel[i]));
+		J40__TRY(j40__init_plane(st, J40__(PLANE_I,P), width, height, 0, &m->channel[i]));
 	}
 
 	if (use_wp) J40__TRY(j40__(init_wp,2P)(st, m->wp, width, &wp));
@@ -3551,7 +4152,7 @@ J40_STATIC J40_RETURNS_ERR j40__(inverse_palette,P)(
 					}
 				}
 				if (use_pred) {
-					j40__(neighbors_t,P) p = j40__(neighbors,P)(c, x, y);
+					j40__(neighbors,P) p = j40__(init_neighbors,P)(c, x, y);
 					j40__(wp_before_predict,2P)(&wp, x, y, &p);
 					// TODO handle overflow
 					if (is_delta) val = (intP_t) (val + j40__(predict,2P)(st, tr->pal.d_pred, &wp, &p));
@@ -3577,8 +4178,8 @@ J40__ON_ERROR:
 
 // ----------------------------------------
 // end of recursion
-	#undef j40__intP_t
-	#undef j40__int2P_t
+	#undef j40__intP
+	#undef j40__int2P
 	#undef J40__PIXELS
 	#undef J40__P
 	#undef J40__2P
@@ -3587,12 +4188,15 @@ J40__ON_ERROR:
 // ----------------------------------------
 
 #ifdef J40_IMPLEMENTATION
-J40_STATIC J40_RETURNS_ERR j40__inverse_transform(j40__st *st, j40__modular_t *m) {
+J40_STATIC J40__RETURNS_ERR j40__inverse_transform(j40__st *st, j40__modular *m) {
 	int32_t i;
 
-	if (st->image->modular_16bit_buffers) {
+	if (m->num_channels == 0) return 0;
+
+	switch (j40__plane_all_equal_typed(m->channel, m->channel + m->num_channels)) {
+	case J40__PLANE_I16:
 		for (i = m->nb_transforms - 1; i >= 0; --i) {
-			const j40__transform_t *tr = &m->transform[i];
+			const j40__transform *tr = &m->transform[i];
 			switch (tr->tr) {
 			case J40__TR_RCT: j40__inverse_rct16(m, tr); break;
 			case J40__TR_PALETTE: J40__TRY(j40__inverse_palette16(st, m, tr)); break;
@@ -3600,9 +4204,11 @@ J40_STATIC J40_RETURNS_ERR j40__inverse_transform(j40__st *st, j40__modular_t *m
 			default: J40__UNREACHABLE();
 			}
 		}
-	} else {
+		break;
+
+	case J40__PLANE_I32:
 		for (i = m->nb_transforms - 1; i >= 0; --i) {
-			const j40__transform_t *tr = &m->transform[i];
+			const j40__transform *tr = &m->transform[i];
 			switch (tr->tr) {
 			case J40__TR_RCT: j40__inverse_rct32(m, tr); break;
 			case J40__TR_PALETTE: J40__TRY(j40__inverse_palette32(st, m, tr)); break;
@@ -3610,6 +4216,9 @@ J40_STATIC J40_RETURNS_ERR j40__inverse_transform(j40__st *st, j40__modular_t *m
 			default: J40__UNREACHABLE();
 			}
 		}
+		break;
+
+	default: J40__UNREACHABLE();
 	}
 
 J40__ON_ERROR:
@@ -3627,7 +4236,7 @@ enum {
 };
 
 typedef struct {
-	enum { // the number of params per channel follows:
+	enum j40__dq_matrix_mode { // the number of params per channel follows:
 		J40__DQ_ENC_LIBRARY = 0, // 0
 		J40__DQ_ENC_HORNUSS = 1, // 3 (params)
 		J40__DQ_ENC_DCT2 = 2, // 6 (params)
@@ -3641,20 +4250,22 @@ typedef struct {
 	} mode;
 	int16_t n, m;
 	float (*params)[4]; // the last element per each row is unused
-} j40__dq_matrix_t;
+} j40__dq_matrix;
 
-J40_STATIC J40_RETURNS_ERR j40__dq_matrix(
-	j40__st *st, int32_t rows, int32_t columns, int32_t raw_sidx, j40__dq_matrix_t *dqmat
+J40_STATIC J40__RETURNS_ERR j40__read_dq_matrix(
+	j40__st *st, int32_t rows, int32_t columns, int64_t raw_sidx,
+	j40__tree_node *global_tree, const j40__code_spec *global_codespec, j40__dq_matrix *dqmat
 );
 J40_INLINE float j40__interpolate(float pos, int32_t c, const float (*bands)[4], int32_t len);
-J40_STATIC J40_RETURNS_ERR j40__interpolation_bands(
+J40_STATIC J40__RETURNS_ERR j40__interpolation_bands(
 	j40__st *st, const float (*params)[4], int32_t nparams, float (*out)[4]
 );
 J40_STATIC void j40__dct_quant_weights(
 	int32_t rows, int32_t columns, const float (*bands)[4], int32_t len, float (*out)[4]
 );
-J40_STATIC J40_RETURNS_ERR j40__load_dq_matrix(j40__st *st, int32_t idx, j40__dq_matrix_t *dqmat);
-J40_STATIC J40_RETURNS_ERR j40__natural_order(j40__st *st, int32_t log_rows, int32_t log_columns, int32_t **out);
+J40_STATIC J40__RETURNS_ERR j40__load_dq_matrix(j40__st *st, int32_t idx, j40__dq_matrix *dqmat);
+J40_STATIC void j40__free_dq_matrix(j40__dq_matrix *dqmat);
+J40_STATIC J40__RETURNS_ERR j40__natural_order(j40__st *st, int32_t log_rows, int32_t log_columns, int32_t **out);
 
 #ifdef J40_IMPLEMENTATION
 
@@ -3764,43 +4375,84 @@ static const int8_t J40__LOG_ORDER_SIZE[J40__NUM_ORDERS][2] = {
 	{3,3}, {3,3}, {4,4}, {5,5}, {3,4}, {3,5}, {4,5}, {6,6}, {5,6}, {7,7}, {6,7}, {8,8}, {7,8},
 };
 
-J40_STATIC J40_RETURNS_ERR j40__dq_matrix(
-	j40__st *st, int32_t rows, int32_t columns, int32_t raw_sidx, j40__dq_matrix_t *dqmat
+J40_STATIC J40__RETURNS_ERR j40__read_dq_matrix(
+	j40__st *st, int32_t rows, int32_t columns, int64_t raw_sidx,
+	j40__tree_node *global_tree, const j40__code_spec *global_codespec, j40__dq_matrix *dqmat
 ) {
+	j40__modular m = {0};
 	int32_t c, i, j;
 
-	dqmat->mode = j40__u(st, 3);
+	dqmat->mode = (enum j40__dq_matrix_mode) j40__u(st, 3);
 	dqmat->params = NULL;
 	if (dqmat->mode == J40__DQ_ENC_RAW) { // read as a modular image
-		float denom = j40__f16(st);
-		J40__TRY(j40__zero_pad_to_byte(st));
-		(void) raw_sidx;
-		J40__RAISE("TODO: RAW dequant matrix");
-	} else {
-		// interpreted as 0xABCD: A is 1 if 8x8 matrix is required, B is the fixed params size,
-		// C indicates that params[0..C-1] are to be scaled, D is the number of calls to ReadDctParams.
-		static const int16_t HOW[7] = {0x0000, 0x1330, 0x1660, 0x1221, 0x1101, 0x1962, 0x1001};
-		int32_t how = HOW[dqmat->mode];
-		int32_t nparams = how >> 8 & 15, nscaled = how >> 4 & 15, ndctparams = how & 15;
-		if (how >> 12) J40__SHOULD(rows == 8 && columns == 8, "dqm?");
-		J40__SHOULD(dqmat->params = malloc(sizeof(float[3]) * (size_t) (nparams + ndctparams * 16)), "!mem");
-		for (c = 0; c < 3; ++c) for (j = 0; j < nparams; ++j) {
-			dqmat->params[j][c] = j40__f16(st) * (j < nscaled ? 64.0f : 1.0f);
+		float denom, inv_denom;
+		int32_t w[3], h[3], x, y;
+
+		denom = j40__f16(st);
+		// TODO spec bug: ZeroPadToByte isn't required at this point
+		J40__SHOULD(j40__surely_nonzero(denom), "dqm0");
+		inv_denom = 1.0f / denom;
+
+		w[0] = w[1] = w[2] = columns;
+		h[0] = h[1] = h[2] = rows;
+		J40__TRY(j40__init_modular(st, 3, w, h, &m));
+		J40__TRY(j40__modular_header(st, global_tree, global_codespec, &m));
+		J40__TRY(j40__allocate_modular(st, &m));
+		for (c = 0; c < 3; ++c) J40__TRY(j40__modular_channel(st, &m, c, raw_sidx));
+		J40__TRY(j40__finish_and_free_code(st, &m.code));
+		J40__TRY(j40__inverse_transform(st, &m));
+
+		J40__SHOULD(dqmat->params = j40__malloc(sizeof(float[4]) * (size_t) (rows * columns)), "!mem");
+		for (c = 0; c < 3; ++c) {
+			if (m.channel[c].type == J40__PLANE_I16) {
+				for (y = 0; y < rows; ++y) {
+					int16_t *pixels = J40__I16_PIXELS(&m.channel[c], y);
+					for (x = 0; x < columns; ++x) {
+						dqmat->params[y * columns + x][c] = (float) pixels[x] * inv_denom;
+					}
+				}
+			} else {
+				for (y = 0; y < rows; ++y) {
+					int32_t *pixels = J40__I32_PIXELS(&m.channel[c], y);
+					for (x = 0; x < columns; ++x) {
+						dqmat->params[y * columns + x][c] = (float) pixels[x] * inv_denom;
+					}
+				}
+			}
 		}
-		for (i = 0; i < ndctparams; ++i) { // ReadDctParams
+
+		j40__free_modular(&m);
+		dqmat->n = (int16_t) rows;
+		dqmat->m = (int16_t) columns;
+	} else {
+		static const struct how {
+			int8_t requires8x8; // 1 if 8x8 matrix is required
+			int8_t nparams; // the number of fixed parameters
+			int8_t nscaled; // params[0..nscaled-1] should be scaled by 64
+			int8_t ndctparams; // the number of calls to ReadDctParams
+		} HOW[7] = {{0,0,0,0}, {1,3,3,0}, {1,6,6,0}, {1,2,2,1}, {1,1,0,1}, {1,9,6,2}, {1,0,0,1}};
+		struct how how = HOW[dqmat->mode];
+		int32_t paramsize = how.nparams + how.ndctparams * 16, paramidx = how.nparams;
+		if (how.requires8x8) J40__SHOULD(rows == 8 && columns == 8, "dqm?");
+		J40__SHOULD(dqmat->params = j40__malloc(sizeof(float[3]) * (size_t) paramsize), "!mem");
+		for (c = 0; c < 3; ++c) for (j = 0; j < how.nparams; ++j) {
+			dqmat->params[j][c] = j40__f16(st) * (j < how.nscaled ? 64.0f : 1.0f);
+		}
+		for (i = 0; i < how.ndctparams; ++i) { // ReadDctParams
 			int32_t n = *(i == 0 ? &dqmat->n : &dqmat->m) = (int16_t) (j40__u(st, 4) + 1);
 			for (c = 0; c < 3; ++c) for (j = 0; j < n; ++j) {
-				dqmat->params[nparams + j][c] = j40__f16(st) * (j == 0 ? 64.0f : 1.0f);
+				dqmat->params[paramidx + j][c] = j40__f16(st) * (j == 0 ? 64.0f : 1.0f);
 			}
-			nparams += n;
+			paramidx += n;
 		}
 		J40__RAISE_DELAYED();
 	}
 	return 0;
 
 J40__ON_ERROR:
-	free(dqmat->params);
+	j40__free(dqmat->params);
 	dqmat->params = NULL;
+	j40__free_modular(&m);
 	return st->err;
 }
 
@@ -3817,7 +4469,7 @@ J40_INLINE float j40__interpolate(float pos, int32_t c, const float (*bands)[4],
 	return a * powf(b / a, frac_idx);
 }
 
-J40_STATIC J40_RETURNS_ERR j40__interpolation_bands(
+J40_STATIC J40__RETURNS_ERR j40__interpolation_bands(
 	j40__st *st, const float (*params)[4], int32_t nparams, float (*out)[4]
 ) {
 	int32_t i, c;
@@ -3853,10 +4505,11 @@ J40_STATIC void j40__dct_quant_weights(
 
 // TODO spec issue: VarDCT uses the (row, column) notation, not the (x, y) notation; explicitly note this
 // TODO spec improvement: spec can provide computed matrices for default parameters to aid verification
-J40_STATIC J40_RETURNS_ERR j40__load_dq_matrix(j40__st *st, int32_t idx, j40__dq_matrix_t *dqmat) {
+J40_STATIC J40__RETURNS_ERR j40__load_dq_matrix(j40__st *st, int32_t idx, j40__dq_matrix *dqmat) {
 	enum { MAX_BANDS = 15 };
 	const struct j40__dct_params dct = J40__DCT_PARAMS[idx];
-	int32_t rows, columns, mode, n, m;
+	enum j40__dq_matrix_mode mode;
+	int32_t rows, columns, n, m;
 	const float (*params)[4];
 	float (*raw)[4] = NULL, bands[MAX_BANDS][4], scratch[64][4];
 	int32_t x, y, i, c;
@@ -3865,7 +4518,7 @@ J40_STATIC J40_RETURNS_ERR j40__load_dq_matrix(j40__st *st, int32_t idx, j40__dq
 	if (mode == J40__DQ_ENC_RAW) {
 		return 0; // nothing to do
 	} else if (mode == J40__DQ_ENC_LIBRARY) {
-		mode = dct.def_mode;
+		mode = (enum j40__dq_matrix_mode) dct.def_mode;
 		n = dct.def_n;
 		m = dct.def_m;
 		params = J40__LIBRARY_DCT_PARAMS + dct.def_offset;
@@ -3877,7 +4530,7 @@ J40_STATIC J40_RETURNS_ERR j40__load_dq_matrix(j40__st *st, int32_t idx, j40__dq
 
 	rows = 1 << dct.log_rows;
 	columns = 1 << dct.log_columns;
-	J40__SHOULD(raw = malloc(sizeof(float[4]) * (size_t) (rows * columns)), "!mem");
+	J40__SHOULD(raw = j40__malloc(sizeof(float[4]) * (size_t) (rows * columns)), "!mem");
 
 	switch (mode) {
 	case J40__DQ_ENC_DCT:
@@ -3986,7 +4639,7 @@ J40_STATIC J40_RETURNS_ERR j40__load_dq_matrix(j40__st *st, int32_t idx, j40__dq
 	default: J40__UNREACHABLE();
 	}
 
-	free(dqmat->params);
+	j40__free(dqmat->params);
 	dqmat->mode = J40__DQ_ENC_RAW;
 	dqmat->n = (int16_t) rows;
 	dqmat->m = (int16_t) columns;
@@ -3994,11 +4647,17 @@ J40_STATIC J40_RETURNS_ERR j40__load_dq_matrix(j40__st *st, int32_t idx, j40__dq
 	return 0;
 
 J40__ON_ERROR:
-	free(raw);
+	j40__free(raw);
 	return st->err;
 }
 
-J40_STATIC J40_RETURNS_ERR j40__natural_order(j40__st *st, int32_t log_rows, int32_t log_columns, int32_t **out) {
+J40_STATIC void j40__free_dq_matrix(j40__dq_matrix *dqmat) {
+	if (dqmat->mode != J40__DQ_ENC_LIBRARY) j40__free(dqmat->params);
+	dqmat->mode = J40__DQ_ENC_LIBRARY;
+	dqmat->params = NULL;
+}
+
+J40_STATIC J40__RETURNS_ERR j40__natural_order(j40__st *st, int32_t log_rows, int32_t log_columns, int32_t **out) {
 	int32_t size = 1 << (log_rows + log_columns), log_slope = log_columns - log_rows;
 	int32_t rows8 = 1 << (log_rows - 3), columns8 = 1 << (log_columns - 3);
 	int32_t *order = NULL;
@@ -4006,7 +4665,7 @@ J40_STATIC J40_RETURNS_ERR j40__natural_order(j40__st *st, int32_t log_rows, int
 
 	J40__ASSERT(8 >= log_columns && log_columns >= log_rows && log_rows >= 3);
 
-	J40__SHOULD(order = malloc(sizeof(int32_t) * (size_t) size), "!mem");
+	J40__SHOULD(order = j40__malloc(sizeof(int32_t) * (size_t) size), "!mem");
 
 	o = 0;
 	for (y = 0; y < rows8; ++y) for (x = 0; x < columns8; ++x) {
@@ -4051,16 +4710,18 @@ J40_STATIC J40_RETURNS_ERR j40__natural_order(j40__st *st, int32_t log_rows, int
 	return 0;
 
 J40__ON_ERROR:
-	free(order);
+	j40__free(order);
 	return st->err;
 }
 
 #endif // defined J40_IMPLEMENTATION
 
 ////////////////////////////////////////////////////////////////////////////////
-// frame header & TOC
+// frame context
 
-enum { J40__MAX_PASSES = 11 };
+enum {
+	J40__MAX_PASSES = 11,
+};
 
 enum {
 	J40__BLEND_REPLACE = 0, // new
@@ -4069,11 +4730,15 @@ enum {
 	J40__BLEND_MUL_ADD = 3, // old + new * alpha or equivalent, optionally clamped
 	J40__BLEND_MUL = 4,     // old * new, optionally clamped
 };
-typedef struct { int8_t mode, alpha_chan, clamp, src_ref_frame; } j40__blend_info;
+typedef struct {
+	int8_t mode, alpha_chan, clamp, src_ref_frame;
+} j40__blend_info;
 
 typedef struct j40__frame_st {
 	int is_last;
-	enum { J40__FRAME_REGULAR = 0, J40__FRAME_LF = 1, J40__FRAME_REFONLY = 2, J40__FRAME_REGULAR_SKIPPROG = 3 } type;
+	enum j40__frame_type {
+		J40__FRAME_REGULAR = 0, J40__FRAME_LF = 1, J40__FRAME_REFONLY = 2, J40__FRAME_REGULAR_SKIPPROG = 3
+	} type;
 	int is_modular; // VarDCT if false
 	int has_noise, has_patches, has_splines, use_lf_frame, skip_adapt_lf_smooth;
 	int do_ycbcr;
@@ -4086,8 +4751,10 @@ typedef struct j40__frame_st {
 	int8_t log_ds[J40__MAX_PASSES + 1]; // pass i shift range is [log_ds[i+1], log_ds[i])
 	int32_t lf_level;
 	int32_t x0, y0, width, height;
-	int32_t num_groups, num_lf_groups, num_lf_groups_per_row;
-	int32_t duration, timecode;
+	// there can be at most (2^23 + 146)^2 groups and (2^20 + 29)^2 LF groups in a single frame
+	int64_t num_groups, num_groups_per_row;
+	int64_t num_lf_groups, num_lf_groups_per_row;
+	int64_t duration, timecode;
 	j40__blend_info blend_info, *ec_blend_info;
 	int32_t save_as_ref;
 	int save_before_ct;
@@ -4095,20 +4762,20 @@ typedef struct j40__frame_st {
 	char *name;
 	struct {
 		int enabled;
-		float weights[3 /*xyb*/][2 /*0=weight1, 1=weight2*/];
+		float weights[3 /*xyb*/][2 /*0=weight1 (cardinal/center), 1=weight2 (diagonal/center)*/];
 	} gab;
 	struct {
 		int32_t iters;
 		float sharp_lut[8], channel_scale[3];
-		float quant_mul, pass0_sigma_circle, pass2_sigma_circle, border_sad_mul, sigma_for_modular;
+		float quant_mul, pass0_sigma_scale, pass2_sigma_scale, border_sad_mul, sigma_for_modular;
 	} epf;
 	// TODO spec bug: m_*_lf_unscaled are wildly incorrect, both in default values and scaling
 	float m_lf_scaled[3 /*xyb*/];
-	j40__tree_t *global_tree;
-	j40__code_spec_t global_codespec;
+	j40__tree_node *global_tree;
+	j40__code_spec global_codespec;
 
 	// modular only, available after LfGlobal (local groups are always pasted into gmodular)
-	j40__modular_t gmodular;
+	j40__modular gmodular;
 	int32_t num_gm_channels; // <= gmodular.num_channels
 
 	// vardct only, available after LfGlobal
@@ -4122,25 +4789,56 @@ typedef struct j40__frame_st {
 	float base_corr_x, base_corr_b;
 
 	// vardct only, available after HfGlobal/HfPass
-	int32_t dct_select_used, order_used; // bitset for DctSelect and order, respectively
-	j40__dq_matrix_t dq_matrix[J40__NUM_DCT_PARAMS];
+	int32_t dct_select_used, dct_select_loaded; // i-th bit for DctSelect i
+	int32_t order_used, order_loaded; // i-th bit for order i
+	j40__dq_matrix dq_matrix[J40__NUM_DCT_PARAMS];
 	int32_t num_hf_presets;
 	// Lehmer code + sentinel (-1) before actual coefficient decoding,
 	// either properly computed or discarded due to non-use later (can be NULL in that case)
 	int32_t *orders[J40__MAX_PASSES][J40__NUM_ORDERS][3 /*xyb*/];
-	j40__code_spec_t coeff_codespec[J40__MAX_PASSES];
+	j40__code_spec coeff_codespec[J40__MAX_PASSES];
 } j40__frame_st;
 
-J40_STATIC J40_RETURNS_ERR j40__frame_header(j40__st *st);
-J40_STATIC J40_RETURNS_ERR j40__permutation(
-	j40__st *st, j40__code_t *code, int32_t size, int32_t skip, int32_t **out
-);
-J40_INLINE void j40__apply_permutation(void *targetbuf, void *temp, size_t elemsize, const int32_t *lehmer);
-J40_STATIC J40_RETURNS_ERR j40__toc(j40__st *st);
+J40_STATIC void j40__free_frame_state(j40__frame_st *f);
 
 #ifdef J40_IMPLEMENTATION
 
-J40_STATIC J40_RETURNS_ERR j40__frame_header(j40__st *st) {
+J40_STATIC void j40__free_frame_state(j40__frame_st *f) {
+	int32_t i, j, k;
+	j40__free(f->ec_log_upsampling);
+	j40__free(f->ec_blend_info);
+	j40__free(f->name);
+	j40__free(f->global_tree);
+	j40__free_code_spec(&f->global_codespec);
+	j40__free_modular(&f->gmodular);
+	j40__free(f->block_ctx_map);
+	for (i = 0; i < J40__NUM_DCT_PARAMS; ++i) j40__free_dq_matrix(&f->dq_matrix[i]);
+	for (i = 0; i < J40__MAX_PASSES; ++i) {
+		for (j = 0; j < J40__NUM_ORDERS; ++j) {
+			for (k = 0; k < 3; ++k) {
+				j40__free(f->orders[i][j][k]);
+				f->orders[i][j][k] = NULL;
+			}
+		}
+		j40__free_code_spec(&f->coeff_codespec[i]);
+	}
+	f->ec_log_upsampling = NULL;
+	f->ec_blend_info = NULL;
+	f->name = NULL;
+	f->global_tree = NULL;
+	f->block_ctx_map = NULL;
+}
+
+#endif // defined J40_IMPLEMENTATION
+
+////////////////////////////////////////////////////////////////////////////////
+// frame header
+
+J40_STATIC J40__RETURNS_ERR j40__frame_header(j40__st *st);
+
+#ifdef J40_IMPLEMENTATION
+
+J40_STATIC J40__RETURNS_ERR j40__frame_header(j40__st *st) {
 	j40__image_st *im = st->image;
 	j40__frame_st *f = st->frame;
 	int32_t i, j;
@@ -4182,8 +4880,8 @@ J40_STATIC J40_RETURNS_ERR j40__frame_header(j40__st *st) {
 	f->epf.channel_scale[1] = 5.0f;
 	f->epf.channel_scale[2] = 3.5f;
 	f->epf.quant_mul = 0.46f;
-	f->epf.pass0_sigma_circle = 0.9f;
-	f->epf.pass2_sigma_circle = 6.5f;
+	f->epf.pass0_sigma_scale = 0.9f;
+	f->epf.pass2_sigma_scale = 6.5f;
 	f->epf.border_sad_mul = 2.0f / 3.0f;
 	f->epf.sigma_for_modular = 1.0f;
 	// TODO spec bug: default values for m_*_lf_unscaled should be reciprocals of the listed values
@@ -4191,15 +4889,16 @@ J40_STATIC J40_RETURNS_ERR j40__frame_header(j40__st *st) {
 	f->m_lf_scaled[1] = 1.0f / 512.0f;
 	f->m_lf_scaled[2] = 1.0f / 256.0f;
 	f->global_tree = NULL;
-	memset(&f->global_codespec, 0, sizeof(j40__code_spec_t));
-	memset(&f->gmodular, 0, sizeof(j40__modular_t));
+	memset(&f->global_codespec, 0, sizeof(j40__code_spec));
+	memset(&f->gmodular, 0, sizeof(j40__modular));
 	f->block_ctx_map = NULL;
 	f->inv_colour_factor = 1 / 84.0f;
 	f->x_factor_lf = 0;
 	f->b_factor_lf = 0;
 	f->base_corr_x = 0.0f;
 	f->base_corr_b = 1.0f;
-	f->dct_select_used = f->order_used = 0;
+	f->dct_select_used = f->dct_select_loaded = 0;
+	f->order_used = f->order_loaded = 0;
 	memset(f->dq_matrix, 0, sizeof(f->dq_matrix));
 	memset(f->orders, 0, sizeof(f->orders));
 	memset(f->coeff_codespec, 0, sizeof(f->coeff_codespec));
@@ -4210,7 +4909,7 @@ J40_STATIC J40_RETURNS_ERR j40__frame_header(j40__st *st) {
 	if (!j40__u(st, 1)) { // !all_default
 		int full_frame = 1;
 		uint64_t flags;
-		f->type = j40__u(st, 2);
+		f->type = (enum j40__frame_type) j40__u(st, 2);
 		f->is_modular = j40__u(st, 1);
 		flags = j40__u64(st);
 		f->has_noise = (int) (flags & 1);
@@ -4223,7 +4922,9 @@ J40_STATIC J40_RETURNS_ERR j40__frame_header(j40__st *st) {
 			if (f->do_ycbcr) f->jpeg_upsampling = j40__u(st, 6); // yes, we are lazy
 			f->log_upsampling = j40__u(st, 2);
 			J40__SHOULD(f->log_upsampling == 0, "TODO: upsampling is not yet implemented");
-			J40__SHOULD(f->ec_log_upsampling = malloc(sizeof(int32_t) * (size_t) im->num_extra_channels), "!mem");
+			J40__SHOULD(
+				f->ec_log_upsampling = j40__malloc(sizeof(int32_t) * (size_t) im->num_extra_channels),
+				"!mem");
 			for (i = 0; i < im->num_extra_channels; ++i) {
 				f->ec_log_upsampling[i] = j40__u(st, 2);
 				J40__SHOULD(f->ec_log_upsampling[i] == 0, "TODO: upsampling is not yet implemented");
@@ -4273,7 +4974,9 @@ J40_STATIC J40_RETURNS_ERR j40__frame_header(j40__st *st) {
 				f->width + f->x0 >= im->width && f->height + f->y0 >= im->height;
 		}
 		if (f->type == J40__FRAME_REGULAR || f->type == J40__FRAME_REGULAR_SKIPPROG) {
-			J40__SHOULD(f->ec_blend_info = malloc(sizeof(j40__blend_info) * (size_t) im->num_extra_channels), "!mem");
+			J40__SHOULD(
+				f->ec_blend_info = j40__malloc(sizeof(j40__blend_info) * (size_t) im->num_extra_channels),
+				"!mem");
 			for (i = -1; i < im->num_extra_channels; ++i) {
 				j40__blend_info *blend = i < 0 ? &f->blend_info : &f->ec_blend_info[i];
 				blend->mode = (int8_t) j40__u32(st, 0, 0, 1, 0, 2, 0, 3, 2);
@@ -4290,9 +4993,9 @@ J40_STATIC J40_RETURNS_ERR j40__frame_header(j40__st *st) {
 				}
 			}
 			if (im->anim_tps_denom) { // have_animation stored implicitly
-				f->duration = j40__u32(st, 0, 0, 1, 0, 0, 8, 0, 32); // TODO uh, u32?
+				f->duration = j40__64u32(st, 0, 0, 1, 0, 0, 8, 0, 32);
 				if (im->anim_have_timecodes) {
-					f->timecode = j40__u(st, 32); // TODO uh, u32??
+					f->timecode = j40__64u(st, 32);
 				}
 			}
 			f->is_last = j40__u(st, 1);
@@ -4318,7 +5021,9 @@ J40_STATIC J40_RETURNS_ERR j40__frame_header(j40__st *st) {
 			f->gab.enabled = restoration_all_default ? 1 : j40__u(st, 1);
 			if (f->gab.enabled) {
 				if (j40__u(st, 1)) { // gab_custom
-					for (i = 0; i < 3; ++i) for (j = 0; j < 2; ++j) f->gab.weights[i][j] = j40__f16(st);
+					for (i = 0; i < 3; ++i) {
+						for (j = 0; j < 2; ++j) f->gab.weights[i][j] = j40__f16(st);
+					}
 				}
 			}
 			f->epf.iters = restoration_all_default ? 2 : j40__u(st, 2);
@@ -4332,8 +5037,8 @@ J40_STATIC J40_RETURNS_ERR j40__frame_header(j40__st *st) {
 				}
 				if (j40__u(st, 1)) { // epf_sigma_custom
 					if (!f->is_modular) f->epf.quant_mul = j40__f16(st);
-					f->epf.pass0_sigma_circle = j40__f16(st);
-					f->epf.pass2_sigma_circle = j40__f16(st);
+					f->epf.pass0_sigma_scale = j40__f16(st);
+					f->epf.pass2_sigma_scale = j40__f16(st);
 					f->epf.border_sad_mul = j40__f16(st);
 				}
 				if (f->epf.iters && f->is_modular) f->epf.sigma_for_modular = j40__f16(st);
@@ -4345,26 +5050,62 @@ J40_STATIC J40_RETURNS_ERR j40__frame_header(j40__st *st) {
 	J40__RAISE_DELAYED();
 
 	if (im->xyb_encoded && im->want_icc) f->save_before_ct = 1; // ignores the decoded bit
-	f->num_groups = j40__ceil_div32(f->width, 1 << f->group_size_shift) *
-		j40__ceil_div32(f->height, 1 << f->group_size_shift);
+	f->num_groups_per_row = j40__ceil_div32(f->width, 1 << f->group_size_shift);
+	f->num_groups = f->num_groups_per_row * j40__ceil_div32(f->height, 1 << f->group_size_shift);
 	f->num_lf_groups_per_row = j40__ceil_div32(f->width, 8 << f->group_size_shift);
 	f->num_lf_groups = f->num_lf_groups_per_row * j40__ceil_div32(f->height, 8 << f->group_size_shift);
 	return 0;
 
 J40__ON_ERROR:
-	free(f->ec_log_upsampling);
-	free(f->ec_blend_info);
-	free(f->name);
+	j40__free(f->ec_log_upsampling);
+	j40__free(f->ec_blend_info);
+	j40__free(f->name);
 	f->ec_log_upsampling = NULL;
 	f->ec_blend_info = NULL;
 	f->name = NULL;
 	return st->err;
 }
 
+#endif // defined J40_IMPLEMENTATION
+
+////////////////////////////////////////////////////////////////////////////////
+// frame header
+
+typedef struct {
+	int64_t idx; // either LF group index (pass < 0) or group index (pass >= 0)
+	int64_t codeoff;
+	int32_t size;
+	int32_t pass; // pass number, or negative if this is an LF group section
+} j40__section;
+
+typedef struct {
+	// if nonzero, there is only single section of this size and other fields are ignored
+	int32_t single_size;
+
+	// LfGlobal and HfGlobal are common dependencies of other sections, and handled separately
+	int64_t lf_global_codeoff, hf_global_codeoff;
+	int32_t lf_global_size, hf_global_size;
+
+	// other sections are ordered by codeoff, unless the earlier section needs the later section
+	// for decoding, in which case the order gets swapped
+	int64_t nsections, nsections_read;
+	j40__section *sections;
+	int64_t end_codeoff;
+} j40__toc;
+
+J40_STATIC J40__RETURNS_ERR j40__permutation(
+	j40__st *st, j40__code_st *code, int32_t size, int32_t skip, int32_t **out
+);
+J40_INLINE void j40__apply_permutation(void *targetbuf, void *temp, size_t elemsize, const int32_t *lehmer);
+J40_STATIC J40__RETURNS_ERR j40__read_toc(j40__st *st, j40__toc *toc);
+J40_STATIC void j40__free_toc(j40__toc *toc);
+
+#ifdef J40_IMPLEMENTATION
+
 // also used in j40__hf_global; out is terminated by a sentinel (-1) or NULL if empty
 // TODO permutation may have to handle more than 2^31 entries
-J40_STATIC J40_RETURNS_ERR j40__permutation(
-	j40__st *st, j40__code_t *code, int32_t size, int32_t skip, int32_t **out
+J40_STATIC J40__RETURNS_ERR j40__permutation(
+	j40__st *st, j40__code_st *code, int32_t size, int32_t skip, int32_t **out
 ) {
 	int32_t *arr = NULL;
 	int32_t i, prev, end;
@@ -4379,7 +5120,7 @@ J40_STATIC J40_RETURNS_ERR j40__permutation(
 		return 0;
 	}
 
-	J40__SHOULD(arr = malloc(sizeof(int32_t) * (size_t) (end + 1)), "!mem");
+	J40__SHOULD(arr = j40__malloc(sizeof(int32_t) * (size_t) (end + 1)), "!mem");
 	prev = 0;
 	for (i = 0; i < end; ++i) {
 		prev = arr[i] = j40__code(st, j40__min32(7, j40__ceil_lg32((uint32_t) prev + 1)), 0, code);
@@ -4406,63 +5147,187 @@ J40_INLINE void j40__apply_permutation(
 	}
 }
 
-J40_STATIC J40_RETURNS_ERR j40__toc(j40__st *st) {
+J40_STATIC int j40__compare_section(const void *a, const void *b) {
+	const j40__section *aa = a, *bb = b;
+	return aa->codeoff < bb->codeoff ? -1 : aa->codeoff > bb->codeoff ? 1 : 0;
+}
+
+J40_STATIC J40__RETURNS_ERR j40__read_toc(j40__st *st, j40__toc *toc) {
 	j40__frame_st *f = st->frame;
-	typedef struct { int32_t lo, hi; } toc_t;
-	int32_t size = f->num_passes == 1 && f->num_groups == 1 ? 1 :
+
+	int64_t nsections = f->num_passes == 1 && f->num_groups == 1 ? 1 :
 		1 /*lf_global*/ + f->num_lf_groups /*lf_group*/ +
 		1 /*hf_global + hf_pass*/ + f->num_passes * f->num_groups /*group_pass*/;
-	toc_t *toc, temp;
-	int32_t *lehmer = NULL;
-	j40__code_spec_t codespec = {0};
-	j40__code_t code = { .spec = &codespec };
-	int32_t base, i;
+	int64_t nsections2;
+	j40__section *sections = NULL, *sections2 = NULL, temp;
 
-	J40__SHOULD(toc = malloc(sizeof(toc_t) * (size_t) size), "!mem");
+	// interleaved linked lists for each LF group; for each LF group `gg` there are three cases:
+	// - no relocated section if `relocs[gg].next == 0` (initial state).
+	// - a single relocated section `relocs[gg].section` if `relocs[gg].next < 0`.
+	// - 2+ relocated sections `relocs[i].section`, where `k` starts at `gg` and
+	//   continues through `next` until it's negative.
+	struct reloc { int64_t next; j40__section section; } *relocs = NULL;
+	int64_t nrelocs, relocs_cap;
+
+	int32_t *lehmer = NULL;
+	j40__code_spec codespec = {0};
+	j40__code_st code = { .spec = &codespec };
+	int64_t i, nremoved;
+	int32_t pass;
+
+	// TODO remove int32_t restrictions
+	J40__SHOULD((uint64_t) nsections <= SIZE_MAX && nsections <= INT32_MAX, "over");
 
 	if (j40__u(st, 1)) { // permuted
-		J40__TRY(j40__code_spec(st, 8, &codespec));
-		J40__TRY(j40__permutation(st, &code, size, 0, &lehmer));
+		J40__TRY(j40__read_code_spec(st, 8, &codespec));
+		J40__TRY(j40__permutation(st, &code, (int32_t) nsections, 0, &lehmer));
 		J40__TRY(j40__finish_and_free_code(st, &code));
 		j40__free_code_spec(&codespec);
-		J40__RAISE("TODO: should reorder groups in this case");
 	}
 	J40__TRY(j40__zero_pad_to_byte(st));
 
-	for (i = 0; i < size; ++i) {
-		toc[i].lo = i > 0 ? toc[i - 1].hi : 0;
-		toc[i].hi = toc[i].lo + j40__u32(st, 0, 10, 1024, 14, 17408, 22, 4211712, 30);
+	// single section case: no allocation required
+	if (nsections == 1) {
+		toc->single_size = j40__u32(st, 0, 10, 1024, 14, 17408, 22, 4211712, 30);
+		J40__TRY(j40__zero_pad_to_byte(st));
+		toc->lf_global_codeoff = toc->hf_global_codeoff = 0;
+		toc->lf_global_size = toc->hf_global_size = 0;
+		toc->nsections = toc->nsections_read = 0;
+		toc->sections = NULL;
+		J40__SHOULD(j40__add64(j40__codestream_offset(st), toc->single_size, &toc->end_codeoff), "over");
+		j40__free(lehmer);
+		return 0;
+	}
+
+	J40__SHOULD(sections = j40__malloc(sizeof(j40__section) * (size_t) nsections), "!mem");
+	for (i = 0; i < nsections; ++i) {
+		sections[i].size = j40__u32(st, 0, 10, 1024, 14, 17408, 22, 4211712, 30);
 	}
 	J40__TRY(j40__zero_pad_to_byte(st));
-	base = 0; // TODO (int32_t) (st->bits_read / 8);
-	for (i = 0; i < size; ++i) toc[i].lo += base, toc[i].hi += base;
 
-	if (lehmer) j40__apply_permutation(toc, &temp, sizeof(toc_t), lehmer);
+	sections[0].codeoff = j40__codestream_offset(st); // all TOC offsets are relative to this point
+	for (i = 1; i < nsections; ++i) {
+		J40__SHOULD(j40__add64(sections[i-1].codeoff, sections[i-1].size, &sections[i].codeoff), "over");
+	}
+	J40__SHOULD(j40__add64(sections[i-1].codeoff, sections[i-1].size, &toc->end_codeoff), "over");
 
-	printf("TOC: lf_global %d-%d\n", toc[0].lo, toc[0].hi);
-	if (size > 1) {
-		int32_t j, k;
-		printf("     lf_group");
-		for (i = 1, j = 0; j < f->num_lf_groups; ++i, ++j) printf(" %d:%d-%d", j, toc[i].lo, toc[i].hi);
-		printf("\n     hf_global/hf_pass %d-%d\n", toc[i].lo, toc[i].hi); ++i;
-		for (j = 0; j < f->num_passes; ++j) {
-			printf("     pass[%d]", j);
-			for (k = 0; k < f->num_groups; ++i, ++k) printf(" %d:%d-%d", k, toc[i].lo, toc[i].hi);
-			printf("\n");
+	if (lehmer) {
+		j40__apply_permutation(sections, &temp, sizeof(j40__section), lehmer);
+		j40__free(lehmer);
+		lehmer = NULL;
+	}
+
+	toc->lf_global_codeoff = sections[0].codeoff;
+	toc->lf_global_size = sections[0].size;
+	sections[0].codeoff = -1;
+	for (i = 0; i < f->num_lf_groups; ++i) {
+		sections[i + 1].pass = -1;
+		sections[i + 1].idx = i;
+	}
+	toc->hf_global_codeoff = sections[f->num_lf_groups + 1].codeoff;
+	toc->hf_global_size = sections[f->num_lf_groups + 1].size;
+	sections[f->num_lf_groups + 1].codeoff = -1;
+	for (pass = 0; pass < f->num_passes; ++pass) {
+		int64_t sectionid = 1 + f->num_lf_groups + 1 + pass * f->num_groups;
+		for (i = 0; i < f->num_groups; ++i) {
+			sections[sectionid + i].pass = pass;
+			sections[sectionid + i].idx = i;
 		}
 	}
-	fflush(stdout);
 
-	free(lehmer);
-	free(toc); // TODO use toc somehow (especially required for permuted one)
+	// any group section depending on the later LF group section is temporarily moved to relocs
+	{
+		int32_t ggrows = j40__ceil_div32(f->height, 8 << f->group_size_shift);
+		int32_t grows = j40__ceil_div32(f->height, 1 << f->group_size_shift);
+		int32_t ggcolumns = j40__ceil_div32(f->width, 8 << f->group_size_shift);
+		int32_t gcolumns = j40__ceil_div32(f->width, 1 << f->group_size_shift);
+		int32_t ggrow, ggcolumn;
+
+		J40__SHOULD(relocs = j40__calloc((size_t) f->num_lf_groups, sizeof(struct reloc)), "!mem");
+		nrelocs = relocs_cap = f->num_lf_groups;
+
+		for (ggrow = 0; ggrow < ggcolumns; ++ggrow) for (ggcolumn = 0; ggcolumn < ggrows; ++ggcolumn) {
+			int64_t ggidx = (int64_t) ggrow * ggcolumns + ggcolumn, ggsection = 1 + ggidx;
+			int64_t ggcodeoff = sections[ggsection].codeoff;
+			int64_t gsection_base = 1 + f->num_lf_groups + 1 + (int64_t) (ggrow * 8) * gcolumns + (ggcolumn * 8);
+			int32_t grows_in_gg = j40__min32((ggrow + 1) * 8, grows) - ggrow * 8;
+			int32_t gcolumns_in_gg = j40__min32((ggcolumn + 1) * 8, gcolumns) - ggcolumn * 8;
+			int32_t grow_in_gg, gcolumn_in_gg;
+
+			for (pass = 0; pass < f->num_passes; ++pass) {
+				for (grow_in_gg = 0; grow_in_gg < grows_in_gg; ++grow_in_gg) {
+					for (gcolumn_in_gg = 0; gcolumn_in_gg < gcolumns_in_gg; ++gcolumn_in_gg) {
+						int64_t gsection = gsection_base + pass * f->num_groups + 
+							(grow_in_gg * gcolumns + gcolumn_in_gg);
+						if (sections[gsection].codeoff > ggcodeoff) continue;
+						if (relocs[ggidx].next) {
+							J40__TRY_REALLOC64(&relocs, nrelocs + 1, &relocs_cap);
+							relocs[nrelocs] = relocs[ggidx];
+							relocs[ggidx].next = nrelocs++;
+						} else {
+							relocs[ggidx].next = -1;
+						}
+						relocs[ggidx].section = sections[gsection];
+						sections[gsection].codeoff = -1;
+					}
+				}
+			}
+		}
+	}
+
+	// remove any section with a codeoff -1 and sort the remainder
+	for (i = nremoved = 0; i < nsections; ++i) {
+		if (sections[i].codeoff < 0) {
+			++nremoved;
+		} else {
+			sections[i - nremoved] = sections[i];
+		}
+	}
+	qsort(sections, (size_t) (nsections - nremoved), sizeof(j40__section), j40__compare_section);
+
+	// copy sections to sections2, but insert any relocated sections after corresponding LF group section
+	J40__SHOULD(sections2 = j40__malloc(sizeof(j40__section) * (size_t) nsections), "!mem");
+	nsections2 = 0;
+	for (i = 0; i < nsections - nremoved; ++i) {
+		int64_t j, first_reloc_off;
+		sections2[nsections2++] = sections[i];
+		if (sections[i].pass >= 0) continue;
+		j = sections[i].idx;
+		if (!relocs[j].next) continue;
+		first_reloc_off = nsections2;
+		while (j >= 0) {
+			sections2[nsections2++] = relocs[j].section;
+			j = relocs[j].next;
+		}
+		qsort(sections2 + first_reloc_off, (size_t) (nsections2 - first_reloc_off),
+			sizeof(j40__section), j40__compare_section);
+	}
+
+	toc->sections = sections2;
+	toc->nsections = nsections2;
+	toc->nsections_read = 0;
+	J40__ASSERT(nsections2 == nsections - 2); // excludes LfGlobal and HfGlobal
+
+	j40__free(sections);
+	j40__free(relocs);
+	j40__free(lehmer);
+	j40__free_code(&code);
+	j40__free_code_spec(&codespec);
 	return 0;
 
 J40__ON_ERROR:
-	free(lehmer);
-	free(toc);
+	j40__free(sections);
+	j40__free(sections2);
+	j40__free(relocs);
+	j40__free(lehmer);
 	j40__free_code(&code);
 	j40__free_code_spec(&codespec);
 	return st->err;
+}
+
+J40_STATIC void j40__free_toc(j40__toc *toc) {
+	j40__free(toc->sections);
+	toc->sections = NULL;
 }
 
 #endif // defined J40_IMPLEMENTATION
@@ -5063,11 +5928,11 @@ J40_STATIC void j40__inverse_afv(float *buf, int flipx, int flipy) {
 ////////////////////////////////////////////////////////////////////////////////
 // LfGlobal: additional image features, HF block context, global tree, extra channels
 
-J40_STATIC J40_RETURNS_ERR j40__lf_global(j40__st *st);
+J40_STATIC J40__RETURNS_ERR j40__lf_global(j40__st *st);
 
 #ifdef J40_IMPLEMENTATION
 
-J40_STATIC J40_RETURNS_ERR j40__lf_global(j40__st *st) {
+J40_STATIC J40__RETURNS_ERR j40__lf_global(j40__st *st) {
 	j40__frame_st *f = st->frame;
 	int32_t sidx = 0;
 	int32_t i, j;
@@ -5093,7 +5958,7 @@ J40_STATIC J40_RETURNS_ERR j40__lf_global(j40__st *st) {
 				7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14,
 			};
 			f->block_ctx_size = sizeof(DEFAULT_BLKCTX) / sizeof(*DEFAULT_BLKCTX);
-			J40__SHOULD(f->block_ctx_map = malloc(sizeof(DEFAULT_BLKCTX)), "!mem");
+			J40__SHOULD(f->block_ctx_map = j40__malloc(sizeof(DEFAULT_BLKCTX)), "!mem");
 			memcpy(f->block_ctx_map, DEFAULT_BLKCTX, sizeof(DEFAULT_BLKCTX));
 			f->nb_qf_thr = f->nb_lf_thr[0] = f->nb_lf_thr[1] = f->nb_lf_thr[2] = 0; // SPEC is implicit
 			f->nb_block_ctx = 15;
@@ -5104,7 +5969,7 @@ J40_STATIC J40_RETURNS_ERR j40__lf_global(j40__st *st) {
 				f->nb_lf_thr[i] = j40__u(st, 4);
 				// TODO spec question: should this be sorted? (current code is okay with that)
 				for (j = 0; j < f->nb_lf_thr[i]; ++j) {
-					f->lf_thr[i][j] = j40__unpack_signed(j40__u32(st, 0, 4, 16, 8, 272, 16, 65808, 32));
+					f->lf_thr[i][j] = (int32_t) j40__unpack_signed64(j40__64u32(st, 0, 4, 16, 8, 272, 16, 65808, 32));
 				}
 				f->block_ctx_size *= f->nb_lf_thr[i] + 1; // SPEC is off by one
 			}
@@ -5114,7 +5979,7 @@ J40_STATIC J40_RETURNS_ERR j40__lf_global(j40__st *st) {
 			f->block_ctx_size *= f->nb_qf_thr + 1; // SPEC is off by one
 			// block_ctx_size <= 39*15^4 and never overflows
 			J40__SHOULD(f->block_ctx_size <= 39 * 64, "hfbc"); // SPEC limit is not 21*64
-			J40__SHOULD(f->block_ctx_map = malloc(sizeof(uint8_t) * (size_t) f->block_ctx_size), "!mem");
+			J40__SHOULD(f->block_ctx_map = j40__malloc(sizeof(uint8_t) * (size_t) f->block_ctx_size), "!mem");
 			J40__TRY(j40__cluster_map(st, f->block_ctx_size, 16, &f->nb_block_ctx, f->block_ctx_map));
 		}
 
@@ -5159,45 +6024,54 @@ J40__ON_ERROR:
 
 typedef struct {
 	int32_t coeffoff_qfidx; // offset to coeffs (always a multiple of 64) | qf index (always < 16)
-	int32_t hfmul_m1; // HfMul - 1 (to avoid overflow at this stage)
+	union {
+		int32_t m1; // HfMul - 1 during j40__hf_metadata, to avoid overflow at this stage
+		float inv; // 1 / HfMul after j40__hf_metadata
+	} hfmul;
 	// DctSelect is embedded in blocks
 } j40__varblock;
 
-typedef struct {
-	int32_t idx;
+typedef struct j40__lf_group_st {
+	int64_t idx;
+
+	int32_t left, top;
 	int32_t width, height; // <= 8192
 	int32_t width8, height8; // <= 1024
 	int32_t width64, height64; // <= 128
+
+	// contained group indices: [gidx + gstride * y, gidx + gstride * y + gcolumns) for each row
+	int64_t gidx, grows, gcolumns, gstride;
+
+	j40__plane xfromy, bfromy; // width64 x height64 each
+	j40__plane sharpness; // width8 x height8
+
 	int32_t nb_varblocks; // <= 2^20 (TODO spec issue: named nb_blocks)
-
-	// these are either int16_t* or int32_t* depending on modular_16bit_buffers, aligned like PIXELS
-	j40__plane xfromy, bfromy; // [width64*height64] each
-	j40__plane sharpness; // [width8*height8]
-
 	// bits 0..19: varblock index [0, nb_varblocks)
 	// bits 20..24: DctSelect + 2, or 1 if not the top-left corner (0 is reserved for unused block)
-	j40__plane blocks; // [width8*height8]
+	j40__plane blocks; // width8 x height8
 	j40__varblock *varblocks; // [nb_varblocks]
 
 	float *llfcoeffs[3]; // [width8*height8] each
-	float *coeffs[3]; // [width8*height8*64] each
+	// TODO coeffs can be integers before dequantization
+	float *coeffs[3]; // [width8*height8*64] each, aligned
+	#define J40__COEFFS_ALIGN 64
 	uint8_t coeffs_misalign[3];
 
 	// precomputed lf_idx
 	j40__plane lfindices; // [width8*height8]
-} j40__lf_group_t;
 
-J40_STATIC J40_RETURNS_ERR j40__lf_quant(
-	j40__st *st, int32_t extra_prec, j40__modular_t *m, j40__lf_group_t *gg, j40__plane outlfquant[3]
+	int loaded;
+} j40__lf_group_st;
+
+J40_STATIC J40__RETURNS_ERR j40__lf_quant(
+	j40__st *st, int32_t extra_prec, j40__modular *m, j40__lf_group_st *gg, j40__plane outlfquant[3]
 );
-J40_STATIC J40_RETURNS_ERR j40__hf_metadata(
+J40_STATIC J40__RETURNS_ERR j40__hf_metadata(
 	j40__st *st, int32_t nb_varblocks,
-	j40__modular_t *m, const j40__plane lfquant[3], j40__lf_group_t *gg
+	j40__modular *m, const j40__plane lfquant[3], j40__lf_group_st *gg
 );
-J40_STATIC J40_RETURNS_ERR j40__lf_group(
-	j40__st *st, int32_t ggw, int32_t ggh, int32_t ggidx, j40__lf_group_t *gg
-);
-J40_STATIC void j40__free_lf_group(j40__lf_group_t *gg);
+J40_STATIC J40__RETURNS_ERR j40__lf_group(j40__st *st, j40__lf_group_st *gg);
+J40_STATIC void j40__free_lf_group(j40__lf_group_st *gg);
 
 // ----------------------------------------
 // recursion for LF dequantization operations
@@ -5212,7 +6086,7 @@ J40_STATIC void j40__free_lf_group(j40__lf_group_t *gg);
 
 #endif // J40__RECURSING < 0
 #if J40__RECURSING == 400
-	#define j40__intP_t J40__CONCAT3(int, J40__P, _t)
+	#define j40__intP J40__CONCAT3(int, J40__P, _t)
 	#define J40__PIXELS J40__CONCAT3(J40__I, J40__P, _PIXELS)
 // ----------------------------------------
 
@@ -5224,7 +6098,7 @@ J40_STATIC void j40__(dequant_lf,P)(const j40__plane *in, float mult, j40__plane
 	J40__ASSERT(in->type == J40__(PLANE_I,P) && out->type == J40__PLANE_F32);
 	J40__ASSERT(in->width <= out->width && in->height <= out->height);
 	for (y = 0; y < in->height; ++y) {
-		j40__intP_t *inpixels = J40__PIXELS(in, y);
+		j40__intP *inpixels = J40__PIXELS(in, y);
 		float *outpixels = J40__F32_PIXELS(out, y);
 		for (x = 0; x < in->width; ++x) outpixels[x] = (float) inpixels[x] * mult;
 	}
@@ -5238,7 +6112,7 @@ J40_STATIC void j40__(add_thresholds,P)(
 	J40__ASSERT(in->type == J40__(PLANE_I,P) && plane->type == J40__PLANE_U8);
 	J40__ASSERT(in->width <= plane->width && in->height <= plane->height);
 	for (y = 0; y < plane->height; ++y) {
-		j40__intP_t *inpixels = J40__PIXELS(in, y);
+		j40__intP *inpixels = J40__PIXELS(in, y);
 		uint8_t *pixels = J40__U8_PIXELS(plane, y);
 		for (i = 0; i < nb_lf_thr; ++i) {
 			int32_t threshold = lf_thr[i];
@@ -5253,7 +6127,7 @@ J40_STATIC void j40__(add_thresholds,P)(
 
 // ----------------------------------------
 // end of recursion
-	#undef j40__intP_t
+	#undef j40__intP
 	#undef J40__PIXELS
 	#undef J40__P
 #endif // J40__RECURSING == 400
@@ -5289,12 +6163,12 @@ J40_STATIC void j40__multiply_each_u8(j40__plane *plane, int32_t mult) {
 	}
 }
 
-J40_STATIC J40_RETURNS_ERR j40__smooth_lf(j40__st *st, j40__lf_group_t *gg, j40__plane lfquant[3]) {
+J40_STATIC J40__RETURNS_ERR j40__smooth_lf(j40__st *st, j40__lf_group_st *gg, j40__plane lfquant[3]) {
 	static const float W0 = 0.05226273532324128f, W1 = 0.20345139757231578f, W2 = 0.0334829185968739f;
 
 	j40__frame_st *f = st->frame;
 	int32_t ggw8 = gg->width8, ggh8 = gg->height8;
-	float *temp;
+	float *linebuf = NULL, *nline[3], *line[3];
 	float inv_m_lf[3];
 	int32_t x, y, c;
 
@@ -5303,16 +6177,19 @@ J40_STATIC J40_RETURNS_ERR j40__smooth_lf(j40__st *st, j40__lf_group_t *gg, j40_
 		inv_m_lf[c] = (float) (f->global_scale * f->quant_lf) / f->m_lf_scaled[c] / 65536.0f;
 	}
 
-	J40__SHOULD(temp = malloc(sizeof(float) * (size_t) (ggw8 * 6)), "!mem");
+	J40__SHOULD(linebuf = j40__malloc(sizeof(float) * (size_t) (ggw8 * 6)), "!mem");
 	for (c = 0; c < 3; ++c) {
-		memcpy(temp + c * ggw8, J40__F32_PIXELS(&lfquant[c], 0), sizeof(float) * (size_t) ggw8);
+		nline[c] = linebuf + (c + 3) * ggw8; // intentionally uninitialized
+		line[c] = linebuf + c * ggw8; // row 0
+		memcpy(line[c], J40__F32_PIXELS(&lfquant[c], 0), sizeof(float) * (size_t) ggw8);
 	}
 
 	for (y = 1; y < ggh8 - 1; ++y) {
-		float *nline[3], *line[3], *outline[3], *sline[3];
+		float *outline[3], *sline[3];
 		for (c = 0; c < 3; ++c) {
-			nline[c] = temp + (y & 1 ? c : c + 3) * ggw8;
-			line[c] = temp + (y & 1 ? c + 3 : c) * ggw8;
+			float *temp = nline[c];
+			nline[c] = line[c];
+			line[c] = temp;
 			outline[c] = J40__F32_PIXELS(&lfquant[c], y);
 			sline[c] = J40__F32_PIXELS(&lfquant[c], y + 1);
 			memcpy(line[c], outline[c], sizeof(float) * (size_t) ggw8);
@@ -5320,26 +6197,26 @@ J40_STATIC J40_RETURNS_ERR j40__smooth_lf(j40__st *st, j40__lf_group_t *gg, j40_
 		for (x = 1; x < ggw8 - 1; ++x) {
 			float wa[3], diff[3], gap = 0.5f;
 			for (c = 0; c < 3; ++c) {
-				wa[c] = nline[c][x - 1] * W2 + nline[c][x] * W1 + nline[c][x + 1] * W2 +
-					line[c][x - 1] * W1 + line[c][x] * W0 + line[c][x + 1] * W1 +
-					sline[c][x - 1] * W2 + sline[c][x] * W1 + sline[c][x + 1] * W2;
+				wa[c] =
+					(nline[c][x - 1] * W2 + nline[c][x] * W1 + nline[c][x + 1] * W2) +
+					( line[c][x - 1] * W1 +  line[c][x] * W0 +  line[c][x + 1] * W1) +
+					(sline[c][x - 1] * W2 + sline[c][x] * W1 + sline[c][x + 1] * W2);
 				diff[c] = fabsf(wa[c] - line[c][x]) * inv_m_lf[c];
 				if (gap < diff[c]) gap = diff[c];
 			}
-			gap = 3.0f - 4.0f * gap;
-			if (gap < 0.0f) gap = 0.0f;
+			gap = j40__maxf(0.0f, 3.0f - 4.0f * gap);
 			// TODO spec bug: s (sample) and wa (weighted average) are swapped in the final formula
 			for (c = 0; c < 3; ++c) outline[c][x] = (wa[c] - line[c][x]) * gap + line[c][x];
 		}
 	}
 
 J40__ON_ERROR:
-	free(temp);
+	j40__free(linebuf);
 	return st->err;
 }
 
-J40_STATIC J40_RETURNS_ERR j40__lf_quant(
-	j40__st *st, int32_t extra_prec, j40__modular_t *m, j40__lf_group_t *gg, j40__plane outlfquant[3]
+J40_STATIC J40__RETURNS_ERR j40__lf_quant(
+	j40__st *st, int32_t extra_prec, j40__modular *m, j40__lf_group_st *gg, j40__plane outlfquant[3]
 ) {
 	static const int32_t YXB2XYB[3] = {1, 0, 2}; // TODO spec bug: this reordering is missing
 
@@ -5350,8 +6227,8 @@ J40_STATIC J40_RETURNS_ERR j40__lf_quant(
 
 	J40__ASSERT(j40__plane_all_equal_sized(m->channel, m->channel + 3));
 
-	for (c = 0; c < 3; ++c) J40__TRY(j40__init_plane(st, J40__PLANE_F32, ggw8, ggh8, &lfquant[c]));
-	J40__TRY(j40__init_and_clear_plane(st, J40__PLANE_U8, ggw8, ggh8, &lfindices));
+	for (c = 0; c < 3; ++c) J40__TRY(j40__init_plane(st, J40__PLANE_F32, ggw8, ggh8, 0, &lfquant[c]));
+	J40__TRY(j40__init_plane(st, J40__PLANE_U8, ggw8, ggh8, J40__PLANE_CLEAR, &lfindices));
 
 	// extract LfQuant from m and populate lfindices
 	for (c = 0; c < 3; ++c) {
@@ -5379,9 +6256,9 @@ J40__ON_ERROR:
 	return st->err;
 }
 
-J40_STATIC J40_RETURNS_ERR j40__hf_metadata(
+J40_STATIC J40__RETURNS_ERR j40__hf_metadata(
 	j40__st *st, int32_t nb_varblocks,
-	j40__modular_t *m, const j40__plane lfquant[3], j40__lf_group_t *gg
+	j40__modular *m, const j40__plane lfquant[3], j40__lf_group_st *gg
 ) {
 	j40__frame_st *f = st->frame;
 	j40__plane blocks = {0};
@@ -5400,31 +6277,31 @@ J40_STATIC J40_RETURNS_ERR j40__hf_metadata(
 	memset(&m->channel[1], 0, sizeof(j40__plane));
 	memset(&m->channel[3], 0, sizeof(j40__plane));
 
-	J40__TRY(j40__init_and_clear_plane(st, J40__PLANE_I32, ggw8, ggh8, &blocks));
-	J40__SHOULD(varblocks = malloc(sizeof(j40__varblock) * (size_t) nb_varblocks), "!mem");
+	J40__TRY(j40__init_plane(st, J40__PLANE_I32, ggw8, ggh8, J40__PLANE_CLEAR, &blocks));
+	J40__SHOULD(varblocks = j40__malloc(sizeof(j40__varblock) * (size_t) nb_varblocks), "!mem");
 	for (c = 0; c < 3; ++c) { // TODO account for chroma subsampling
-		J40__SHOULD(llfcoeffs[c] = malloc((size_t) (ggw8 * ggh8) * sizeof(float)), "!mem");
+		J40__SHOULD(llfcoeffs[c] = j40__malloc((size_t) (ggw8 * ggh8) * sizeof(float)), "!mem");
 		J40__SHOULD(
 			coeffs[c] = j40__alloc_aligned(
-				sizeof(float) * (size_t) (ggw8 * ggh8 * 64), J40__PIXELS_ALIGN, &coeffs_misalign[c]),
+				sizeof(float) * (size_t) (ggw8 * ggh8 * 64), J40__COEFFS_ALIGN, &coeffs_misalign[c]),
 			"!mem");
+		for (i = 0; i < ggw8 * ggh8 * 64; ++i) coeffs[c][i] = 0.0f;
 	}
 
 	// temporarily use coeffoff_qfidx to store DctSelect
-	// TODO spec issue: HfMul seems to be capped to [1, Quantizer::kQuantMax = 256] in libjxl
 	if (m->channel[2].type == J40__PLANE_I16) {
 		int16_t *blockinfo0 = J40__I16_PIXELS(&m->channel[2], 0);
 		int16_t *blockinfo1 = J40__I16_PIXELS(&m->channel[2], 1);
 		for (i = 0; i < nb_varblocks; ++i) {
 			varblocks[i].coeffoff_qfidx = blockinfo0[i];
-			varblocks[i].hfmul_m1 = blockinfo1[i];
+			varblocks[i].hfmul.m1 = blockinfo1[i];
 		}
 	} else {
 		int32_t *blockinfo0 = J40__I32_PIXELS(&m->channel[2], 0);
 		int32_t *blockinfo1 = J40__I32_PIXELS(&m->channel[2], 1);
 		for (i = 0; i < nb_varblocks; ++i) {
 			varblocks[i].coeffoff_qfidx = blockinfo0[i];
-			varblocks[i].hfmul_m1 = blockinfo1[i];
+			varblocks[i].hfmul.m1 = blockinfo1[i];
 		}
 	}
 
@@ -5485,12 +6362,15 @@ J40_STATIC J40_RETURNS_ERR j40__hf_metadata(
 	J40__SHOULD(voff == nb_varblocks, "vblk"); // TODO spec issue: missing
 	// TODO both libjxl and spec don't check for coeffoff == ggw8 * ggh8, but they probably should?
 
-	// compute qf_idx for later use
+	// compute qf_idx and hfmul.inv for later use
 	J40__ASSERT(f->nb_qf_thr < 16);
 	for (j = 0; j < f->nb_qf_thr; ++j) {
 		for (i = 0; i < nb_varblocks; ++i) {
-			varblocks[i].coeffoff_qfidx += varblocks[i].hfmul_m1 >= f->qf_thr[j];
+			varblocks[i].coeffoff_qfidx += varblocks[i].hfmul.m1 >= f->qf_thr[j];
 		}
+	}
+	for (i = 0; i < nb_varblocks; ++i) {
+		varblocks[i].hfmul.inv = 1.0f / ((float) varblocks[i].hfmul.m1 + 1.0f);
 	}
 
 	gg->nb_varblocks = nb_varblocks;
@@ -5505,21 +6385,20 @@ J40_STATIC J40_RETURNS_ERR j40__hf_metadata(
 
 J40__ON_ERROR:
 	j40__free_plane(&blocks);
-	free(varblocks);
+	j40__free(varblocks);
 	for (c = 0; c < 3; ++c) {
-		j40__free_aligned(coeffs[c], J40__PIXELS_ALIGN, coeffs_misalign[0]);
-		free(llfcoeffs[c]);
+		j40__free_aligned(coeffs[c], J40__COEFFS_ALIGN, coeffs_misalign[0]);
+		j40__free(llfcoeffs[c]);
 	}
 	return st->err;
 }
 
-J40_STATIC J40_RETURNS_ERR j40__lf_group(
-	j40__st *st, int32_t ggw, int32_t ggh, int32_t ggidx, j40__lf_group_t *gg
-) {
+J40_STATIC J40__RETURNS_ERR j40__lf_group(j40__st *st, j40__lf_group_st *gg) {
 	j40__frame_st *f = st->frame;
-	int32_t sidx0 = 1 + ggidx, sidx1 = 1 + f->num_lf_groups + ggidx, sidx2 = 1 + 2 * f->num_lf_groups + ggidx;
+	int64_t ggidx = gg->idx;
+	int64_t sidx0 = 1 + ggidx, sidx1 = 1 + f->num_lf_groups + ggidx, sidx2 = 1 + 2 * f->num_lf_groups + ggidx;
 	j40__plane lfquant[3] = {{0}};
-	j40__modular_t m = {0};
+	j40__modular m = {0};
 	int32_t i, c;
 
 	// TODO factor into j40__init_modular_for_lf_group
@@ -5532,14 +6411,11 @@ J40_STATIC J40_RETURNS_ERR j40__lf_group(
 	}
 
 	if (!f->is_modular) {
-		int32_t ggw8 = j40__ceil_div32(ggw, 8), ggh8 = j40__ceil_div32(ggh, 8);
-		int32_t ggw64 = j40__ceil_div32(ggw, 64), ggh64 = j40__ceil_div32(ggh, 64);
+		int32_t ggw8 = gg->width8, ggh8 = gg->height8;
+		int32_t ggw64 = gg->width64, ggh64 = gg->height64;
 		int32_t w[4], h[4], nb_varblocks;
 
-		J40__ASSERT(gg);
 		J40__ASSERT(ggw8 <= 1024 && ggh8 <= 1024);
-		gg->width = ggw; gg->width8 = ggw8; gg->width64 = ggw64;
-		gg->height = ggh; gg->height8 = ggh8; gg->height64 = ggh64;
 
 		// LfQuant
 		if (!f->use_lf_frame) {
@@ -5587,11 +6463,11 @@ J40__ON_ERROR:
 	return st->err;
 }
 
-J40_STATIC void j40__free_lf_group(j40__lf_group_t *gg) {
+J40_STATIC void j40__free_lf_group(j40__lf_group_st *gg) {
 	int32_t i;
 	for (i = 0; i < 3; ++i) {
-		free(gg->llfcoeffs[i]);
-		j40__free_aligned(gg->coeffs[i], J40__PIXELS_ALIGN, gg->coeffs_misalign[i]);
+		j40__free(gg->llfcoeffs[i]);
+		j40__free_aligned(gg->coeffs[i], J40__COEFFS_ALIGN, gg->coeffs_misalign[i]);
 		gg->llfcoeffs[i] = NULL;
 		gg->coeffs[i] = NULL;
 	}
@@ -5600,7 +6476,7 @@ J40_STATIC void j40__free_lf_group(j40__lf_group_t *gg) {
 	j40__free_plane(&gg->sharpness);
 	j40__free_plane(&gg->blocks);
 	j40__free_plane(&gg->lfindices);
-	free(gg->varblocks);
+	j40__free(gg->varblocks);
 	gg->varblocks = NULL;
 }
 
@@ -5609,16 +6485,16 @@ J40_STATIC void j40__free_lf_group(j40__lf_group_t *gg) {
 ////////////////////////////////////////////////////////////////////////////////
 // HfGlobal and HfPass
 
-J40_STATIC J40_RETURNS_ERR j40__hf_global(j40__st *st);
+J40_STATIC J40__RETURNS_ERR j40__hf_global(j40__st *st);
 
 #ifdef J40_IMPLEMENTATION
 
 // reads both HfGlobal and HfPass (SPEC they form a single group)
-J40_STATIC J40_RETURNS_ERR j40__hf_global(j40__st *st) {
+J40_STATIC J40__RETURNS_ERR j40__hf_global(j40__st *st) {
 	j40__frame_st *f = st->frame;
-	int32_t sidx_base = 1 + 3 * f->num_lf_groups;
-	j40__code_spec_t codespec = {0};
-	j40__code_t code = { .spec = &codespec };
+	int64_t sidx_base = 1 + 3 * f->num_lf_groups;
+	j40__code_spec codespec = {0};
+	j40__code_st code = { .spec = &codespec };
 	int32_t i, j, c;
 
 	J40__ASSERT(!f->is_modular);
@@ -5629,7 +6505,8 @@ J40_STATIC J40_RETURNS_ERR j40__hf_global(j40__st *st) {
 		for (i = 0; i < J40__NUM_DCT_PARAMS; ++i) { // SPEC not 11, should be 17
 			const struct j40__dct_params dct = J40__DCT_PARAMS[i];
 			int32_t rows = 1 << (int32_t) dct.log_rows, columns = 1 << (int32_t) dct.log_columns;
-			J40__TRY(j40__dq_matrix(st, rows, columns, sidx_base + i, &f->dq_matrix[i]));
+			J40__TRY(j40__read_dq_matrix(st, rows, columns, sidx_base + i,
+				f->global_tree, &f->global_codespec, &f->dq_matrix[i]));
 		}
 	}
 
@@ -5640,7 +6517,7 @@ J40_STATIC J40_RETURNS_ERR j40__hf_global(j40__st *st) {
 	// HfPass
 	for (i = 0; i < f->num_passes; ++i) {
 		int32_t used_orders = j40__u32(st, 0x5f, 0, 0x13, 0, 0, 0, 0, 13);
-		if (used_orders > 0) J40__TRY(j40__code_spec(st, 8, &codespec));
+		if (used_orders > 0) J40__TRY(j40__read_code_spec(st, 8, &codespec));
 		for (j = 0; j < J40__NUM_ORDERS; ++j) {
 			if (used_orders >> j & 1) {
 				int32_t size = 1 << (J40__LOG_ORDER_SIZE[j][0] + J40__LOG_ORDER_SIZE[j][1]);
@@ -5654,7 +6531,7 @@ J40_STATIC J40_RETURNS_ERR j40__hf_global(j40__st *st) {
 			j40__free_code_spec(&codespec);
 		}
 
-		J40__TRY(j40__code_spec(st, 495 * f->nb_block_ctx * f->num_hf_presets, &f->coeff_codespec[i]));
+		J40__TRY(j40__read_code_spec(st, 495 * f->nb_block_ctx * f->num_hf_presets, &f->coeff_codespec[i]));
 	}
 
 J40__ON_ERROR:
@@ -5666,32 +6543,32 @@ J40__ON_ERROR:
 ////////////////////////////////////////////////////////////////////////////////
 // PassGroup
 
-J40_STATIC J40_RETURNS_ERR j40__hf_coeffs(
+J40_STATIC J40__RETURNS_ERR j40__hf_coeffs(
 	j40__st *st, int32_t ctxoff, int32_t pass,
-	int32_t gx_in_gg, int32_t gy_in_gg, int32_t gw, int32_t gh, j40__lf_group_t *gg
+	int32_t gx_in_gg, int32_t gy_in_gg, int32_t gw, int32_t gh, j40__lf_group_st *gg
 );
-J40_STATIC J40_RETURNS_ERR j40__pass_group(
-	j40__st *st, int32_t pass, int32_t gx_in_gg, int32_t gy_in_gg, int32_t gw, int32_t gh, int32_t gidx,
-	int32_t ggx, int32_t ggy, j40__lf_group_t *gg
+J40_STATIC J40__RETURNS_ERR j40__pass_group(
+	j40__st *st, int32_t pass, int32_t gx_in_gg, int32_t gy_in_gg, int32_t gw, int32_t gh, int64_t gidx,
+	j40__lf_group_st *gg
 );
 
 #ifdef J40_IMPLEMENTATION
 
-J40_STATIC J40_RETURNS_ERR j40__hf_coeffs(
+J40_STATIC J40__RETURNS_ERR j40__hf_coeffs(
 	j40__st *st, int32_t ctxoff, int32_t pass,
-	int32_t gx_in_gg, int32_t gy_in_gg, int32_t gw, int32_t gh, j40__lf_group_t *gg
+	int32_t gx_in_gg, int32_t gy_in_gg, int32_t gw, int32_t gh, j40__lf_group_st *gg
 ) {
 	const j40__frame_st *f = st->frame;
 	int32_t gw8 = j40__ceil_div32(gw, 8), gh8 = j40__ceil_div32(gh, 8);
 	int8_t (*nonzeros)[3] = NULL;
-	j40__code_t code = { .spec = &f->coeff_codespec[pass] };
+	j40__code_st code = { .spec = &f->coeff_codespec[pass] };
 	int32_t lfidx_size = (f->nb_lf_thr[0] + 1) * (f->nb_lf_thr[1] + 1) * (f->nb_lf_thr[2] + 1);
 	int32_t x8, y8, i, j, c_yxb;
 
 	J40__ASSERT(gx_in_gg % 8 == 0 && gy_in_gg % 8 == 0);
 
 	// TODO spec bug: there are *three* NonZeros for each channel
-	J40__SHOULD(nonzeros = malloc(sizeof(int8_t[3]) * (size_t) (gw8 * gh8)), "!mem");
+	J40__SHOULD(nonzeros = j40__malloc(sizeof(int8_t[3]) * (size_t) (gw8 * gh8)), "!mem");
 
 	for (y8 = 0; y8 < gh8; ++y8) for (x8 = 0; x8 < gw8; ++x8) {
 		const j40__dct_select *dct;
@@ -5741,7 +6618,8 @@ J40_STATIC J40_RETURNS_ERR j40__hf_coeffs(
 			int32_t bctx = f->block_ctx_map[bctx0 + bctxc * c_yxb]; // BlockContext()
 			int32_t nz, nzctx, cctx, qnz, prev;
 
-			J40__ASSERT(order); // orders should have been already converted from Lehmer code
+			// orders should have been already converted from Lehmer code
+			J40__ASSERT(order && ((f->order_loaded >> dct->order_idx) & 1));
 
 			// predict and read the number of non-zero coefficients
 			nz = x8 > 0 ?
@@ -5783,28 +6661,27 @@ J40_STATIC J40_RETURNS_ERR j40__hf_coeffs(
 	}
 
 	J40__TRY(j40__finish_and_free_code(st, &code));
-	free(nonzeros);
+	j40__free(nonzeros);
 	return 0;
 
 J40__ON_ERROR:
 	j40__free_code(&code);
-	free(nonzeros);
+	j40__free(nonzeros);
 	return st->err;
 }
 
-J40_STATIC J40_RETURNS_ERR j40__pass_group(
-	j40__st *st, int32_t pass, int32_t gx_in_gg, int32_t gy_in_gg, int32_t gw, int32_t gh, int32_t gidx,
-	int32_t ggx, int32_t ggy, j40__lf_group_t *gg
+J40_STATIC J40__RETURNS_ERR j40__pass_group(
+	j40__st *st, int32_t pass, int32_t gx_in_gg, int32_t gy_in_gg, int32_t gw, int32_t gh, int64_t gidx,
+	j40__lf_group_st *gg
 ) {
 	j40__frame_st *f = st->frame;
 	// SPEC "the number of tables" is fixed, no matter how many RAW quant tables are there
-	int32_t sidx = 1 + 3 * f->num_lf_groups + J40__NUM_DCT_PARAMS + pass * f->num_groups + gidx;
-	j40__modular_t m = {0};
+	int64_t sidx = 1 + 3 * f->num_lf_groups + J40__NUM_DCT_PARAMS + pass * f->num_groups + gidx;
+	j40__modular m = {0};
 	int32_t i;
 
 	if (!f->is_modular) {
 		int32_t ctxoff;
-		J40__ASSERT(gg);
 		// TODO spec issue: this offset is later referred so should be monospaced
 		ctxoff = 495 * f->nb_block_ctx * j40__u(st, j40__ceil_lg32((uint32_t) f->num_hf_presets));
 		J40__TRY(j40__hf_coeffs(st, ctxoff, pass, gx_in_gg, gy_in_gg, gw, gh, gg));
@@ -5814,13 +6691,11 @@ J40_STATIC J40_RETURNS_ERR j40__pass_group(
 	if (m.num_channels > 0) {
 		J40__TRY(j40__modular_header(st, f->global_tree, &f->global_codespec, &m));
 		J40__TRY(j40__allocate_modular(st, &m));
-		for (i = 0; i < m.num_channels; ++i) {
-			J40__TRY(j40__modular_channel(st, &m, i, sidx));
-		}
+		for (i = 0; i < m.num_channels; ++i) J40__TRY(j40__modular_channel(st, &m, i, sidx));
 		J40__TRY(j40__finish_and_free_code(st, &m.code));
 		J40__TRY(j40__inverse_transform(st, &m));
-		j40__combine_modular_from_pass_group(st, f->num_gm_channels,
-			ggy + gy_in_gg, ggx + gx_in_gg, 0, 3, &f->gmodular, &m);
+		j40__combine_modular_from_pass_group(f->num_gm_channels,
+			gg->top + gy_in_gg, gg->left + gx_in_gg, 0, 3, &f->gmodular, &m);
 		j40__free_modular(&m);
 	}
 
@@ -5836,14 +6711,12 @@ J40__ON_ERROR:
 ////////////////////////////////////////////////////////////////////////////////
 // coefficients to samples
 
-J40_STATIC void j40__dequant_hf(j40__st *st, j40__lf_group_t *gg);
-J40_STATIC J40_RETURNS_ERR j40__combine_vardct_from_lf_group(
-	j40__st *st, int32_t ggx, int32_t ggy, const j40__lf_group_t *gg
-);
+J40_STATIC void j40__dequant_hf(j40__st *st, j40__lf_group_st *gg);
+J40_STATIC J40__RETURNS_ERR j40__combine_vardct_from_lf_group(j40__st *st, const j40__lf_group_st *gg);
 
 #ifdef J40_IMPLEMENTATION
 
-J40_STATIC void j40__dequant_hf(j40__st *st, j40__lf_group_t *gg) {
+J40_STATIC void j40__dequant_hf(j40__st *st, j40__lf_group_st *gg) {
 	// QM_SCALE[i] = 0.8^(i - 2)
 	static const float QM_SCALE[8] = {1.5625f, 1.25f, 1.0f, 0.8f, 0.64f, 0.512f, 0.4096f, 0.32768f};
 
@@ -5859,7 +6732,7 @@ J40_STATIC void j40__dequant_hf(j40__st *st, j40__lf_group_t *gg) {
 
 	for (y8 = 0; y8 < ggh8; ++y8) for (x8 = 0; x8 < ggw8; ++x8) {
 		const j40__dct_select *dct;
-		const j40__dq_matrix_t *dqmat;
+		const j40__dq_matrix *dqmat;
 		int32_t voff = J40__I32_PIXELS(&gg->blocks, y8)[x8], dctsel = voff >> 20, size;
 		float mult[3 /*xyb*/];
 
@@ -5868,7 +6741,7 @@ J40_STATIC void j40__dequant_hf(j40__st *st, j40__lf_group_t *gg) {
 		dct = &J40__DCT_SELECT[dctsel - 2];
 		size = 1 << (dct->log_rows + dct->log_columns);
 		// TODO spec bug: spec says mult[1] = HfMul, should be 2^16 / (global_scale * HfMul)
-		mult[1] = 65536.0f / (float) f->global_scale / (float) (gg->varblocks[voff].hfmul_m1 + 1);
+		mult[1] = 65536.0f / (float) f->global_scale * gg->varblocks[voff].hfmul.inv;
 		mult[0] = mult[1] * x_qm_scale;
 		mult[2] = mult[1] * b_qm_scale;
 		dqmat = &f->dq_matrix[dct->param_idx];
@@ -5889,9 +6762,7 @@ J40_STATIC void j40__dequant_hf(j40__st *st, j40__lf_group_t *gg) {
 	}
 }
 
-J40_STATIC J40_RETURNS_ERR j40__combine_vardct_from_lf_group(
-	j40__st *st, int32_t ggx, int32_t ggy, const j40__lf_group_t *gg
-) {
+J40_STATIC J40__RETURNS_ERR j40__combine_vardct_from_lf_group(j40__st *st, const j40__lf_group_st *gg) {
 	j40__image_st *im = st->image;
 	j40__frame_st *f = st->frame;
 	int32_t ggw8 = gg->width8, ggh8 = gg->height8;
@@ -5901,10 +6772,10 @@ J40_STATIC J40_RETURNS_ERR j40__combine_vardct_from_lf_group(
 	int32_t x8, y8, x, y, i, c;
 
 	for (c = 0; c < 3; ++c) {
-		J40__SHOULD(samples[c] = malloc(sizeof(float) * (size_t) (ggw * ggh)), "!mem");
+		J40__SHOULD(samples[c] = j40__malloc(sizeof(float) * (size_t) (ggw * ggh)), "!mem");
 	}
 	// TODO allocates the same amount of memory regardless of transformations used
-	J40__SHOULD(scratch = malloc(sizeof(float) * 2 * 65536), "!mem");
+	J40__SHOULD(scratch = j40__malloc(sizeof(float) * 2 * 65536), "!mem");
 	scratch2 = scratch + 65536;
 
 	kx_lf = f->base_corr_x + (float) f->x_factor_lf * f->inv_colour_factor;
@@ -5999,6 +6870,7 @@ J40_STATIC J40_RETURNS_ERR j40__combine_vardct_from_lf_group(
 	}
 
 	// coeffs is now correctly positioned, copy to the modular buffer
+	// TODO this is highly ad hoc, should be moved to rendering
 	for (c = 0; c < 3; ++c) cbrt_opsin_bias[c] = cbrtf(im->opsin_bias[c]);
 	for (y = 0; y < ggh; ++y) for (x = 0; x < ggw; ++x) {
 		int32_t pos = y * ggw + x;
@@ -6016,16 +6888,17 @@ J40_STATIC J40_RETURNS_ERR j40__combine_vardct_from_lf_group(
 	for (c = 0; c < 3; ++c) {
 		if (f->gmodular.channel[c].type == J40__PLANE_I16) {
 			for (y = 0; y < ggh; ++y) {
-				int16_t *pixels = J40__I16_PIXELS(&f->gmodular.channel[c], ggy + y);
+				int16_t *pixels = J40__I16_PIXELS(&f->gmodular.channel[c], gg->top + y);
 				for (x = 0; x < ggw; ++x) {
 					int32_t p = y * ggw + x;
 					float v = 
 						samples[0][p] * im->opsin_inv_mat[c][0] +
 						samples[1][p] * im->opsin_inv_mat[c][1] +
 						samples[2][p] * im->opsin_inv_mat[c][2];
+					// TODO very, very slow; probably different approximations per bpp ranges may be needed
 					v = (v <= 0.0031308f ? 12.92f * v : 1.055f * powf(v, 1.0f / 2.4f) - 0.055f); // to sRGB
 					// TODO overflow check
-					pixels[ggx + x] = (int16_t) ((float) ((1 << im->bpp) - 1) * v + 0.5f);
+					pixels[gg->left + x] = (int16_t) ((float) ((1 << im->bpp) - 1) * v + 0.5f);
 				}
 			}
 		} else {
@@ -6034,280 +6907,1233 @@ J40_STATIC J40_RETURNS_ERR j40__combine_vardct_from_lf_group(
 	}
 
 J40__ON_ERROR:
-	free(scratch);
-	for (c = 0; c < 3; ++c) free(samples[c]);
+	j40__free(scratch);
+	for (c = 0; c < 3; ++c) j40__free(samples[c]);
 	return st->err;
 }
 
 #endif // defined J40_IMPLEMENTATION
 
 ////////////////////////////////////////////////////////////////////////////////
-// frame
+// restoration filters
 
-J40_STATIC J40_RETURNS_ERR j40__frame(j40__st *st);
+J40_STATIC J40__RETURNS_ERR j40__gaborish(j40__st *st, j40__plane channels[3 /*xyb*/]);
+
+J40_STATIC int32_t j40__mirror1d(int32_t coord, int32_t size);
+J40_STATIC void j40__epf_distance(const j40__plane *in, int32_t dx, int32_t dy, j40__plane *out);
+J40_STATIC J40__RETURNS_ERR j40__epf_recip_sigmas(j40__st *st, const j40__lf_group_st *gg, j40__plane *out);
+J40_STATIC J40__RETURNS_ERR j40__epf_step(
+	j40__st *st, j40__plane channels[3], float sigma_scale, const j40__plane *recip_sigmas,
+	int32_t nkernels, const int32_t (*kernels)[2], j40__plane (*distances)[3], int dist_uses_cross,
+	const j40__lf_group_st *gg
+);
+J40_STATIC J40__RETURNS_ERR j40__epf(j40__st *st, j40__plane channels[3], const j40__lf_group_st *gg);
 
 #ifdef J40_IMPLEMENTATION
 
-J40_STATIC J40_RETURNS_ERR j40__frame(j40__st *st) {
+// TODO spec issue: restoration filters are applied to the entire image,
+// even though their parameters are separately signaled via multiple groups or LF groups!
+
+J40_STATIC J40__RETURNS_ERR j40__gaborish(j40__st *st, j40__plane channels[3 /*xyb*/]) {
 	j40__frame_st *f = st->frame;
-	j40__lf_group_t *gg = NULL;
-	int32_t i, j, c;
-	int single_section;
+	int32_t width, height;
+	int32_t c, x, y;
+	float *linebuf, *nline, *line;
 
-	J40__TRY(j40__frame_header(st));
-	J40__TRY(j40__toc(st));
-	// TODO subsequent groups can be reordered and should have separate bit readers
+	if (!f->gab.enabled) return 0;
 
-	// TODO spec issue: if there is a single section, there is no zero padding after the TOC
-	single_section = f->num_passes == 1 && f->num_groups == 1;
+	J40__ASSERT(j40__plane_all_equal_sized(channels, channels + 3));
+	J40__ASSERT(j40__plane_all_equal_typed(channels, channels + 3) == J40__PLANE_F32);
+	width = channels->width;
+	height = channels->height;
 
-	J40__TRY(j40__lf_global(st));
-	if (!single_section) J40__TRY(j40__zero_pad_to_byte(st));
+	J40__SHOULD(linebuf = j40__malloc(sizeof(float) * (size_t) (width * 2)), "!mem");
 
-	// LfGroups
-	{
-		int32_t ggsize = 8 << f->group_size_shift;
-		int32_t ggx, ggy, ggidx = 0;
-		J40__SHOULD(gg = calloc((size_t) f->num_lf_groups, sizeof(j40__lf_group_t)), "!mem");
-		for (ggy = 0; ggy < f->height; ggy += ggsize) {
-			int32_t ggh = j40__min32(ggsize, f->height - ggy);
-			for (ggx = 0; ggx < f->width; ggx += ggsize, ++ggidx) {
-				int32_t ggw = j40__min32(ggsize, f->width - ggx);
-				gg->idx = ggidx;
-				printf("lf group ggy %d ggx %d ggidx %d\n", ggy, ggx, ggidx); fflush(stdout);
-				J40__TRY(j40__lf_group(st, ggw, ggh, ggidx, f->is_modular ? NULL : &gg[ggidx]));
-				if (!single_section) J40__TRY(j40__zero_pad_to_byte(st));
+	for (c = 0; c < 3; ++c) {
+		float w0 = 1.0f, w1 = f->gab.weights[c][0], w2 = f->gab.weights[c][1];
+		float wsum = w0 + w1 * 4 + w2 * 4;
+		J40__SHOULD(j40__surely_nonzero(wsum), "gab0");
+		w0 /= wsum; w1 /= wsum; w2 /= wsum;
+
+		nline = linebuf + width; // intentionally uninitialized
+		line = linebuf; // row -1 (= row 0 after mirroring)
+		memcpy(line, J40__F32_PIXELS(&channels[c], 0), sizeof(float) * (size_t) width);
+
+		for (y = 0; y < height; ++y) {
+			float *sline, *outline, *temp = nline;
+			nline = line;
+			line = temp;
+			sline = y + 1 < height ? J40__F32_PIXELS(&channels[c], y + 1) : line;
+			outline = J40__F32_PIXELS(&channels[c], y);
+			memcpy(line, outline, sizeof(float) * (size_t) width);
+
+			outline[0] =
+				nline[0] * (w2 + w1) + nline[1] * w2 +
+				 line[0] * (w1 + w0) +  line[1] * w1 +
+				sline[0] * (w2 + w1) + sline[1] * w2;
+			for (x = 1; x < width - 1; ++x) {
+				outline[x] =
+					nline[x - 1] * w2 + nline[x] * w1 + nline[x + 1] * w2 +
+					 line[x - 1] * w1 +  line[x] * w0 +  line[x + 1] * w1 +
+					sline[x - 1] * w2 + sline[x] * w1 + sline[x + 1] * w2;
 			}
-		}
-	}
-
-	if (!f->is_modular) {
-		J40__TRY(j40__hf_global(st));
-		if (!single_section) J40__TRY(j40__zero_pad_to_byte(st));
-	}
-
-	// ensure all needed dequantization matrices loaded
-	for (j = 0; j < J40__NUM_DCT_SELECT; ++j) {
-		if (f->dct_select_used >> j & 1) {
-			const j40__dct_select *dct = &J40__DCT_SELECT[j];
-			int32_t param_idx = dct->param_idx;
-			J40__TRY(j40__load_dq_matrix(st, param_idx, &f->dq_matrix[param_idx]));
-		}
-	}
-
-	// PassGroups
-	for (i = 0; i < f->num_passes; ++i) {
-		int32_t gsize = 1 << f->group_size_shift, log_ggsize = 3 + f->group_size_shift;
-		int32_t gx, gy, gidx = 0;
-
-		if (i > 0) J40__RAISE("TODO: more passes");
-
-		// compute all needed coefficient orders and discard others
-		for (j = 0; j < J40__NUM_ORDERS; ++j) {
-			if (f->order_used >> j & 1) {
-				int32_t log_rows = J40__LOG_ORDER_SIZE[j][0];
-				int32_t log_columns = J40__LOG_ORDER_SIZE[j][1];
-				int32_t *order, temp, skip = 1 << (log_rows + log_columns - 6);
-				for (c = 0; c < 3; ++c) {
-					J40__TRY(j40__natural_order(st, log_rows, log_columns, &order));
-					j40__apply_permutation(order + skip, &temp, sizeof(int32_t), f->orders[i][j][c]);
-					free(f->orders[i][j][c]);
-					f->orders[i][j][c] = order;
-				}
-			} else {
-				for (c = 0; c < 3; ++c) {
-					free(f->orders[i][j][c]);
-					f->orders[i][j][c] = NULL;
-				}
-			}
-		}
-
-		for (gy = 0; gy < f->height; gy += gsize) {
-			int32_t gh = j40__min32(gsize, f->height - gy);
-			int32_t ggy = gy >> log_ggsize << log_ggsize;
-			int32_t ggrowidx = (gy >> log_ggsize) * f->num_lf_groups_per_row;
-			for (gx = 0; gx < f->width; gx += gsize, ++gidx) {
-				int32_t gw = j40__min32(gsize, f->width - gx);
-				int32_t ggx = gx >> log_ggsize << log_ggsize;
-				int32_t ggidx = ggrowidx + (gx >> log_ggsize);
-				printf("pass %d gy %d gx %d gw %d gh %d ggy %d ggx %d ggidx %d\n", i, gy, gx, gw, gh, ggy, ggx, ggidx); fflush(stdout);
-				J40__TRY(j40__pass_group(st, i, gx - ggx, gy - ggy, gw, gh, gidx, ggx, ggy,
-					f->is_modular ? NULL : &gg[ggidx]));
-				if (!single_section) J40__TRY(j40__zero_pad_to_byte(st));
-			}
-		}
-	}
-
-	J40__TRY(j40__zero_pad_to_byte(st)); // frame boundary is always byte-aligned
-	J40__TRY(j40__inverse_transform(st, &f->gmodular));
-
-	// render the LF group into modular buffers
-	if (!f->is_modular) {
-		int32_t ggsize = 8 << f->group_size_shift, ggx, ggy, ggidx = 0;
-
-		// TODO pretty incorrect to do this
-		J40__SHOULD(!f->do_ycbcr && st->image->cspace != J40__CS_GREY, "TODO: we don't yet do YCbCr or gray");
-		J40__SHOULD(st->image->modular_16bit_buffers, "TODO: !modular_16bit_buffers");
-		f->gmodular.num_channels = 3;
-		J40__SHOULD(f->gmodular.channel = calloc(3, sizeof(j40__plane)), "!mem");
-		for (i = 0; i < f->gmodular.num_channels; ++i) {
-			J40__TRY(j40__init_plane(st, J40__PLANE_I16, f->width, f->height, &f->gmodular.channel[i]));
-		}
-		for (ggy = 0; ggy < f->height; ggy += ggsize) {
-			for (ggx = 0; ggx < f->width; ggx += ggsize, ++ggidx) {
-				j40__dequant_hf(st, &gg[ggidx]);
-				J40__TRY(j40__combine_vardct_from_lf_group(st, ggx, ggy, &gg[ggidx]));
+			if (width > 1) {
+				outline[width - 1] =
+					nline[width - 2] * w2 + nline[width - 1] * (w1 + w2) +
+					 line[width - 2] * w1 +  line[width - 1] * (w0 + w1) +
+					sline[width - 2] * w2 + sline[width - 1] * (w1 + w2);
 			}
 		}
 	}
 
 J40__ON_ERROR:
-	if (gg) for (i = 0; i < f->num_lf_groups; ++i) j40__free_lf_group(&gg[i]);
-	free(gg);
+	j40__free(linebuf);
 	return st->err;
+}
+
+J40_STATIC int32_t j40__mirror1d(int32_t coord, int32_t size) {
+	while (1) {
+		if (coord < 0) coord = -coord - 1;
+		else if (coord >= size) coord = size * 2 - 1 - coord;
+		else return coord;
+	}
+}
+
+// computes out(x + 1, y + 1) = abs(in(x, y) - in(x + dx, y + dy)), up to mirroring.
+// used to compute DistanceStep* functions; an increased border is required for correctness.
+J40_STATIC void j40__epf_distance(const j40__plane *in, int32_t dx, int32_t dy, j40__plane *out) {
+	int32_t width = in->width, height = in->height;
+	int32_t x, y, xlo, xhi;
+
+	J40__ASSERT(width + 2 == out->width && height + 2 == out->height);
+	J40__ASSERT(in->type == J40__PLANE_F32 && out->type == J40__PLANE_F32);
+	J40__ASSERT(-2 <= dx && dx <= 2 && -2 <= dy && dy <= 2);
+
+	xlo = (dx > 0 ? 0 : -dx);
+	xhi = (dx < 0 ? width : width - dx);
+
+	// TODO spec issue: `[[(ix, iy) in coords]]` should be normative comments
+	// TODO spec issue: `ix` and `iy` not defined in DistanceStep2, should be 0
+
+	for (y = -1; y <= height; ++y) {
+		int32_t refy = j40__mirror1d(y, height), offy = j40__mirror1d(y + dy, height);
+		float *refpixels = J40__F32_PIXELS(in, refy);
+		float *offpixels = J40__F32_PIXELS(in, offy);
+		float *outpixels = J40__F32_PIXELS(out, y + 1) + 1;
+
+		for (x = -1; x < xlo; ++x) {
+			outpixels[x] = fabsf(refpixels[j40__mirror1d(x, width)] - offpixels[j40__mirror1d(x + dx, width)]);
+		}
+		for (; x < xhi; ++x) {
+			outpixels[x] = fabsf(refpixels[x] - offpixels[x + dx]);
+		}
+		for (; x <= width; ++x) {
+			outpixels[x] = fabsf(refpixels[j40__mirror1d(x, width)] - offpixels[j40__mirror1d(x + dx, width)]);
+		}
+	}
+}
+
+static const float J40__SIGMA_THRESHOLD = 0.3f;
+
+// computes f(sigma) for each block, where f(x) = 1/x if x >= J40__SIGMA_THRESHOLD and < 0 otherwise.
+// note that `inv_sigma` in the spec is not same to `1/sigma`, hence a different name.
+J40_STATIC J40__RETURNS_ERR j40__epf_recip_sigmas(j40__st *st, const j40__lf_group_st *gg, j40__plane *out) {
+	j40__frame_st *f = st->frame;
+	int32_t ggw8 = gg->width8, ggh8 = gg->height8;
+	float inv_quant_sharp_lut[8]; // 1 / (epf_quant_mul * epf_sharp_lut[i])
+	int32_t x8, y8, i;
+
+	J40__TRY(j40__init_plane(st, J40__PLANE_F32, gg->width8, gg->height8, J40__PLANE_FORCE_PAD, out));
+
+	for (i = 0; i < 8; ++i) {
+		float quant_sharp_lut = f->epf.quant_mul * f->epf.sharp_lut[i];
+		J40__SHOULD(j40__surely_nonzero(quant_sharp_lut), "epf0");
+		inv_quant_sharp_lut[i] = 1.0f / quant_sharp_lut;
+	}
+
+	if (gg->sharpness.type == J40__PLANE_I16) {
+		uint16_t sharpness_ub = 0;
+		for (y8 = 0; y8 < ggh8; ++y8) {
+			int16_t *sharpness = J40__I16_PIXELS(&gg->sharpness, y8);
+			float *recip_sigmas = J40__F32_PIXELS(out, y8);
+			for (x8 = 0; x8 < ggw8; ++x8) {
+				sharpness_ub |= (uint16_t) sharpness[x8];
+				recip_sigmas[x8] = inv_quant_sharp_lut[sharpness[x8] & 7];
+			}
+		}
+		J40__SHOULD(sharpness_ub < 8, "shrp");
+	} else {
+		uint32_t sharpness_ub = 0;
+		for (y8 = 0; y8 < ggh8; ++y8) {
+			int32_t *sharpness = J40__I32_PIXELS(&gg->sharpness, y8);
+			float *recip_sigmas = J40__F32_PIXELS(out, y8);
+			for (x8 = 0; x8 < ggw8; ++x8) {
+				sharpness_ub |= (uint32_t) sharpness[x8];
+				recip_sigmas[x8] = inv_quant_sharp_lut[sharpness[x8] & 7];
+			}
+		}
+		J40__SHOULD(sharpness_ub < 8, "shrp");
+	}
+
+	for (y8 = 0; y8 < ggh8; ++y8) {
+		int32_t *blocks = J40__I32_PIXELS(&gg->blocks, y8);
+		float *recip_sigmas = J40__F32_PIXELS(out, y8);
+		for (x8 = 0; x8 < ggw8; ++x8) {
+			int32_t voff = blocks[x8] & 0xfffff;
+			recip_sigmas[x8] *= gg->varblocks[voff].hfmul.inv;
+			if (recip_sigmas[x8] > 1.0f / J40__SIGMA_THRESHOLD) recip_sigmas[x8] = -1.0f;
+		}
+	}
+
+	return 0;
+
+J40__ON_ERROR:
+	j40__free_plane(out);
+	return st->err;
+}
+
+J40_STATIC J40__RETURNS_ERR j40__epf_step(
+	j40__st *st, j40__plane channels[3], float sigma_scale, const j40__plane *recip_sigmas,
+	int32_t nkernels, const int32_t (*kernels)[2], j40__plane (*distances)[3], int dist_uses_cross,
+	const j40__lf_group_st *gg
+) {
+	static const int NKERNELS = 12; // except for the center
+
+	j40__frame_st *f = st->frame;
+	int32_t ggw8 = gg->width8, ggh8 = gg->height8, width = gg->width, height = gg->height;
+	int32_t stride = width + 4, cstride = stride * 3;
+	int32_t borderx[4] = {-2, -1, width, width + 1}, mirrorx[4];
+	float *linebuf = NULL, *lines[5][3]; // [y+2][c] for row y in the channel c, with mirrored borders
+	float *recip_sigmas_for_modular = NULL; // only used for modular
+	float border_sigma_scale;
+	int32_t x, y, c, k, i;
+
+	J40__ASSERT(nkernels <= NKERNELS);
+
+	J40__ASSERT(j40__plane_all_equal_sized(channels, channels + 3));
+	J40__ASSERT(j40__plane_all_equal_typed(channels, channels + 3) == J40__PLANE_F32);
+	J40__ASSERT(channels->width == width && channels->height == height);
+
+	if (recip_sigmas) {
+		J40__ASSERT(recip_sigmas->width == ggw8 && recip_sigmas->height == ggh8);
+		J40__ASSERT(recip_sigmas->type == J40__PLANE_F32);
+	} else {
+		float recip_sigma;
+		J40__SHOULD(j40__surely_nonzero(f->epf.sigma_for_modular), "epf0");
+
+		// sigma is fixed for modular, so if this is below the threshold no filtering happens
+		if (f->epf.sigma_for_modular < J40__SIGMA_THRESHOLD) return 0;
+
+		J40__SHOULD(recip_sigmas_for_modular = j40__malloc(sizeof(float) * (size_t) ggw8), "!mem");
+		recip_sigma = 1.0f / f->epf.sigma_for_modular;
+		for (x = 0; x < ggw8; ++x) recip_sigmas_for_modular[x] = recip_sigma;
+	}
+
+	sigma_scale *= 1.9330952441687859f; // -1.65 * 4 * (sqrt(0.5) - 1)
+	border_sigma_scale = sigma_scale * f->epf.border_sad_mul;
+
+	for (c = 0; c < 3; ++c) {
+		for (k = 0; k < nkernels; ++k) {
+			j40__epf_distance(&channels[c], kernels[k][0], kernels[k][1], &distances[k][c]);
+		}
+	}
+
+	for (i = 0; i < 4; ++i) mirrorx[i] = j40__mirror1d(borderx[i], width);
+
+	J40__SHOULD(linebuf = j40__malloc(sizeof(float) * (size_t) (cstride * 4)), "!mem");
+	for (c = 0; c < 3; ++c) {
+		int32_t ym2 = j40__mirror1d(-2, height), ym1 = j40__mirror1d(-1, height);
+		for (i = 0; i < 4; ++i) lines[i][c] = linebuf + cstride * c + stride * i + 1;
+		memcpy(lines[1][c], J40__F32_PIXELS(&channels[c], ym2), sizeof(float) * (size_t) width);
+		memcpy(lines[2][c], J40__F32_PIXELS(&channels[c], ym1), sizeof(float) * (size_t) width);
+		memcpy(lines[3][c], J40__F32_PIXELS(&channels[c], 0), sizeof(float) * (size_t) width);
+		for (i = 0; i < 4; ++i) {
+			int32_t borderpos = c * cstride + borderx[i], mirrorpos = c * cstride + mirrorx[i];
+			lines[1][c][borderpos] = lines[1][c][mirrorpos];
+			lines[2][c][borderpos] = lines[2][c][mirrorpos];
+			lines[3][c][borderpos] = lines[3][c][mirrorpos];
+		}
+	}
+
+	for (y = 0; y < height; ++y) {
+		int32_t y1 = j40__mirror1d(y + 1, height), y2 = j40__mirror1d(y + 2, height);
+		float *outline[3];
+		float *recip_sigma_row =
+			recip_sigmas ? J40__F32_PIXELS(recip_sigmas, y / 8) : recip_sigmas_for_modular;
+		float *distance_rows[NKERNELS][3][3]; // [kernel_idx][dy+1][c]
+
+		for (c = 0; c < 3; ++c) {
+			float *temp = lines[0][c];
+			lines[0][c] = lines[1][c];
+			lines[1][c] = lines[2][c];
+			lines[2][c] = lines[3][c];
+			lines[3][c] = temp;
+			lines[4][c] = J40__F32_PIXELS(&channels[c], y2);
+			outline[c] = J40__F32_PIXELS(&channels[c], y);
+
+			memcpy(lines[3][c], J40__F32_PIXELS(&channels[c], y1), sizeof(float) * (size_t) width);
+			for (i = 0; i < 4; ++i) lines[3][c][borderx[i]] = lines[3][c][mirrorx[i]];
+
+			for (k = 0; k < nkernels; ++k) {
+				for (i = 0; i < 3; ++i) {
+					distance_rows[k][i][c] = J40__F32_PIXELS(&distances[k][c], y + i);
+				}
+			}
+		}
+
+		for (x = 0; x < width; ++x) {
+			float recip_sigma = recip_sigma_row[x / 8], inv_sigma_times_pos_mult;
+			float sum_weights, sum_channels[3];
+
+			if (recip_sigma < 0.0f) {
+				x += 7; // this and at most 7 subsequent pixels will be skipped anyway
+				continue;
+			}
+
+			// TODO spec issue: "either coordinate" refers to both x and y (i.e. "borders")
+			// according to the source code
+			if ((((x + 1) | (y + 1)) & 7) < 2) {
+				inv_sigma_times_pos_mult = recip_sigma * border_sigma_scale;
+			} else {
+				inv_sigma_times_pos_mult = recip_sigma * sigma_scale;
+			}
+
+			// kernels[*] do not include center, which distance is always 0
+			sum_weights = 1.0f;
+			for (c = 0; c < 3; ++c) sum_channels[c] = lines[2][c][x];
+
+			if (dist_uses_cross) {
+				for (k = 0; k < nkernels; ++k) {
+					float dist = 0.0f;
+					for (c = 0; c < 3; ++c) {
+						dist += f->epf.channel_scale[c] * (
+							distance_rows[k][1][c][x + 1] +
+							distance_rows[k][1][c][x + 0] + distance_rows[k][0][c][x + 1] +
+							distance_rows[k][2][c][x + 1] + distance_rows[k][1][c][x + 2]);
+					}
+					float weight = j40__maxf(0.0f, 1.0f + dist * inv_sigma_times_pos_mult);
+					sum_weights += weight;
+					for (c = 0; c < 3; ++c) {
+						sum_channels[c] += lines[2 + kernels[k][0]][c][x + kernels[k][1]] * weight;
+					}
+				}
+			} else {
+				for (k = 0; k < nkernels; ++k) {
+					float dist = 0.0f;
+					for (c = 0; c < 3; ++c) {
+						dist += f->epf.channel_scale[c] * distance_rows[k][1][c][x + 1];
+					}
+					float weight = j40__maxf(0.0f, 1.0f + dist * inv_sigma_times_pos_mult);
+					sum_weights += weight;
+					for (c = 0; c < 3; ++c) {
+						sum_channels[c] += lines[2 + kernels[k][0]][c][x + kernels[k][1]] * weight;
+					}
+				}
+			}
+
+			for (c = 0; c < 3; ++c) outline[c][x] = sum_channels[c] / sum_weights;
+		}
+	}
+
+J40__ON_ERROR:
+	j40__free(recip_sigmas_for_modular);
+	j40__free(linebuf);
+	return st->err;
+}
+
+J40_STATIC J40__RETURNS_ERR j40__epf(j40__st *st, j40__plane channels[3], const j40__lf_group_st *gg) {
+	static const int32_t KERNELS12[][2] = { // 0 < L1 distance <= 2 (step 2)
+		{0,-2}, {-1,-1}, {-1,0}, {-1,1}, {0,-2}, {0,-1}, {0,1}, {0,2}, {-1,1}, {-1,0}, {-1,1}, {0,2},
+	}, KERNELS4[][2] = { // 0 < L1 distance <= 1 (steps 0 and 1)
+		{0,-1}, {-1,0}, {1,0}, {0,1},
+	};
+
+	j40__frame_st *f = st->frame;
+	j40__plane recip_sigmas_ = {0}, *recip_sigmas;
+	j40__plane distances[12][3] = {};
+	int32_t k, c, maxnkernels = 0;
+
+	if (f->epf.iters <= 0) return 0;
+
+	if (!f->is_modular) {
+		recip_sigmas = &recip_sigmas_;
+		J40__TRY(j40__epf_recip_sigmas(st, gg, recip_sigmas));
+	} else {
+		recip_sigmas = NULL;
+	}
+
+	// TODO the current implementation takes up to 36 times the input image size of memory!
+	maxnkernels = f->epf.iters >= 3 ? 12 : 4;
+	for (k = 0; k < maxnkernels; ++k) for (c = 0; c < 3; ++c) {
+		J40__TRY(j40__init_plane(
+			st, J40__PLANE_F32, channels[c].width + 2, channels[c].height + 2, 0, &distances[k][c]));
+	}
+
+	if (f->epf.iters >= 3) { // step 0
+		J40__TRY(j40__epf_step(
+			st, channels, f->epf.pass0_sigma_scale, recip_sigmas, 12, KERNELS12, distances, 1, gg));
+	}
+	if (f->epf.iters >= 1) { // step 1
+		J40__TRY(j40__epf_step(st, channels, 1.0f, recip_sigmas, 4, KERNELS4, distances, 1, gg));
+	}
+	if (f->epf.iters >= 2) { // step 2
+		J40__TRY(j40__epf_step(
+			st, channels, f->epf.pass2_sigma_scale, recip_sigmas, 4, KERNELS4, distances, 0, gg));
+	}
+
+J40__ON_ERROR:
+	if (recip_sigmas) j40__free_plane(recip_sigmas);
+	for (k = 0; k < maxnkernels; ++k) for (c = 0; c < 3; ++c) j40__free_plane(&distances[k][c]);
+	return st->err;
+}
+
+#endif // J40_IMPLEMENTATION
+
+////////////////////////////////////////////////////////////////////////////////
+// frame parsing primitives
+
+struct j40__group_info {
+	int64_t ggidx;
+	int32_t gx_in_gg, gy_in_gg;
+	int32_t gw, gh;
+};
+
+typedef struct {
+	j40__st *parent; // can be NULL if not initialized
+	j40__st st;
+	j40__buffer_st buffer;
+} j40__section_st;
+
+J40_STATIC J40__RETURNS_ERR j40__allocate_lf_groups(j40__st *st, j40__lf_group_st **out);
+J40_STATIC J40__RETURNS_ERR j40__prepare_dq_matrices(j40__st *st);
+J40_STATIC J40__RETURNS_ERR j40__prepare_orders(j40__st *st);
+J40_ALWAYS_INLINE struct j40__group_info j40__group_info(j40__frame_st *f, int64_t gidx);
+
+J40_STATIC J40__RETURNS_ERR j40__init_section_state(
+	j40__st **stptr, j40__section_st *sst, int64_t codeoff, int32_t size
+);
+J40_STATIC J40__RETURNS_ERR j40__finish_section_state(j40__st **stptr, j40__section_st *sst, j40_err err);
+
+J40_STATIC J40__RETURNS_ERR j40__lf_global_in_section(j40__st *st, const j40__toc *toc);
+J40_STATIC J40__RETURNS_ERR j40__hf_global_in_section(j40__st *st, const j40__toc *toc);
+J40_STATIC J40__RETURNS_ERR j40__lf_or_pass_group_in_section(j40__st *st, j40__toc *toc, j40__lf_group_st *ggs);
+
+J40_STATIC J40__RETURNS_ERR j40__combine_vardct(j40__st *st, j40__lf_group_st *ggs);
+
+#ifdef J40_IMPLEMENTATION
+
+J40_STATIC J40__RETURNS_ERR j40__allocate_lf_groups(j40__st *st, j40__lf_group_st **out) {
+	j40__frame_st *f = st->frame;
+	j40__lf_group_st *ggs = NULL;
+	int32_t ggsize = 8 << f->group_size_shift, gsize = 1 << f->group_size_shift;
+	int32_t ggx, ggy, ggidx = 0, gidx = 0, gstride = j40__ceil_div32(f->width, gsize);
+
+	J40__SHOULD(ggs = j40__calloc((size_t) f->num_lf_groups, sizeof(j40__lf_group_st)), "!mem");
+
+	for (ggy = 0; ggy < f->height; ggy += ggsize) {
+		int32_t ggh = j40__min32(ggsize, f->height - ggy);
+		int32_t grows = j40__ceil_div32(ggh, gsize);
+		for (ggx = 0; ggx < f->width; ggx += ggsize, ++ggidx) {
+			j40__lf_group_st *gg = &ggs[ggidx];
+			int32_t ggw = j40__min32(ggsize, f->width - ggx);
+			int32_t gcolumns = j40__ceil_div32(ggw, gsize);
+			gg->idx = ggidx;
+			gg->left = ggx; gg->top = ggy;
+			gg->width = ggw; gg->height = ggh;
+			gg->width8 = j40__ceil_div32(ggw, 8); gg->height8 = j40__ceil_div32(ggh, 8);
+			gg->width64 = j40__ceil_div32(ggw, 64); gg->height64 = j40__ceil_div32(ggh, 64);
+			gg->gidx = gidx + (ggx >> f->group_size_shift);
+			gg->grows = grows;
+			gg->gcolumns = gcolumns;
+			gg->gstride = gstride;
+		}
+		gidx += grows * gstride;
+	}
+
+	J40__ASSERT(f->num_lf_groups == ggidx);
+	J40__ASSERT(f->num_groups == gidx);
+	*out = ggs;
+J40__ON_ERROR:
+	return st->err;
+}
+
+J40_STATIC J40__RETURNS_ERR j40__prepare_dq_matrices(j40__st *st) {
+	j40__frame_st *f = st->frame;
+	int32_t dct_select_not_loaded = f->dct_select_used & ~f->dct_select_loaded;
+	int32_t i;
+	if (!dct_select_not_loaded) return 0;
+	for (i = 0; i < J40__NUM_DCT_SELECT; ++i) {
+		if (dct_select_not_loaded >> i & 1) {
+			const j40__dct_select *dct = &J40__DCT_SELECT[i];
+			int32_t param_idx = dct->param_idx;
+			J40__TRY(j40__load_dq_matrix(st, param_idx, &f->dq_matrix[param_idx]));
+			f->dct_select_loaded |= 1 << i;
+		}
+	}
+J40__ON_ERROR:
+	return st->err;
+}
+
+J40_STATIC J40__RETURNS_ERR j40__prepare_orders(j40__st *st) {
+	j40__frame_st *f = st->frame;
+	int32_t order_not_loaded = f->order_used & ~f->order_loaded;
+	int32_t pass, i, c;
+	if (!order_not_loaded) return 0;
+	for (i = 0; i < J40__NUM_ORDERS; ++i) {
+		if (order_not_loaded >> i & 1) {
+			int32_t log_rows = J40__LOG_ORDER_SIZE[i][0];
+			int32_t log_columns = J40__LOG_ORDER_SIZE[i][1];
+			int32_t *order, temp, skip = 1 << (log_rows + log_columns - 6);
+			for (pass = 0; pass < f->num_passes; ++pass) for (c = 0; c < 3; ++c) {
+				J40__TRY(j40__natural_order(st, log_rows, log_columns, &order));
+				j40__apply_permutation(order + skip, &temp, sizeof(int32_t), f->orders[pass][i][c]);
+				j40__free(f->orders[pass][i][c]);
+				f->orders[pass][i][c] = order;
+			}
+			f->order_loaded |= 1 << i;
+		}
+	}
+J40__ON_ERROR:
+	return st->err;
+}
+
+J40_ALWAYS_INLINE struct j40__group_info j40__group_info(j40__frame_st *f, int64_t gidx) {
+	struct j40__group_info info;
+	int32_t shift = f->group_size_shift;
+	int64_t row, column;
+	J40__ASSERT(0 <= gidx && gidx < f->num_groups);
+	row = gidx / f->num_groups_per_row;
+	column = gidx % f->num_groups_per_row;
+	info.ggidx = (row / 8) * f->num_lf_groups_per_row + (column / 8);
+	info.gx_in_gg = (int32_t) (column % 8) << shift;
+	info.gy_in_gg = (int32_t) (row % 8) << shift;
+	info.gw = (int32_t) (j40__min64(f->width, (column + 1) << shift) - (column << shift));
+	info.gh = (int32_t) (j40__min64(f->height, (row + 1) << shift) - (row << shift));
+	return info;
+}
+
+// creates a new per-section state `sst` which is identical to `*stptr` except for `buffer`,
+// then ensures that only codestream offsets [codeoff, codeoff + size) are available to `sst`
+// and updates `stptr` to point to `sst`, which should be restored with `j40__finish_section_state`.
+J40_STATIC J40__RETURNS_ERR j40__init_section_state(
+	j40__st **stptr, j40__section_st *sst, int64_t codeoff, int32_t size
+) {
+	static const j40__buffer_st BUFFER_INIT = {0};
+	j40__st *st = *stptr;
+	int64_t fileoff, codeoff_limit;
+
+	sst->parent = NULL;
+
+	J40__ASSERT(codeoff <= INT64_MAX - size);
+	J40__TRY(j40__map_codestream_offset(st, codeoff, &fileoff));
+	J40__SHOULD(j40__add64(codeoff, size, &codeoff_limit), "over");
+
+	J40__TRY(j40__seek_from_source(st, fileoff)); // doesn't alter st->buffer
+
+	sst->st = *st;
+	sst->buffer = BUFFER_INIT;
+	sst->st.buffer = &sst->buffer;
+	J40__TRY(j40__init_buffer(&sst->st, codeoff, codeoff_limit));
+
+J40__ON_ERROR:
+	sst->parent = st;
+	*stptr = &sst->st;
+	return st->err;
+}
+
+J40_STATIC J40__RETURNS_ERR j40__finish_section_state(j40__st **stptr, j40__section_st *sst, j40_err err) {
+	j40__st *st;
+
+	if (!sst->parent) return err;
+	J40__ASSERT(*stptr == &sst->st);
+
+	if (err) {
+		*stptr = st = sst->parent;
+		J40__ASSERT(sst->st.err == err);
+		st->err = err;
+		st->saved_errno = sst->st.saved_errno;
+		st->cannot_retry = sst->st.cannot_retry;
+		// TODO `shrt` is not recoverable if this section is not the last section read
+	} else {
+		st = &sst->st;
+		J40__ASSERT(!st->err);
+		J40__TRY(j40__no_more_bytes(st));
+	}
+
+J40__ON_ERROR:
+	*stptr = st = sst->parent;
+	j40__free_buffer(&sst->buffer);
+
+	// ensure that other subsystems can't be accidentally deallocated
+	sst->parent = NULL;
+	sst->st.source = NULL;
+	sst->st.container = NULL;
+	sst->st.buffer = NULL;
+	sst->st.image = NULL;
+	sst->st.frame = NULL;
+
+	return st->err;
+}
+
+J40_STATIC J40__RETURNS_ERR j40__lf_global_in_section(j40__st *st, const j40__toc *toc) {
+	j40__section_st sst = {0};
+	if (!toc->single_size) {
+		J40__TRY(j40__init_section_state(&st, &sst, toc->lf_global_codeoff, toc->lf_global_size));
+	}
+	J40__TRY(j40__finish_section_state(&st, &sst, j40__lf_global(st)));
+J40__ON_ERROR:
+	return st->err;
+}
+
+J40_STATIC J40__RETURNS_ERR j40__hf_global_in_section(j40__st *st, const j40__toc *toc) {
+	j40__section_st sst = {0};
+	if (st->frame->is_modular) {
+		J40__SHOULD(toc->hf_global_size == 0, "excs");
+	} else {
+		if (!toc->single_size) {
+			J40__TRY(j40__init_section_state(&st, &sst, toc->hf_global_codeoff, toc->hf_global_size));
+		}
+		J40__TRY(j40__finish_section_state(&st, &sst, j40__hf_global(st)));
+	}
+J40__ON_ERROR:
+	return st->err;
+}
+
+J40_STATIC J40__RETURNS_ERR j40__lf_or_pass_group_in_section(j40__st *st, j40__toc *toc, j40__lf_group_st *ggs) {
+	j40__section section = toc->sections[toc->nsections_read];
+	j40__section_st sst = {0};
+
+	if (section.pass < 0) { // LF group
+		j40__lf_group_st *gg = &ggs[section.idx];
+		J40__TRY(j40__init_section_state(&st, &sst, section.codeoff, section.size));
+		J40__TRY(j40__finish_section_state(&st, &sst, j40__lf_group(st, gg)));
+		gg->loaded = 1;
+		J40__TRY(j40__prepare_dq_matrices(st));
+		J40__TRY(j40__prepare_orders(st));
+	} else { // pass group
+		struct j40__group_info info = j40__group_info(st->frame, section.idx);
+		j40__lf_group_st *gg = &ggs[info.ggidx];
+		J40__ASSERT(gg->loaded); // j40__read_toc should have taken care of this
+		J40__TRY(j40__init_section_state(&st, &sst, section.codeoff, section.size));
+		J40__TRY(j40__finish_section_state(&st, &sst, j40__pass_group(
+			st, section.pass, info.gx_in_gg, info.gy_in_gg, info.gw, info.gh, section.idx, gg)));
+	}
+
+	++toc->nsections_read;
+
+J40__ON_ERROR:
+	return st->err;
+}
+
+J40_STATIC J40__RETURNS_ERR j40__combine_vardct(j40__st *st, j40__lf_group_st *ggs) {
+	j40__frame_st *f = st->frame;
+	int64_t i;
+
+	// TODO pretty incorrect to do this
+	J40__SHOULD(!f->do_ycbcr && st->image->cspace != J40__CS_GREY, "TODO: we don't yet do YCbCr or gray");
+	J40__SHOULD(st->image->modular_16bit_buffers, "TODO: !modular_16bit_buffers");
+	f->gmodular.num_channels = 3;
+	J40__SHOULD(f->gmodular.channel = j40__calloc(3, sizeof(j40__plane)), "!mem");
+	for (i = 0; i < f->gmodular.num_channels; ++i) {
+		J40__TRY(j40__init_plane(
+			st, J40__PLANE_I16, f->width, f->height, J40__PLANE_FORCE_PAD, &f->gmodular.channel[i]));
+	}
+	for (i = 0; i < f->num_lf_groups; ++i) {
+		j40__dequant_hf(st, &ggs[i]);
+		J40__TRY(j40__combine_vardct_from_lf_group(st, &ggs[i]));
+	}
+
+J40__ON_ERROR:
+	return st->err;
+}
+
+J40_STATIC J40__RETURNS_ERR j40__end_of_frame(j40__st *st, const j40__toc *toc) {
+	J40__TRY(j40__zero_pad_to_byte(st));
+	if (toc->single_size) {
+		int64_t codeoff = j40__codestream_offset(st);
+		if (codeoff < toc->end_codeoff) {
+			st->cannot_retry = 1;
+			J40__RAISE("shrt");
+		} else {
+			J40__SHOULD(codeoff == toc->end_codeoff, "excs");
+		}
+	} else {
+		J40__TRY(j40__seek_buffer(st, toc->end_codeoff));
+	}
+J40__ON_ERROR:
+	return st->err;
+}
+
+#endif // defined J40_IMPLEMENTATION
+
+////////////////////////////////////////////////////////////////////////////////
+// rendering (currently very limited)
+
+J40_STATIC J40__RETURNS_ERR j40__render_to_u8x4_rgba(j40__st *st, j40__plane *out);
+
+#ifdef J40_IMPLEMENTATION
+
+J40_STATIC J40__RETURNS_ERR j40__render_to_u8x4_rgba(j40__st *st, j40__plane *out) {
+	j40__image_st *im = st->image;
+	j40__frame_st *f = st->frame;
+	j40__plane *c[4], rgba = {0};
+	int32_t maxpixel, maxpixel2;
+	int32_t i, x, y;
+
+	J40__SHOULD(im->modular_16bit_buffers, "TODO: specialize for 32-bit");
+	J40__SHOULD(im->bpp >= 8, "TODO: does not yet support <8bpp");
+	J40__SHOULD(im->exp_bits == 0, "TODO: float samples not yet supported");
+	J40__SHOULD(!(!f->do_ycbcr && im->xyb_encoded && im->cspace == J40__CS_GREY),
+		"TODO: direct luma encoding not yet supported");
+
+	J40__ASSERT(f->gmodular.num_channels >= 3);
+	for (i = 0; i < 3; ++i) c[i] = &f->gmodular.channel[i];
+	c[3] = NULL;
+	for (i = 3; i < f->gmodular.num_channels; ++i) {
+		j40__ec_info *ec = &im->ec_info[i - 3];
+		if (ec->type == J40__EC_ALPHA) {
+			J40__SHOULD(ec->bpp == im->bpp && ec->exp_bits == im->exp_bits,
+				"TODO: alpha channel has different bpp or sample type from color channels");
+			J40__SHOULD(ec->dim_shift == 0, "TODO: subsampled alpha not yet supported");
+			J40__SHOULD(!ec->data.alpha_associated, "TODO: associated alpha not yet supported");
+			c[3] = &f->gmodular.channel[i];
+			break;
+		}
+	}
+
+	J40__SHOULD(f->width < INT32_MAX / 4, "over");
+	J40__TRY(j40__init_plane(st, J40__PLANE_U8, f->width * 4, f->height, J40__PLANE_FORCE_PAD, &rgba));
+
+	maxpixel = (1 << im->bpp) - 1;
+	maxpixel2 = (1 << (im->bpp - 1));
+	for (y = 0; y < f->height; ++y) {
+		int16_t *pixels[4];
+		uint8_t *outpixels = J40__U8_PIXELS(&rgba, y);
+		for (i = 0; i < 4; ++i) pixels[i] = c[i] ? J40__I16_PIXELS(c[i], y) : NULL;
+		for (x = 0; x < f->width; ++x) {
+			for (i = 0; i < 4; ++i) {
+				// TODO optimize
+				int32_t p = j40__min32(j40__max32(0, pixels[i] ? pixels[i][x] : maxpixel), maxpixel);
+				outpixels[x * 4 + i] = (uint8_t) ((p * 255 + maxpixel2) / maxpixel);
+			}
+		}
+	}
+
+	*out = rgba;
+	return 0;
+
+J40__ON_ERROR:
+	j40__free_plane(&rgba);
+	return st->err;
+}
+
+#endif // defined J40_IMPLEMENTATION
+
+////////////////////////////////////////////////////////////////////////////////
+// API utilities
+
+// we don't trust callers and do the basic check ourselves
+#define J40__IMAGE_MAGIC ((uint32_t) 0x7867ae21) // crc32("j40_image")
+#define J40__IMAGE_ERR_MAGIC ((uint32_t) 0xb26a48aa) // crc32("j40_image with error")
+#define J40__IMAGE_OPEN_ERR_MAGIC ((uint32_t) 0x02c2eb6d) // crc32("j40_image with open error")
+#define J40__FRAME_MAGIC ((uint32_t) 0x08a296b3) // crc32("j40_frame")
+#define J40__FRAME_ERR_MAGIC ((uint32_t) 0x16351564) // crc32("j40_frame with error")
+#define J40__INNER_MAGIC ((uint32_t) 0x5009e1c4) // crc32("j40__inner")
+
+#define J40__FOREACH_API(X) \
+	X(from_file,) \
+	X(from_memory,) \
+	/* the last origin that can use alternative magic numbers, see J40__ORIGIN_LAST_ALT_MAGIC */ \
+	X(output_format,) \
+	X(next_frame,) \
+	X(current_frame,) \
+	X(frame_pixels,_*) \
+	X(error_string,) \
+	X(free,) \
+
+typedef enum { // each API defines its origin value; they don't have to be stable
+	J40__ORIGIN_NONE = 0,
+	J40__ORIGIN_NEXT, // for j40_free; the next call will be the actual origin
+#define J40__ORIGIN_ENUM_VALUE(origin, suffix) J40__ORIGIN_##origin,
+	J40__FOREACH_API(J40__ORIGIN_ENUM_VALUE)
+	J40__ORIGIN_MAX,
+	J40__ORIGIN_LAST_ALT_MAGIC = J40__ORIGIN_from_memory,
+} j40__origin;
+
+static const char *J40__ORIGIN_NAMES[] = {
+	"(unknown)",
+	NULL,
+#define J40__ORIGIN_NAME(origin, suffix) #origin #suffix,
+	J40__FOREACH_API(J40__ORIGIN_NAME)
+};
+
+static const struct { char err[4]; const char *msg, *suffix; } J40__ERROR_STRINGS[] = {
+	{ "Upt0", "`path` parameter is NULL", NULL },
+	{ "Ubf0", "`buf` parameter is NULL", NULL },
+	{ "Uch?", "Bad `channel` parameter", NULL },
+	{ "Ufm?", "Bad `format` parameter", NULL },
+	{ "Uof?", "Bad `channel` and `format` combination", NULL },
+	{ "Ufre", "Trying to reuse already freed image", NULL },
+	{ "!mem", "Out of memory", NULL },
+	{ "!jxl", "The JPEG XL signature is not found", NULL },
+	{ "open", "Failed to open file", NULL },
+	{ "bigg", "Image is too big to handle", NULL },
+	{ "over", "File is too big to handle", NULL },
+	{ "shrt", "Premature end of file", NULL },
+	{ "TODO", "Unimplemented feature encountered", NULL }, // TODO remove this when ready
+	{ "TEST", "Testing-only error occurred", NULL },
+};
+
+// an API-level twin of `j40__st`; see `j40__st` documentation for the rationale for split.
+typedef struct j40__inner {
+	uint32_t magic; // should be J40__INNER_MAGIC
+
+	//j40__mutex mutex;
+
+	j40__origin origin; // error origin
+	// same to those in j40__st
+	j40_err err;
+	int saved_errno;
+	int cannot_retry;
+
+	#define J40__ERRBUF_LEN 256
+	char errbuf[J40__ERRBUF_LEN];
+
+	int state; // used in j40_advance
+
+	// subsystem contexts; copied to and from j40__st whenever needed
+	struct j40__bits_st bits;
+	struct j40__source_st source;
+	struct j40__container_st container;
+	struct j40__buffer_st buffer;
+	struct j40__image_st image;
+	struct j40__frame_st frame;
+	struct j40__lf_group_st *lf_groups; // [frame.num_lf_groups]
+
+	j40__toc toc;
+
+	int rendered;
+	j40__plane rendered_rgba;
+} j40__inner;
+
+J40_STATIC J40__RETURNS_ERR j40__set_alt_magic(
+	j40_err err, int saved_errno, j40__origin origin, j40_image *image
+);
+J40_STATIC J40__RETURNS_ERR j40__set_magic(j40__inner *inner, j40_image *image);
+
+J40_STATIC J40__RETURNS_ERR j40__check_image(j40_image *image, j40__origin neworigin, j40__inner **outinner);
+#define J40__CHECK_IMAGE() do { \
+		j40_err err = j40__check_image((j40_image*) image, ORIGIN, &inner); \
+		if (err) return err; \
+	} while (0)
+#define J40__SET_INNER_ERR(s) (inner->origin = ORIGIN, inner->err = J40__4(s))
+
+J40_STATIC void j40__init_state(j40__st *st, j40__inner *inner);
+J40_STATIC void j40__save_state(j40__st *st, j40__inner *inner, j40__origin origin);
+
+J40_STATIC J40__RETURNS_ERR j40__advance(j40__inner *inner, j40__origin origin/*, int32_t until*/);
+
+J40_STATIC void j40__free_inner(j40__inner *inner);
+
+#ifdef J40_IMPLEMENTATION
+
+J40_STATIC J40__RETURNS_ERR j40__set_alt_magic(
+	j40_err err, int saved_errno, j40__origin origin, j40_image *image
+) {
+	if (err == J40__4("open")) {
+		image->magic = J40__IMAGE_OPEN_ERR_MAGIC ^ (uint32_t) origin;
+		image->u.saved_errno = saved_errno;
+		return err;
+	} else {
+		image->magic = J40__IMAGE_ERR_MAGIC ^ (uint32_t) origin;
+		return image->u.err = err;
+	}
+}
+
+J40_STATIC J40__RETURNS_ERR j40__set_magic(j40__inner *inner, j40_image *image) {
+	image->magic = J40__IMAGE_MAGIC;
+	image->u.inner = inner;
+	inner->magic = J40__INNER_MAGIC;
+	return 0;
+}
+
+J40_STATIC J40__RETURNS_ERR j40__check_image(j40_image *image, j40__origin neworigin, j40__inner **outinner) {
+	*outinner = NULL;
+	if (!image) return J40__4("Uim0");
+	if (image->magic != J40__IMAGE_MAGIC) {
+		uint32_t origin = image->magic ^ J40__IMAGE_ERR_MAGIC;
+		if (0 < origin && origin <= J40__ORIGIN_LAST_ALT_MAGIC) {
+			if (origin == J40__ORIGIN_NEXT && neworigin) image->magic = J40__IMAGE_ERR_MAGIC ^ neworigin;
+			return image->u.err;
+		}
+		origin = image->magic ^ J40__IMAGE_OPEN_ERR_MAGIC;
+		if (0 < origin && origin <= J40__ORIGIN_LAST_ALT_MAGIC) return J40__4("open");
+		return J40__4("Uim?");
+	}
+	if (!image->u.inner || image->u.inner->magic != J40__INNER_MAGIC) return J40__4("Uim?");
+	*outinner = image->u.inner;
+	return image->u.inner->cannot_retry ? image->u.inner->err : 0;
+}
+
+J40_STATIC void j40__init_state(j40__st *st, j40__inner *inner) {
+	st->err = 0;
+	st->saved_errno = 0;
+	st->cannot_retry = 0;
+	st->bits = inner->buffer.checkpoint;
+	st->source = &inner->source;
+	st->container = &inner->container;
+	st->buffer = &inner->buffer;
+	st->image = &inner->image;
+	st->frame = &inner->frame;
+}
+
+J40_STATIC void j40__save_state(j40__st *st, j40__inner *inner, j40__origin origin) {
+	if (st->err) {
+		inner->origin = origin;
+		inner->err = st->err;
+		inner->saved_errno = st->saved_errno;
+		inner->cannot_retry = st->cannot_retry;
+	} else {
+		inner->buffer.checkpoint = st->bits;
+	}
+}
+
+// TODO expose this with a proper interface
+J40_STATIC J40__RETURNS_ERR j40__advance(j40__inner *inner, j40__origin origin/*, int32_t until*/) {
+	j40__st stbuf, *st = &stbuf;
+	j40__frame_st *f;
+
+	j40__init_state(st, inner);
+
+	// a less-known coroutine hack with some tweak.
+	// see https://www.chiark.greenend.org.uk/~sgtatham/coroutines.html for basic concepts.
+	//
+	// it is EXTREMELY important that any `J40__YIELD_AFTER` call may fail, and the next call
+	// to `j40_advance` will restart after the last successful `J40__YIELD_AFTER` call.
+	// therefore any code between two `J40__YIELD_AFTER` can run multiple times!
+	// if you don't want this, you should move the code into a separate function.
+	// for the same reason, this block can't contain any variable declaration or assignment.
+	#define J40__YIELD_AFTER(expr) \
+		do { \
+			j40_err err = (expr); \
+			j40__save_state(st, inner, origin); \
+			if (err) return err; \
+			inner->state = __LINE__; /* thus each line can have at most one J40__YIELD() call */ \
+			/* fall through */ \
+			case __LINE__:; \
+		} while (0)
+
+	f = st->frame;
+	switch (inner->state) {
+	case 0: // initial state
+
+		J40__YIELD_AFTER(j40__init_buffer(st, 0, INT64_MAX));
+		J40__YIELD_AFTER(j40__signature(st));
+		J40__YIELD_AFTER(j40__size_header(st, &st->image->width, &st->image->height));
+		J40__YIELD_AFTER(j40__image_metadata(st));
+
+		if (st->image->want_icc) {
+			J40__YIELD_AFTER(j40__icc(st));
+		}
+
+		{ // TODO should really be a loop, should we support multiple frames
+			J40__YIELD_AFTER(j40__frame_header(st));
+			if (!f->is_last) J40__YIELD_AFTER(J40__ERR("TODO: multiple frames"));
+			if (f->type != J40__FRAME_REGULAR) J40__YIELD_AFTER(J40__ERR("TODO: non-regular frame"));
+			J40__YIELD_AFTER(j40__read_toc(st, &inner->toc));
+
+			J40__YIELD_AFTER(j40__lf_global_in_section(st, &inner->toc));
+			J40__YIELD_AFTER(j40__hf_global_in_section(st, &inner->toc));
+
+			J40__YIELD_AFTER(j40__allocate_lf_groups(st, &inner->lf_groups));
+
+			if (inner->toc.single_size) {
+				J40__ASSERT(f->num_lf_groups == 1 && f->num_groups == 1 && f->num_passes == 1);
+				J40__YIELD_AFTER(j40__lf_group(st, &inner->lf_groups[0]));
+				J40__YIELD_AFTER(j40__prepare_dq_matrices(st));
+				J40__YIELD_AFTER(j40__prepare_orders(st));
+				J40__YIELD_AFTER(j40__pass_group(st, 0, 0, 0, f->width, f->height, 0, &inner->lf_groups[0]));
+				J40__YIELD_AFTER(j40__zero_pad_to_byte(st));
+			} else {
+				while (inner->toc.nsections_read < inner->toc.nsections) {
+					J40__YIELD_AFTER(j40__lf_or_pass_group_in_section(st, &inner->toc, inner->lf_groups));
+				}
+			}
+
+			J40__YIELD_AFTER(j40__end_of_frame(st, &inner->toc));
+
+			J40__YIELD_AFTER(j40__inverse_transform(st, &f->gmodular));
+			if (!f->is_modular) J40__YIELD_AFTER(j40__combine_vardct(st, inner->lf_groups));
+		}
+
+		J40__YIELD_AFTER(j40__no_more_bytes(st));
+		break;
+
+	default: J40__UNREACHABLE();
+	}
+
+	return 0;
+}
+
+J40_STATIC void j40__free_inner(j40__inner *inner) {
+	int64_t i, num_lf_groups = inner->frame.num_lf_groups;
+	j40__free_source(&inner->source);
+	j40__free_container(&inner->container);
+	j40__free_buffer(&inner->buffer);
+	j40__free_image_state(&inner->image);
+	j40__free_frame_state(&inner->frame);
+	if (inner->lf_groups) {
+		for (i = 0; i < num_lf_groups; ++i) j40__free_lf_group(&inner->lf_groups[i]);
+		free(inner->lf_groups);
+	}
+	j40__free_toc(&inner->toc);
+	j40__free(inner);
+}
+
+#endif // defined J40_IMPLEMENTATION
+
+////////////////////////////////////////////////////////////////////////////////
+// public API (implementation)
+
+#ifdef J40_IMPLEMENTATION
+
+J40_API j40_err j40_error(const j40_image *image) {
+	j40__inner *inner; // ignored
+	// do not alter image->magic even for Ufre
+	return j40__check_image((j40_image *) image, J40__ORIGIN_NONE, &inner);
+}
+
+J40_API const char *j40_error_string(const j40_image *image) {
+	static char static_errbuf[J40__ERRBUF_LEN];
+	uint32_t origin;
+	j40_err err;
+	const char *msg, *suffix;
+	char *buf;
+	int saved_errno;
+	int32_t i, corrupted_image = 0;
+
+	if (!image) {
+		snprintf(static_errbuf, J40__ERRBUF_LEN, "`image` parameter is NULL during j40_error_string");
+		return static_errbuf;
+	}
+	if (image->magic == J40__IMAGE_MAGIC) {
+		if (image->u.inner && image->u.inner->magic == J40__INNER_MAGIC) {
+			origin = image->u.inner->origin;
+			err = image->u.inner->err;
+			buf = image->u.inner->errbuf;
+			saved_errno = image->u.inner->saved_errno;
+		} else {
+			corrupted_image = 1;
+		}
+	} else {
+		origin = image->magic ^ J40__IMAGE_ERR_MAGIC;
+		if (0 < origin && origin <= J40__ORIGIN_LAST_ALT_MAGIC) {
+			err = image->u.err;
+			buf = static_errbuf;
+			saved_errno = 0;
+			// do not alter image->magic even for Ufre, but the message will be altered accordingly
+			if (origin == J40__ORIGIN_NEXT) origin = J40__ORIGIN_error_string;
+		} else {
+			origin = image->magic ^ J40__IMAGE_OPEN_ERR_MAGIC;
+			if (0 < origin && origin <= J40__ORIGIN_LAST_ALT_MAGIC) {
+				err = J40__4("open");
+				buf = static_errbuf;
+				saved_errno = image->u.saved_errno;
+			} else {
+				corrupted_image = 1;
+			}
+		}
+	}
+	if (corrupted_image) {
+		snprintf(static_errbuf, J40__ERRBUF_LEN,
+			"`image` parameter is found corrupted during j40_error_string");
+		return static_errbuf;
+	}
+
+	// TODO acquire a spinlock for buf if threaded
+
+	msg = suffix = NULL;
+	for (i = 0; i < (int32_t) (sizeof(J40__ERROR_STRINGS) / sizeof(*J40__ERROR_STRINGS)); ++i) {
+		if (err == J40__4(J40__ERROR_STRINGS[i].err)) {
+			msg = J40__ERROR_STRINGS[i].msg;
+			if (J40__ERROR_STRINGS[i].suffix) suffix = J40__ERROR_STRINGS[i].suffix;
+			break;
+		}
+	}
+	if (!msg) {
+		snprintf(buf, J40__ERRBUF_LEN, "Decoding failed (%c%c%c%c) during j40_%s",
+			err >> 24 & 0xff, err >> 16 & 0xff, err >> 8 & 0xff, err & 0xff, J40__ORIGIN_NAMES[origin]);
+	} else if (saved_errno) {
+		snprintf(buf, J40__ERRBUF_LEN, "%s during j40_%s%s", msg, J40__ORIGIN_NAMES[origin], suffix);
+	} else {
+		snprintf(buf, J40__ERRBUF_LEN, "%s during j40_%s%s: %s",
+			msg, J40__ORIGIN_NAMES[origin], suffix, strerror(saved_errno));
+	}
+	return buf;
+}
+
+J40_API j40_err j40_from_memory(j40_image *image, void *buf, size_t size, j40_memory_free_func freefunc) {
+	static const j40__origin ORIGIN = J40__ORIGIN_from_memory;
+	j40__inner *inner;
+	j40__st stbuf, *st = &stbuf;
+
+	if (!image) return J40__4("Uim0");
+	if (!buf) return j40__set_alt_magic(J40__4("Ubf0"), 0, ORIGIN, image);
+
+	inner = j40__calloc(1, sizeof(j40__inner));
+	if (!inner) return j40__set_alt_magic(J40__4("!mem"), 0, ORIGIN, image);
+
+	j40__init_state(st, inner);
+	if (j40__init_memory_source(st, buf, size, freefunc, &inner->source)) {
+		j40__free_inner(inner);
+		return j40__set_alt_magic(st->err, st->saved_errno, ORIGIN, image);
+	} else {
+		J40__ASSERT(!st->err);
+		return j40__set_magic(inner, image);
+	}
+}
+
+J40_API j40_err j40_from_file(j40_image *image, const char *path) {
+	static const j40__origin ORIGIN = J40__ORIGIN_from_file;
+	j40__inner *inner;
+	j40__st stbuf, *st = &stbuf;
+
+	if (!image) return J40__4("Uim0");
+	if (!path) return j40__set_alt_magic(J40__4("Upt0"), 0, ORIGIN, image);
+
+	inner = j40__calloc(1, sizeof(j40__inner));
+	if (!inner) return j40__set_alt_magic(J40__4("!mem"), 0, ORIGIN, image);
+
+	j40__init_state(st, inner);
+	if (j40__init_file_source(st, path, &inner->source)) {
+		j40__free_inner(inner);
+		return j40__set_alt_magic(st->err, st->saved_errno, ORIGIN, image);
+	} else {
+		J40__ASSERT(!st->err);
+		return j40__set_magic(inner, image);
+	}
+}
+
+J40_API j40_err j40_output_format(j40_image *image, int32_t channel, int32_t format) {
+	static const j40__origin ORIGIN = J40__ORIGIN_output_format;
+	j40__inner *inner;
+
+	J40__CHECK_IMAGE();
+
+	// TODO implement multiple output formats
+	if (channel != J40_RGBA) return J40__SET_INNER_ERR("Uch?");
+	if (format != J40_U8X4) return J40__SET_INNER_ERR("Ufm?");
+	if (!(channel == J40_RGBA && format == J40_U8X4)) return J40__SET_INNER_ERR("Uof?");
+
+	return 0;
+}
+
+J40_API int j40_next_frame(j40_image *image) {
+	static const j40__origin ORIGIN = J40__ORIGIN_next_frame;
+	j40__inner *inner;
+	j40__st stbuf;
+	j40_err err;
+
+	err = j40__check_image(image, ORIGIN, &inner);
+	if (err) return 0; // does NOT return err!
+
+	err = j40__advance(inner, ORIGIN);
+	if (err) return 0;
+
+	// we don't yet have multiple frames, so the second j40_next_frame call always returns 0
+	if (inner->rendered) return 0;
+
+	j40__init_state(&stbuf, inner);
+	err = j40__render_to_u8x4_rgba(&stbuf, &inner->rendered_rgba);
+	if (err) {
+		inner->origin = ORIGIN;
+		inner->err = err;
+		return 0;
+	}
+	inner->rendered = 1;
+	return 1;
+}
+
+J40_API j40_frame j40_current_frame(j40_image *image) {
+	static const j40__origin ORIGIN = J40__ORIGIN_current_frame;
+	j40__inner *inner;
+	j40_frame frame;
+	j40_err err;
+
+	err = j40__check_image(image, ORIGIN, &inner);
+	frame.magic = J40__FRAME_ERR_MAGIC;
+	frame.reserved = 0;
+	frame.inner = inner;
+	if (err) return frame;
+
+	if (!inner->rendered) {
+		if (!j40_next_frame(image)) { // if j40_next_frame hasn't been called, implicity call it
+			if (inner->err) return frame; // at this point we are sure that inner exists
+		}
+	}
+
+	frame.magic = J40__FRAME_MAGIC;
+	return frame;
+}
+
+J40_API j40_pixels_u8x4 j40_frame_pixels_u8x4(const j40_frame *frame, int32_t channel) {
+	static const j40__origin ORIGIN = J40__ORIGIN_frame_pixels;
+
+	// on error, return this placeholder image (TODO should this include an error message?)
+	#define J40__U8X4_THIRD(a,b,c,d,e,f,g) 255,0,0,a*255, 255,0,0,b*255, 255,0,0,c*255, \
+		255,0,0,d*255, 255,0,0,e*255, 255,0,0,f*255, 255,0,0,g*255
+	#define J40__U8X4_ROW(aa,bb,cc) J40__U8X4_THIRD aa, J40__U8X4_THIRD bb, J40__U8X4_THIRD cc
+	static const uint8_t ERROR_PIXELS_DATA[] = {
+		J40__U8X4_ROW((1,1,1,1,1,1,1),(1,1,1,1,1,1,1),(1,1,1,1,1,1,1)),
+		J40__U8X4_ROW((1,0,0,0,1,1,1),(1,1,1,1,1,1,1),(1,1,1,1,1,1,1)),
+		J40__U8X4_ROW((1,0,1,1,1,1,1),(1,1,1,1,1,1,1),(1,1,1,1,1,1,1)),
+		J40__U8X4_ROW((1,0,0,0,1,0,0),(0,1,0,0,0,1,0),(0,0,1,0,0,0,1)),
+		J40__U8X4_ROW((1,0,1,1,1,0,1),(1,1,0,1,1,1,0),(1,0,1,0,1,1,1)),
+		J40__U8X4_ROW((1,0,0,0,1,0,1),(1,1,0,1,1,1,0),(0,0,1,0,1,1,1)),
+		J40__U8X4_ROW((1,1,1,1,1,1,1),(1,1,1,1,1,1,1),(1,1,1,1,1,1,1)),
+	};
+	static const j40_pixels_u8x4 ERROR_PIXELS = {21, 7, 21 * 4, ERROR_PIXELS_DATA};
+
+	j40__inner *inner;
+	j40_pixels_u8x4 pixels;
+
+	if (!frame || frame->magic != J40__FRAME_MAGIC) return ERROR_PIXELS;
+	inner = frame->inner;
+	if (!inner || inner->magic != J40__INNER_MAGIC) return ERROR_PIXELS;
+
+	// TODO support more channels
+	if (channel != J40_RGBA) return ERROR_PIXELS;
+
+	// TODO this condition is impossible under the current API
+	if (!inner->rendered) return J40__SET_INNER_ERR("Urnd"), ERROR_PIXELS;
+
+	J40__ASSERT(inner->rendered_rgba.width % 4 == 0);
+	pixels.width = inner->rendered_rgba.width / 4;
+	pixels.height = inner->rendered_rgba.height;
+	pixels.stride_bytes = inner->rendered_rgba.stride_bytes;
+	pixels.data = (void*) inner->rendered_rgba.pixels;
+	return pixels;
+}
+
+J40_API const j40_u8x4 *j40_row_u8x4(j40_pixels_u8x4 pixels, int32_t y) {
+	J40__ASSERT(0 <= y && y < pixels.height);
+	J40__ASSERT(pixels.stride_bytes > 0);
+	J40__ASSERT(pixels.data);
+	return (const j40_u8x4*) ((const char*) pixels.data + (size_t) pixels.stride_bytes * (size_t) y);
+}
+
+J40_API void j40_free(j40_image *image) {
+	j40__inner *inner;
+	if (j40__check_image(image, J40__ORIGIN_free, &inner)) return;
+	j40__free_inner(inner);
+	image->magic = J40__IMAGE_ERR_MAGIC ^ J40__ORIGIN_NEXT;
+	image->u.err = J40__4("Ufre");
 }
 
 #endif // defined J40_IMPLEMENTATION
 
 ////////////////////////////////////////////////////////////////////////////////
 #endif // J40__RECURSING < 0                       // internal code ends here //
-////////////////////////////////////////////////////////////////////////////////
-
-////////////////////////////////////////////////////////////////////////////////
-// public API, continued
-
-#if J40__RECURSING <= 0
-
-const char *dumppath;
-void end(const j40__st st);
-
-j40_err j40_from_file(const char *path);
-
-#ifdef J40_IMPLEMENTATION
-
-const char *dumppath = NULL;
-void end(const j40__st st) { (void) st; }
-
-static void update_cksum(uint8_t b, uint32_t *crc, uint32_t *adler) {
-	static const uint32_t TAB[16] = {
-		0x00000000,0x1DB71064,0x3B6E20C8,0x26D930AC,0x76DC4190,0x6B6B51F4,0x4DB26158,0x5005713C,
-		0xEDB88320,0xF00F9344,0xD6D6A3E8,0xCB61B38C,0x9B64C2B0,0x86D3D2D4,0xA00AE278,0xBDBDF21C,
-	};
-	uint32_t lo, hi;
-	*crc = TAB[(*crc ^ b) & 15] ^ (*crc >> 4);
-	*crc = TAB[(*crc ^ (b >> 4)) & 15] ^ (*crc >> 4);
-	lo = ((*adler & 0xffff) + b) % 65521;
-	hi = ((*adler >> 16) + lo) % 65521;
-	*adler = (hi << 16) | lo;
-}
-
-j40_err j40_from_file(const char *path) {
-	j40__source src = {0};
-	j40__container_st container = {0};
-	j40__image_st im = {
-		.modular_16bit_buffers = 1,
-		.xyb_encoded = 1,
-		.opsin_inv_mat = {
-			{11.031566901960783f, -9.866943921568629f, -0.16462299647058826f},
-			{-3.254147380392157f, 4.418770392156863f, -0.16462299647058826f},
-			{-3.6588512862745097f, 2.7129230470588235f, 1.9459282392156863f},
-		},
-		.opsin_bias = {-0.0037930732552754493f, -0.0037930732552754493f, -0.0037930732552754493f},
-		.quant_bias = {1-0.05465007330715401f, 1-0.07005449891748593f, 1-0.049935103337343655f},
-		.quant_bias_num = 0.145f,
-	};
-	j40__st st_ = { .source = &src, .container = &container, .image = &im };
-	j40__st *st = &st_;
-	int32_t i, j, k;
-
-	J40__TRY(j40__init_file_source(st, path, 8 * 1024 * 1024, st->source));
-	J40__TRY(j40__refill_backing_buffer(st));
-
-	J40__TRY(j40__container(st));
-
-	J40__SHOULD(st->remaining >= 2, "shrt");
-	J40__SHOULD(st->ptr[0] == 0xff && st->ptr[1] == 0x0a, "!jxl");
-	st->ptr += 2;
-	st->remaining -= 2;
-
-	J40__TRY(j40__size_header(st, &im.width, &im.height));
-	J40__TRY(j40__image_metadata(st));
-	if (im.want_icc) J40__TRY(j40__icc(st));
-
-	j40__frame_st frame;
-	do {
-		st->frame = &frame;
-		J40__TRY(j40__frame(st));
-		printf("%sframe: %s, %d+%d+%dx%d\n", frame.is_last ? "last " : "",
-			(char*[]){"regular", "lf", "refonly", "regular-but-skip-progressive"}[frame.type],
-			frame.x0, frame.y0, frame.width, frame.height);
-		fflush(stdout);
-
-		if (dumppath && frame.type == J40__FRAME_REGULAR) {
-			J40__ASSERT(im.modular_16bit_buffers && im.bpp >= 8 && im.exp_bits == 0);
-			FILE *f = fopen(dumppath, "wb");
-			uint32_t crc, adler, unused = 0, idatsize;
-			j40__plane *c[4];
-			int32_t nchan;
-			uint8_t buf[32];
-			nchan = (!frame.do_ycbcr && !im.xyb_encoded && im.cspace == J40__CS_GREY ? 1 : 3);
-			for (i = 0; i < nchan; ++i) c[i] = &frame.gmodular.channel[i];
-			for (i = nchan; i < frame.gmodular.num_channels; ++i) {
-				j40__ec_info *ec = &im.ec_info[i - nchan];
-				if (ec->type == J40__EC_ALPHA) {
-					J40__ASSERT(ec->bpp == im.bpp && ec->exp_bits == im.exp_bits);
-					J40__ASSERT(ec->dim_shift == 0 && !ec->data.alpha_associated);
-					c[nchan++] = &frame.gmodular.channel[i];
-					break;
-				}
-			}
-			fwrite("\x89PNG\x0d\x0a\x1a\x0a" "\0\0\0\x0d", 12, 1, f);
-			memcpy(buf, "IHDR" "wwww" "hhhh" "\x08" "C" "\0\0\0" "crcc" "lenn" "IDAT" "\x78\x01", 31);
-			for (i = 0; i < 4; ++i) buf[i + 4] = (uint8_t) ((frame.width >> (24 - i * 8)) & 0xff);
-			for (i = 0; i < 4; ++i) buf[i + 8] = (uint8_t) ((frame.height >> (24 - i * 8)) & 0xff);
-			buf[13] = (uint8_t) ((nchan % 2 == 0 ? 4 : 0) | (nchan > 2 ? 2 : 0));
-			for (i = 0, crc = ~0u; i < 17; ++i) update_cksum(buf[i], &crc, &unused);
-			for (i = 0; i < 4; ++i) buf[i + 17] = (uint8_t) ((~crc >> (24 - i * 8)) & 0xff);
-			idatsize = (uint32_t) (6 + (nchan * frame.width + 6) * frame.height);
-			for (i = 0; i < 4; ++i) buf[i + 21] = (uint8_t) ((idatsize >> (24 - i * 8)) & 0xff);
-			fwrite(buf, 31, 1, f);
-			for (i = 25, crc = ~0u; i < 31; ++i) update_cksum(buf[i], &crc, &unused);
-			adler = 1;
-			for (i = 0; i < frame.height; ++i) {
-				update_cksum(buf[0] = (i == frame.height - 1), &crc, &unused);
-				update_cksum(buf[1] = (uint8_t) ((nchan * frame.width + 1) & 0xff), &crc, &unused);
-				update_cksum(buf[2] = (uint8_t) ((nchan * frame.width + 1) >> 8), &crc, &unused);
-				update_cksum(buf[3] = (uint8_t) ~((nchan * frame.width + 1) & 0xff), &crc, &unused);
-				update_cksum(buf[4] = (uint8_t) ~((nchan * frame.width + 1) >> 8), &crc, &unused);
-				update_cksum(buf[5] = 0, &crc, &adler);
-				fwrite(buf, 6, 1, f);
-				for (j = 0; j < frame.width; ++j) {
-					for (k = 0; k < nchan; ++k) {
-						int32_t p = j40__min32(j40__max32(0, J40__I16_PIXELS(c[k], i)[j]), (1 << im.bpp) - 1);
-						update_cksum(buf[k] = (uint8_t) (p * 255 / ((1 << im.bpp) - 1)), &crc, &adler);
-					}
-					fwrite(buf, (size_t) nchan, 1, f);
-				}
-			}
-			for (i = 0; i < 4; ++i) update_cksum(buf[i] = (uint8_t) ((adler >> (24 - i * 8)) & 0xff), &crc, &unused);
-			for (i = 0; i < 4; ++i) buf[i + 4] = (uint8_t) ((~crc >> (24 - i * 8)) & 0xff);
-			memcpy(buf + 8, "\0\0\0\0" "IEND" "\xae\x42\x60\x82", 12);
-			fwrite(buf, 20, 1, f);
-			fclose(f);
-			break;
-		}
-	} while (!frame.is_last);
-
-	end(st_);
-	return 0;
-
-J40__ON_ERROR:
-	return st->err;
-}
-
-#endif // defined J40_IMPLEMENTATION
-#endif // J40__RECURSING <= 0
-
 ////////////////////////////////////////////////////////////////////////////////
 
 #if J40__RECURSING <= 0
@@ -6321,5 +8147,9 @@ J40__ON_ERROR:
 #define J40__RECURSING 9999
 
 #endif // J40__RECURSING <= 0
+
+////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////// end of file //////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////
 
 // vim: noet ts=4 st=4 sts=4 sw=4 list colorcolumn=100
