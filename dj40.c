@@ -1,3 +1,5 @@
+// this example uses stb_image_write to generate a PNG output from a JPEG XL input.
+
 #define J40_CONFIRM_THAT_THIS_IS_EXPERIMENTAL_AND_POTENTIALLY_UNSAFE
 #define J40_IMPLEMENTATION
 #include "j40.h"
@@ -8,13 +10,16 @@
 	#pragma GCC diagnostic ignored "-Wconversion"
 #endif
 #define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "stb_image_write.h" // copy from https://github.com/nothings/stb/blob/master/stb_image_write.h
+#include "extra/stb_image_write.h"
 #ifdef __GNUC__
 	#pragma GCC diagnostic pop
 #endif
 
 int main(int argc, char **argv) {
-	if (argc < 2) return 1;
+	if (argc < 2) {
+		fprintf(stderr, "Usage: %s input.jxl [output.png]\n", argv[0]);
+		return 1;
+	}
 
 	j40_image image;
 	j40_from_file(&image, argv[1]);
