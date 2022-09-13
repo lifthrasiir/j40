@@ -1512,7 +1512,7 @@ J40_STATIC J40__RETURNS_ERR j40__init_buffer(j40__st *st, int64_t codeoff, int64
 J40_STATIC J40__RETURNS_ERR j40__refill_buffer(j40__st *st);
 J40_STATIC J40__RETURNS_ERR j40__seek_buffer(j40__st *st, int64_t codeoff);
 J40_STATIC int64_t j40__codestream_offset(const j40__st *st);
-J40_STATIC int64_t j40__bits_read(const j40__st *st);
+J40_MAYBE_UNUSED J40_STATIC int64_t j40__bits_read(const j40__st *st);
 J40_STATIC void j40__free_buffer(j40__buffer_st *buffer);
 
 #ifdef J40_IMPLEMENTATION
@@ -1641,7 +1641,7 @@ J40_STATIC int64_t j40__codestream_offset(const j40__st *st) {
 }
 
 // diagnostic only, doesn't check for overflow or anything
-J40_STATIC int64_t j40__bits_read(const j40__st *st) {
+J40_MAYBE_UNUSED J40_STATIC int64_t j40__bits_read(const j40__st *st) {
 	int32_t nbytes = j40__ceil_div32(st->bits.nbits, 8), nbits = 8 * nbytes - st->bits.nbits;
 	// the codestream offset for the byte that contains the first bit to read
 	int64_t codeoff = st->buffer->next_codeoff - st->buffer->size + (st->bits.ptr - st->buffer->buf) - nbytes;
@@ -3423,7 +3423,6 @@ J40_STATIC void j40__combine_modular_from_pass_group(
 					(void*) (c->pixels + c_stride * (size_t) y),
 					pixel_size * (size_t) c->width);
 			}
-			printf("combined channel %d with w=%d h=%d to channel %d with w=%d h=%d gx0=%d gy0=%d\n", cidx, c->width, c->height, gcidx, gc->width, gc->height, gx0, gy0); fflush(stdout);
 			++cidx;
 		}
 	}
@@ -3470,7 +3469,6 @@ J40_STATIC J40__RETURNS_ERR j40__modular_header(
 			J40__SHOULD(begin_c + 3 <= num_channels, "rctc");
 			J40__SHOULD(begin_c >= nb_meta_channels || begin_c + 3 <= nb_meta_channels, "rctc");
 			J40__SHOULD(j40__plane_all_equal_sized(channel + begin_c, channel + begin_c + 3), "rtcd");
-			printf("transform %d: rct type %d [%d,%d)\n", i, type, begin_c, begin_c + 3); fflush(stdout);
 			break;
 		}
 
@@ -3503,7 +3501,6 @@ J40_STATIC J40__RETURNS_ERR j40__modular_header(
 			channel[0].vshift = -1;
 			channel[begin_c + 1] = input;
 			num_channels += 2 - num_c;
-			printf("transform %d: palette [%d,%d) c%d d%d p%d\n", i, begin_c, end_c, nb_colours, tr->pal.nb_deltas, tr->pal.d_pred); fflush(stdout);
 			break;
 		}
 
@@ -4901,7 +4898,6 @@ J40_STATIC J40__RETURNS_ERR j40__frame_header(j40__st *st) {
 	memset(f->coeff_codespec, 0, sizeof(f->coeff_codespec));
 
 	J40__TRY(j40__zero_pad_to_byte(st));
-	printf("frame starts at %d\n", (int32_t) j40__bits_read(st)); fflush(stdout);
 
 	if (!j40__u(st, 1)) { // !all_default
 		int full_frame = 1;
