@@ -4428,7 +4428,7 @@ J40_STATIC J40__RETURNS_ERR j40__read_dq_matrix(
 		struct how how = HOW[dqmat->mode];
 		int32_t paramsize = how.nparams + how.ndctparams * 16, paramidx = how.nparams;
 		if (how.requires8x8) J40__SHOULD(rows == 8 && columns == 8, "dqm?");
-		J40__SHOULD(dqmat->params = j40__malloc(sizeof(float[3]) * (size_t) paramsize), "!mem");
+		J40__SHOULD(dqmat->params = j40__malloc(sizeof(float[4]) * (size_t) paramsize), "!mem");
 		for (c = 0; c < 3; ++c) for (j = 0; j < how.nparams; ++j) {
 			dqmat->params[j][c] = j40__f16(st) * (j < how.nscaled ? 64.0f : 1.0f);
 		}
