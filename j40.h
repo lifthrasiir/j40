@@ -7946,7 +7946,8 @@ J40_API const char *j40_error_string(const j40_image *image) {
 
 	// TODO acquire a spinlock for buf if threaded
 
-	msg = suffix = NULL;
+	msg = NULL;
+	suffix = "";
 	for (i = 0; i < (int32_t) (sizeof(J40__ERROR_STRINGS) / sizeof(*J40__ERROR_STRINGS)); ++i) {
 		if (err == J40__4(J40__ERROR_STRINGS[i].err)) {
 			msg = J40__ERROR_STRINGS[i].msg;
@@ -7958,10 +7959,10 @@ J40_API const char *j40_error_string(const j40_image *image) {
 		snprintf(buf, J40__ERRBUF_LEN, "Decoding failed (%c%c%c%c) during j40_%s",
 			err >> 24 & 0xff, err >> 16 & 0xff, err >> 8 & 0xff, err & 0xff, J40__ORIGIN_NAMES[origin]);
 	} else if (saved_errno) {
-		snprintf(buf, J40__ERRBUF_LEN, "%s during j40_%s%s", msg, J40__ORIGIN_NAMES[origin], suffix);
-	} else {
 		snprintf(buf, J40__ERRBUF_LEN, "%s during j40_%s%s: %s",
 			msg, J40__ORIGIN_NAMES[origin], suffix, strerror(saved_errno));
+	} else {
+		snprintf(buf, J40__ERRBUF_LEN, "%s during j40_%s%s", msg, J40__ORIGIN_NAMES[origin], suffix);
 	}
 	return buf;
 }
