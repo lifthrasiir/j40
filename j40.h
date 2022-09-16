@@ -1711,10 +1711,15 @@ J40_STATIC J40__RETURNS_ERR j40__always_refill(j40__st *st, int32_t n) {
 			bits->bits |= (uint64_t) *bits->ptr++ << bits->nbits;
 			bits->nbits += 8;
 		}
-		if (bits->nbits >= n) break;
+		if (bits->nbits > NBITS - 8) break;
+
 		J40__SHOULD(st->buffer, "shrt");
 		J40__TRY(j40__refill_buffer(st));
-		// now we have possibly more bits to refill, try again
+		if (bits->end == bits->ptr) { // no possibility to read more bits
+			if (bits->nbits >= n) break;
+			J40__RAISE("shrt");
+		}
+		// otherwise now we have possibly more bits to refill, try again
 	}
 
 J40__ON_ERROR:
@@ -2106,12 +2111,20 @@ J40_STATIC int32_t j40__match_overflow(j40__st *st, int32_t fast_len, const int3
 
 J40_INLINE int32_t j40__prefix_code(j40__st *st, int32_t fast_len, int32_t max_len, const int32_t *table) {
 	int32_t entry, code_len;
+	// this is not `j40__refill(st, max_len)` because it should be able to handle codes
+	// at the very end of file or section and shorter than max_len bits; in that case
+	// the bit buffer will correctly contain a short code padded with zeroes.
 	if (st->bits.nbits < max_len && j40__always_refill(st, 0)) return 0;
 	entry = table[st->bits.bits & ((1u << fast_len) - 1)];
 	if (entry < 0 && fast_len < max_len) entry = j40__match_overflow(st, fast_len, table - entry);
 	code_len = entry & 15;
 	st->bits.nbits -= code_len;
 	st->bits.bits >>= code_len;
+	if (st->bits.nbits < 0) { // too many bits read from the bit buffer
+		st->bits.nbits = 0;
+		J40__ASSERT(st->bits.bits == 0);
+		J40__ERR("shrt");
+	}
 	return entry >> 16;
 }
 
