@@ -6380,7 +6380,7 @@ J40__ON_ERROR:
 	j40__free_plane(&blocks);
 	j40__free(varblocks);
 	for (c = 0; c < 3; ++c) {
-		j40__free_aligned(coeffs[c], J40__COEFFS_ALIGN, coeffs_misalign[0]);
+		j40__free_aligned(coeffs[c], J40__COEFFS_ALIGN, coeffs_misalign[c]);
 		j40__free(llfcoeffs[c]);
 	}
 	return st->err;
