@@ -7881,6 +7881,7 @@ J40_STATIC void j40__free_inner(j40__inner *inner) {
 		free(inner->lf_groups);
 	}
 	j40__free_toc(&inner->toc);
+	j40__free_plane(&inner->rendered_rgba);
 	j40__free(inner);
 }
 
