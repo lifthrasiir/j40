@@ -3739,7 +3739,7 @@ J40_STATIC void j40__(wp_before_predict_internal,2P)(
 	wp->trueerrnw = x > 0 && y > 0 ? nerr[x - 1][4] : wp->trueerrn;
 	wp->trueerrne = x + 1 < wp->width && y > 0 ? nerr[x + 1][4] : wp->trueerrn;
 
-	// TODO spec issue: (expr << 3) is used throughout wp, but it's an UB when expr is negative
+	// (expr << 3) is used throughout wp, but it's an UB when expr is negative
 	wp->pred[0] = (pw + pne - pn) * 8;
 	wp->pred[1] = pn * 8 - (((wp->trueerrw + wp->trueerrn + wp->trueerrne) * wp->params.p1) >> 5);
 	wp->pred[2] = pw * 8 - (((wp->trueerrw + wp->trueerrn + wp->trueerrnw) * wp->params.p2) >> 5);
