@@ -7728,7 +7728,7 @@ J40_STATIC J40__RETURNS_ERR j40__set_alt_magic(
 );
 J40_STATIC J40__RETURNS_ERR j40__set_magic(j40__inner *inner, j40_image *image);
 
-J40_STATIC J40__RETURNS_ERR j40__check_image(j40_image *image, j40__origin neworigin, j40__inner **outinner);
+J40_STATIC j40_err j40__check_image(j40_image *image, j40__origin neworigin, j40__inner **outinner);
 #define J40__CHECK_IMAGE() do { \
 		j40_err err = j40__check_image((j40_image*) image, ORIGIN, &inner); \
 		if (err) return err; \
@@ -7764,7 +7764,7 @@ J40_STATIC J40__RETURNS_ERR j40__set_magic(j40__inner *inner, j40_image *image) 
 	return 0;
 }
 
-J40_STATIC J40__RETURNS_ERR j40__check_image(j40_image *image, j40__origin neworigin, j40__inner **outinner) {
+J40_STATIC j40_err j40__check_image(j40_image *image, j40__origin neworigin, j40__inner **outinner) {
 	*outinner = NULL;
 	if (!image) return J40__4("Uim0");
 	if (image->magic != J40__IMAGE_MAGIC) {
@@ -7779,7 +7779,7 @@ J40_STATIC J40__RETURNS_ERR j40__check_image(j40_image *image, j40__origin newor
 	}
 	if (!image->u.inner || image->u.inner->magic != J40__INNER_MAGIC) return J40__4("Uim?");
 	*outinner = image->u.inner;
-	return image->u.inner->cannot_retry ? image->u.inner->err : 0;
+	return image->u.inner->err; // TODO handle cannot_retry in a better way
 }
 
 J40_STATIC void j40__init_state(j40__st *st, j40__inner *inner) {
@@ -8133,8 +8133,8 @@ J40_API const j40_u8x4 *j40_row_u8x4(j40_pixels_u8x4 pixels, int32_t y) {
 
 J40_API void j40_free(j40_image *image) {
 	j40__inner *inner;
-	if (j40__check_image(image, J40__ORIGIN_free, &inner)) return;
-	j40__free_inner(inner);
+	j40__check_image(image, J40__ORIGIN_free, &inner);
+	if (inner) j40__free_inner(inner);
 	image->magic = J40__IMAGE_ERR_MAGIC ^ J40__ORIGIN_NEXT;
 	image->u.err = J40__4("Ufre");
 }
