@@ -2384,6 +2384,7 @@ J40_STATIC J40__RETURNS_ERR j40__cluster_map(
 	uint32_t seen[8] = {0};
 	int32_t i, j;
 
+	J40__ASSERT(num_dist > 0);
 	J40__ASSERT(max_allowed >= 1 && max_allowed <= 256);
 	if (max_allowed > num_dist) max_allowed = num_dist;
 
@@ -2427,10 +2428,10 @@ J40_STATIC J40__RETURNS_ERR j40__cluster_map(
 	// verify cluster_map and determine the implicit num_clusters
 	for (i = 0; i < num_dist; ++i) seen[map[i] >> 5] |= (uint32_t) 1 << (map[i] & 31);
 	for (i = 0; i < 256 && (seen[i >> 5] >> (i & 31) & 1); ++i);
-	J40__ASSERT(i > 0);
 	*num_clusters = i; // the first unset position or 256 if none
 	for (; i < 256 && !(seen[i >> 5] >> (i & 31) & 1); ++i);
 	J40__SHOULD(i == 256, "clst"); // no more set position beyond num_clusters
+	J40__ASSERT(*num_clusters > 0);
 
 	return 0;
 
