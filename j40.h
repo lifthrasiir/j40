@@ -1560,6 +1560,7 @@ J40_STATIC J40__RETURNS_ERR j40__refill_buffer(j40__st *st) {
 		memmove(buffer->buf, checkpoint->ptr, (size_t) (buffer->size - committed_size));
 		buffer->size -= committed_size;
 		bits->ptr -= committed_size;
+		bits->end -= committed_size;
 		checkpoint->ptr = buffer->buf;
 	}
 
