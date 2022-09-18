@@ -2025,12 +2025,14 @@ J40_STATIC J40__RETURNS_ERR j40__prefix_code_tree(
 				// between the previous and current repeat count and directly apply the delta
 				if (prev_rep < 0) prev_rep = 0;
 				rep = (prev_rep > 0 ? 4 * prev_rep - 5 : 3) + j40__u(st, 2);
+				J40__SHOULD(i + (rep - prev_rep) <= l2size, "hufd");
 				total += (L2CODESUM * (rep - prev_rep)) >> prev;
 				l2counts[prev] += rep - prev_rep;
 				for (; prev_rep < rep; ++prev_rep) l2lengths[i++] = prev;
 			} else { // code == 17: repeat zero 3+u(3) times
 				if (prev_rep > 0) prev_rep = 0;
 				rep = (prev_rep < 0 ? 8 * prev_rep + 13 : -3) - j40__u(st, 3);
+				J40__SHOULD(i + (prev_rep - rep) <= l2size, "hufd");
 				for (; prev_rep > rep; --prev_rep) l2lengths[i++] = 0;
 			}
 			J40__RAISE_DELAYED();
