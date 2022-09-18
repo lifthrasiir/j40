@@ -6560,6 +6560,8 @@ J40_STATIC J40__RETURNS_ERR j40__hf_global(j40__st *st) {
 	}
 
 J40__ON_ERROR:
+	j40__free_code(&code);
+	j40__free_code_spec(&codespec);
 	return st->err;
 }
 
