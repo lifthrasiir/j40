@@ -2966,13 +2966,13 @@ J40_STATIC J40__RETURNS_ERR j40__image_metadata(j40__st *st) {
 		im->modular_16bit_buffers = j40__u(st, 1);
 		im->num_extra_channels = j40__u32(st, 0, 0, 1, 0, 2, 4, 1, 12);
 		J40__SHOULD(im->ec_info = j40__calloc((size_t) im->num_extra_channels, sizeof(j40__ec_info)), "!mem");
+		for (i = 0; i < im->num_extra_channels; ++i) im->ec_info[i].name = NULL;
 		for (i = 0; i < im->num_extra_channels; ++i) {
 			j40__ec_info *ec = &im->ec_info[i];
 			if (j40__u(st, 1)) { // d_alpha
 				ec->type = J40__EC_ALPHA;
 				ec->bpp = 8;
 				ec->exp_bits = ec->dim_shift = ec->name_len = 0;
-				ec->name = NULL;
 				ec->data.alpha_associated = 0;
 			} else {
 				ec->type = (enum j40__ec_type) j40__enum(st);
@@ -3106,11 +3106,13 @@ J40__ON_ERROR:
 
 J40_STATIC void j40__free_image_state(j40__image_st *im) {
 	int32_t i;
-	for (i = 0; i < im->num_extra_channels; ++i) j40__free(im->ec_info[i].name);
+	if (im->ec_info) {
+		for (i = 0; i < im->num_extra_channels; ++i) j40__free(im->ec_info[i].name);
+		j40__free(im->ec_info);
+		im->ec_info = NULL;
+	}
 	j40__free(im->icc);
-	j40__free(im->ec_info);
 	im->icc = NULL;
-	im->ec_info = NULL;
 	im->num_extra_channels = 0;
 }
 
