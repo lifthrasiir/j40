@@ -5148,7 +5148,10 @@ J40_STATIC J40__RETURNS_ERR j40__permutation(
 	}
 	arr[end] = -1; // sentinel
 	*out = arr;
+	return 0;
+
 J40__ON_ERROR:
+	free(arr);
 	return st->err;
 }
 
