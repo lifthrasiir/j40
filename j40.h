@@ -4457,16 +4457,18 @@ J40_STATIC J40__RETURNS_ERR j40__read_dq_matrix(
 		struct how how = HOW[dqmat->mode];
 		int32_t paramsize = how.nparams + how.ndctparams * 16, paramidx = how.nparams;
 		if (how.requires8x8) J40__SHOULD(rows == 8 && columns == 8, "dqm?");
-		J40__SHOULD(dqmat->params = j40__malloc(sizeof(float[4]) * (size_t) paramsize), "!mem");
-		for (c = 0; c < 3; ++c) for (j = 0; j < how.nparams; ++j) {
-			dqmat->params[j][c] = j40__f16(st) * (j < how.nscaled ? 64.0f : 1.0f);
-		}
-		for (i = 0; i < how.ndctparams; ++i) { // ReadDctParams
-			int32_t n = *(i == 0 ? &dqmat->n : &dqmat->m) = (int16_t) (j40__u(st, 4) + 1);
-			for (c = 0; c < 3; ++c) for (j = 0; j < n; ++j) {
-				dqmat->params[paramidx + j][c] = j40__f16(st) * (j == 0 ? 64.0f : 1.0f);
+		if (paramsize) {
+			J40__SHOULD(dqmat->params = j40__malloc(sizeof(float[4]) * (size_t) paramsize), "!mem");
+			for (c = 0; c < 3; ++c) for (j = 0; j < how.nparams; ++j) {
+				dqmat->params[j][c] = j40__f16(st) * (j < how.nscaled ? 64.0f : 1.0f);
 			}
-			paramidx += n;
+			for (i = 0; i < how.ndctparams; ++i) { // ReadDctParams
+				int32_t n = *(i == 0 ? &dqmat->n : &dqmat->m) = (int16_t) (j40__u(st, 4) + 1);
+				for (c = 0; c < 3; ++c) for (j = 0; j < n; ++j) {
+					dqmat->params[paramidx + j][c] = j40__f16(st) * (j == 0 ? 64.0f : 1.0f);
+				}
+				paramidx += n;
+			}
 		}
 		J40__RAISE_DELAYED();
 	}
