@@ -1204,22 +1204,27 @@ J40_STATIC J40__RETURNS_ERR j40__read_from_source(j40__st *st, uint8_t *buf, int
 
 J40_STATIC J40__RETURNS_ERR j40__seek_from_source(j40__st *st, int64_t fileoff) {
 	j40__source_st *source = st->source;
-	int saved_errno;
 
 	J40__ASSERT(fileoff >= 0);
 	if (fileoff == source->fileoff) return 0;
 
-	saved_errno = errno;
-	errno = 0;
+	fileoff = j40__min64(fileoff, source->fileoff_limit);
 
-	if (J40_UNLIKELY(source->seek_func(fileoff, source->data))) {
-		st->saved_errno = errno;
-		if (errno == 0) errno = saved_errno;
-		J40__RAISE("seek");
+	// for the memory source read always have the current fileoff so seek is a no-op
+	if (source->seek_func) {
+		int saved_errno = errno;
+		errno = 0;
+
+		if (J40_UNLIKELY(source->seek_func(fileoff, source->data))) {
+			st->saved_errno = errno;
+			if (errno == 0) errno = saved_errno;
+			J40__RAISE("seek");
+		}
+
+		errno = saved_errno;
 	}
 
 	source->fileoff = fileoff;
-	errno = saved_errno;
 J40__ON_ERROR:
 	return st->err;
 }
