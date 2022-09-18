@@ -2449,13 +2449,16 @@ J40_STATIC J40__RETURNS_ERR j40__ans_table(j40__st *st, int32_t log_alpha_size, 
 
 	J40__SHOULD(D = j40__malloc(sizeof(int16_t) * (size_t) table_size), "!mem");
 
-	switch (j40__u(st, 2)) {
-	case 1: // one entry
+	switch (j40__u(st, 2)) { // two Bool() calls combined into u(2), so bits are swapped
+	case 1: { // true -> false case: one entry
+		int32_t v = j40__u8(st);
 		memset(D, 0, sizeof(int16_t) * (size_t) table_size);
-		D[j40__u8(st)] = DISTSUM;
+		J40__SHOULD(v < table_size, "ansd");
+		D[v] = DISTSUM;
 		break;
+	}
 
-	case 3: { // two entries
+	case 3: { // true -> true case: two entries
 		int32_t v1 = j40__u8(st);
 		int32_t v2 = j40__u8(st);
 		J40__SHOULD(v1 != v2 && v1 < table_size && v2 < table_size, "ansd");
@@ -2465,17 +2468,18 @@ J40_STATIC J40__RETURNS_ERR j40__ans_table(j40__st *st, int32_t log_alpha_size, 
 		break;
 	}
 
-	case 2: { // evenly distribute to first `alpha_size` entries (false -> true)
+	case 2: { // false -> true case: evenly distribute to first `alpha_size` entries
 		int32_t alpha_size = j40__u8(st) + 1;
 		int16_t d = (int16_t) (DISTSUM / alpha_size);
-		int16_t bias_size = (int16_t) (DISTSUM - d * alpha_size);
+		int16_t bias_size = (int16_t) (DISTSUM % alpha_size);
+		J40__SHOULD(alpha_size <= table_size, "ansd");
 		for (i = 0; i < bias_size; ++i) D[i] = (int16_t) (d + 1);
 		for (; i < alpha_size; ++i) D[i] = d;
 		for (; i < table_size; ++i) D[i] = 0;
 		break;
 	}
 
-	case 0: { // bit counts + RLE (false -> false)
+	case 0: { // false -> false case: bit counts + RLE
 		int32_t len, shift, alpha_size, omit_log, omit_pos, code, total, n;
 		int32_t ncodes, codes[259]; // exponents if >= 0, negated repeat count if < 0
 
@@ -2504,13 +2508,14 @@ J40_STATIC J40__RETURNS_ERR j40__ans_table(j40__st *st, int32_t log_alpha_size, 
 		J40__SHOULD(i == alpha_size && omit_log >= 0, "ansd");
 
 		omit_pos = -1;
-		for (i = n = total = 0; i < ncodes; ++i) {
+		for (i = n = total = 0; i < ncodes && n < table_size; ++i) {
 			code = codes[i];
 			if (code < 0) { // repeat
 				int16_t prev = n > 0 ? D[n - 1] : 0;
 				J40__SHOULD(prev >= 0, "ansd"); // implicit D[n] followed by RLE
-				total += (int32_t) prev * (int32_t) -code;
-				while (code++ < 0) D[n++] = prev;
+				code = j40__min32(-code, table_size - n);
+				total += (int32_t) prev * code;
+				while (code-- > 0) D[n++] = prev;
 			} else if (code == omit_log) { // the first longest D[n] is "omitted" (implicit)
 				omit_pos = n;
 				omit_log = -1; // this branch runs at most once
@@ -2528,7 +2533,7 @@ J40_STATIC J40__RETURNS_ERR j40__ans_table(j40__st *st, int32_t log_alpha_size, 
 			}
 		}
 		for (; n < table_size; ++n) D[n] = 0;
-		J40__ASSERT(omit_pos >= 0);
+		J40__SHOULD(omit_pos >= 0, "ansd");
 		J40__SHOULD(total <= DISTSUM, "ansd");
 		D[omit_pos] = (int16_t) (DISTSUM - total);
 		break;
