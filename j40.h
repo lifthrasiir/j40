@@ -328,7 +328,7 @@ J40_API void j40_free(j40_image *image);
 	#if J40__HAS_ALWAYS_INLINE_ATTR || J40__GCC_VER >= 0x30100 || J40__CLANG_VER >= 0x10000
 		#define J40_ALWAYS_INLINE __attribute__((always_inline)) J40_INLINE
 	#elif defined _MSC_VER
-		#define J40_ALWAYS_INLINE __forceinline J40_INLINE
+		#define J40_ALWAYS_INLINE __forceinline
 	#else
 		#define J40_ALWAYS_INLINE J40_INLINE
 	#endif
@@ -5693,13 +5693,13 @@ J40_STATIC void j40__forward_dct_unscaled(J40__DCT_ARGS, int32_t rep) {
 	if (t <= 0) {
 		memcpy(out, in, sizeof(float) * (size_t) rep);
 	} else if (rep % 8 == 0) {
-		if (t == 1) return j40__dct2(out, in, 1, rep / 8, 8);
-		if (t == 2) return j40__forward_dct4(out, in, 2, rep / 8, 8);
-		j40__forward_dct_recur_x8(out, in, t, rep / 8, 8);
+		if (t == 1) j40__dct2(out, in, 1, rep / 8, 8);
+		else if (t == 2) j40__forward_dct4(out, in, 2, rep / 8, 8);
+		else j40__forward_dct_recur_x8(out, in, t, rep / 8, 8);
 	} else {
-		if (t == 1) return j40__dct2(out, in, 1, rep, 1);
-		if (t == 2) return j40__forward_dct4(out, in, 2, rep, 1);
-		j40__forward_dct_recur(out, in, t, rep, 1);
+		if (t == 1) j40__dct2(out, in, 1, rep, 1);
+		else if (t == 2) j40__forward_dct4(out, in, 2, rep, 1);
+		else j40__forward_dct_recur(out, in, t, rep, 1);
 	}
 }
 
@@ -5736,13 +5736,13 @@ J40_STATIC void j40__inverse_dct(J40__DCT_ARGS, int32_t rep) {
 	if (t <= 0) {
 		memcpy(out, in, sizeof(float) * (size_t) rep);
 	} else if (rep % 8 == 0) {
-		if (t == 1) return j40__dct2(out, in, 1, rep / 8, 8);
-		if (t == 2) return j40__inverse_dct4(out, in, 2, rep / 8, 8);
-		return j40__inverse_dct_recur_x8(out, in, t, rep / 8, 8);
+		if (t == 1) j40__dct2(out, in, 1, rep / 8, 8);
+		else if (t == 2) j40__inverse_dct4(out, in, 2, rep / 8, 8);
+		else j40__inverse_dct_recur_x8(out, in, t, rep / 8, 8);
 	} else {
-		if (t == 1) return j40__dct2(out, in, 1, rep, 1);
-		if (t == 2) return j40__inverse_dct4(out, in, 2, rep, 1);
-		return j40__inverse_dct_recur(out, in, t, rep, 1);
+		if (t == 1) j40__dct2(out, in, 1, rep, 1);
+		else if (t == 2) j40__inverse_dct4(out, in, 2, rep, 1);
+		else j40__inverse_dct_recur(out, in, t, rep, 1);
 	}
 }
 
@@ -5864,7 +5864,7 @@ J40_STATIC void j40__inverse_hornuss(float *buf) {
 	j40__aux_inverse_dct11(scratch, buf, 0, 0, 1); // updates scratch[(0..1)*8+(0..1)]
 	for (y = 0; y < 2; ++y) for (x = 0; x < 2; ++x) {
 		int32_t pos00 = y * 8 + x, pos11 = (y + 2) * 8 + (x + 2);
-		float rsum[4] = {}, sample11;
+		float rsum[4] = {0}, sample11;
 		for (iy = 0; iy < 4; ++iy) for (ix = 0; ix < 4; ++ix) {
 			rsum[ix] += scratch[(y + iy * 2) * 8 + (x + ix * 2)];
 		}
@@ -6289,8 +6289,8 @@ J40_ALWAYS_INLINE void j40__add_thresholds(
 	j40__plane *plane, const j40__plane *in, const int32_t *lf_thr, int32_t nb_lf_thr
 ) {
 	switch (in->type) {
-	case J40__PLANE_I16: return j40__add_thresholds16(plane, in, lf_thr, nb_lf_thr);
-	case J40__PLANE_I32: return j40__add_thresholds32(plane, in, lf_thr, nb_lf_thr);
+	case J40__PLANE_I16: j40__add_thresholds16(plane, in, lf_thr, nb_lf_thr); break;
+	case J40__PLANE_I32: j40__add_thresholds32(plane, in, lf_thr, nb_lf_thr); break;
 	default: J40__UNREACHABLE();
 	}
 }
@@ -6911,7 +6911,7 @@ J40_STATIC J40__RETURNS_ERR j40__combine_vardct_from_lf_group(j40__st *st, const
 	int32_t ggw8 = gg->width8, ggh8 = gg->height8;
 	int32_t ggw = gg->width, ggh = gg->height;
 	float kx_lf, kb_lf, cbrt_opsin_bias[3 /*xyb*/];
-	float *scratch = NULL, *scratch2, *samples[3] = {};
+	float *scratch = NULL, *scratch2, *samples[3] = {0};
 	int32_t x8, y8, x, y, i, c;
 
 	for (c = 0; c < 3; ++c) {
@@ -7240,7 +7240,7 @@ J40_STATIC J40__RETURNS_ERR j40__epf_step(
 	int32_t nkernels, const int32_t (*kernels)[2], j40__plane (*distances)[3], int dist_uses_cross,
 	const j40__lf_group_st *gg
 ) {
-	static const int NKERNELS = 12; // except for the center
+	enum { NKERNELS = 12 }; // except for the center
 
 	j40__frame_st *f = st->frame;
 	int32_t ggw8 = gg->width8, ggh8 = gg->height8, width = gg->width, height = gg->height;
@@ -7303,7 +7303,7 @@ J40_STATIC J40__RETURNS_ERR j40__epf_step(
 		float *outline[3];
 		float *recip_sigma_row =
 			recip_sigmas ? J40__F32_PIXELS(recip_sigmas, y / 8) : recip_sigmas_for_modular;
-		float *distance_rows[NKERNELS][3][3]; // [kernel_idx][dy+1][c]
+		float *distance_rows[NKERNELS][3][3] = {0}; // [kernel_idx][dy+1][c]
 
 		for (c = 0; c < 3; ++c) {
 			float *temp = lines[0][c];
@@ -7393,7 +7393,7 @@ J40_STATIC J40__RETURNS_ERR j40__epf(j40__st *st, j40__plane channels[3], const 
 
 	j40__frame_st *f = st->frame;
 	j40__plane recip_sigmas_ = {0}, *recip_sigmas;
-	j40__plane distances[12][3] = {};
+	j40__plane distances[12][3] = {0};
 	int32_t k, c, maxnkernels = 0;
 
 	if (f->epf.iters <= 0) return 0;
