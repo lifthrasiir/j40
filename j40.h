@@ -2147,6 +2147,8 @@ J40_INLINE int32_t j40__prefix_code(j40__st *st, int32_t fast_len, int32_t max_l
 typedef struct {
 	int8_t split_exp; // [0, 15]
 	int8_t msb_in_token, lsb_in_token; // msb_in_token + lsb_in_token <= split_exp
+	// TODO 2^30 bound is arbitrary, codestream may require larger values for some edge cases
+	int32_t max_token; // upper bound of token s.t. `j40__hybrid_int(token)` is < 2^30
 } j40__hybrid_int_config;
 
 J40_STATIC J40__RETURNS_ERR j40__read_hybrid_int_config(
@@ -2167,15 +2169,20 @@ J40_STATIC J40__RETURNS_ERR j40__read_hybrid_int_config(
 	} else {
 		out->msb_in_token = out->lsb_in_token = 0;
 	}
+	out->max_token =
+		(1 << out->split_exp) + ((30 - out->split_exp) << (out->lsb_in_token + out->msb_in_token)) - 1;
 	return st->err;
 }
 
 J40_INLINE int32_t j40__hybrid_int(j40__st *st, int32_t token, j40__hybrid_int_config config) {
 	int32_t midbits, lo, mid, hi, top, bits_in_token, split = 1 << config.split_exp;
 	if (token < split) return token;
+	if (token > config.max_token) {
+		token = config.max_token;
+		J40__ERR("iovf");
+	}
 	bits_in_token = config.msb_in_token + config.lsb_in_token;
 	midbits = config.split_exp - bits_in_token + ((token - split) >> bits_in_token);
-	// TODO midbits can overflow!
 	mid = j40__u(st, midbits);
 	top = 1 << config.msb_in_token;
 	lo = token & ((1 << config.lsb_in_token) - 1);
@@ -3961,6 +3968,7 @@ J40_STATIC J40__RETURNS_ERR j40__(modular_channel,P)(
 			}
 
 			val = j40__code(st, n->leaf.ctx, m->dist_mult, &m->code);
+			// TODO can overflow at any operator and the bound is incorrect anyway
 			val = j40__unpack_signed((int32_t) val) * n->leaf.multiplier + n->leaf.offset;
 			val += j40__(predict,2P)(st, n->leaf.predictor, &wp, &p);
 			J40__SHOULD(INT16_MIN <= val && val <= INT16_MAX, "povf");
