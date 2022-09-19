@@ -438,7 +438,7 @@ typedef struct {
 	struct j40__image_st *image;
 	struct j40__frame_st *frame;
 	struct j40__lf_group_st *lf_group;
-	struct j40__alloc_st *alloc;
+	const struct j40__limits *limits;
 } j40__st;
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -622,6 +622,7 @@ J40_ALWAYS_INLINE int j40__(add_fallback,N)(j40__intN x, j40__intN y, j40__intN 
 J40_ALWAYS_INLINE int j40__(sub_fallback,N)(j40__intN x, j40__intN y, j40__intN *out);
 J40_ALWAYS_INLINE int j40__(mul_fallback,N)(j40__intN x, j40__intN y, j40__intN *out);
 J40_ALWAYS_INLINE j40__intN j40__(clamp_add,N)(j40__intN x, j40__intN y);
+J40_ALWAYS_INLINE j40__intN j40__(clamp_mul,N)(j40__intN x, j40__intN y);
 
 #ifdef J40_IMPLEMENTATION
 
@@ -700,6 +701,11 @@ J40_ALWAYS_INLINE int j40__(mul_fallback,N)(j40__intN x, j40__intN y, j40__intN 
 J40_ALWAYS_INLINE j40__intN j40__(clamp_add,N)(j40__intN x, j40__intN y) {
 	j40__intN out;
 	return j40__(add,N)(x, y, &out) ? out : J40__INTN_MAX;
+}
+
+J40_ALWAYS_INLINE j40__intN j40__(clamp_mul,N)(j40__intN x, j40__intN y) {
+	j40__intN out;
+	return j40__(mul,N)(x, y, &out) ? out : J40__INTN_MAX;
 }
 
 #endif // defined J40_IMPLEMENTATION
@@ -1036,6 +1042,44 @@ J40_STATIC void j40__free_plane(j40__plane *plane) {
 	plane->misalign = 0;
 	plane->pixels = (uintptr_t) (void*) 0; 
 }
+
+#endif // defined J40_IMPLEMENTATION
+
+////////////////////////////////////////////////////////////////////////////////
+// limits
+
+typedef struct j40__limits {
+	int64_t pixels; // <= 2^61
+	int32_t width; // <= 2^31
+	int32_t height; // <= 2^30
+	uint64_t icc_output_size; // < 2^63
+	int32_t bpp; // <= 64
+	int ec_black_allowed;
+	int32_t num_extra_channels; // <= 4096
+	int needs_modular_16bit_buffers;
+	int32_t nb_transforms; // <= 273
+	int32_t nb_channels_tr; // # of modular channels after transform
+	int32_t tree_depth; // distance between root and leaf nodes
+	int64_t zf_pixels; // total # of pixels in a run of zero-duration frames, unlimited if zero
+} j40__limits;
+
+static const j40__limits J40__MAIN_LV5_LIMITS/*, J40__MAIN_LV10_LIMITS*/;
+
+#ifdef J40_IMPLEMENTATION
+
+static const j40__limits J40__MAIN_LV5_LIMITS = {
+	.pixels = 1 << 28, .width = 1 << 18, .height = 1 << 18, .icc_output_size = 1u << 22,
+	.bpp = 16, .ec_black_allowed = 0, .num_extra_channels = 4, .needs_modular_16bit_buffers = 1,
+	.nb_transforms = 8, .nb_channels_tr = 256, .tree_depth = 64, .zf_pixels = 1 << 28,
+};
+
+/*
+static j40__limits J40__MAIN_LV10_LIMITS = {
+	.pixels = (int64_t) 1 << 40, .width = 1 << 30, .height = 1 << 30, .icc_output_size = 1u << 28,
+	.bpp = 32, .ec_black_allowed = 1, .num_extra_channels = 256, .needs_modular_16bit_buffers = 0,
+	.nb_transforms = 512, .nb_channels_tr = 1 << 16, .tree_depth = 2048, .zf_pixels = 0,
+};
+*/
 
 #endif // defined J40_IMPLEMENTATION
 
@@ -2968,6 +3012,10 @@ J40_STATIC J40__RETURNS_ERR j40__image_metadata(j40__st *st) {
 	im->quant_bias[2] = 1.0f - 0.049935103337343655f;
 	im->quant_bias_num = 0.145f;
 
+	J40__TRY(j40__size_header(st, &im->width, &im->height));
+	J40__SHOULD(im->width <= st->limits->width && im->height <= st->limits->height, "slim");
+	J40__SHOULD((int64_t) im->width * im->height <= st->limits->pixels, "slim");
+
 	if (!j40__u(st, 1)) { // !all_default
 		int32_t extra_fields = j40__u(st, 1);
 		if (extra_fields) {
@@ -2986,8 +3034,11 @@ J40_STATIC J40__RETURNS_ERR j40__image_metadata(j40__st *st) {
 			}
 		}
 		J40__TRY(j40__bit_depth(st, &im->bpp, &im->exp_bits));
+		J40__SHOULD(im->bpp <= st->limits->bpp, "fbpp");
 		im->modular_16bit_buffers = j40__u(st, 1);
+		J40__SHOULD(im->modular_16bit_buffers || !st->limits->needs_modular_16bit_buffers, "fm32");
 		im->num_extra_channels = j40__u32(st, 0, 0, 1, 0, 2, 4, 1, 12);
+		J40__SHOULD(im->num_extra_channels <= st->limits->num_extra_channels, "elim");
 		J40__SHOULD(im->ec_info = j40__calloc((size_t) im->num_extra_channels, sizeof(j40__ec_info)), "!mem");
 		for (i = 0; i < im->num_extra_channels; ++i) im->ec_info[i].name = NULL;
 		for (i = 0; i < im->num_extra_channels; ++i) {
@@ -3015,12 +3066,16 @@ J40_STATIC J40__RETURNS_ERR j40__image_metadata(j40__st *st) {
 				case J40__EC_CFA:
 					ec->data.cfa_channel = j40__u32(st, 1, 0, 0, 2, 3, 4, 19, 8);
 					break;
-				case J40__EC_DEPTH: case J40__EC_SELECTION_MASK: case J40__EC_BLACK:
+				case J40__EC_BLACK:
+					J40__SHOULD(st->limits->ec_black_allowed, "fblk");
+					break;
+				case J40__EC_DEPTH: case J40__EC_SELECTION_MASK:
 				case J40__EC_THERMAL: case J40__EC_NON_OPTIONAL: case J40__EC_OPTIONAL:
 					break;
 				default: J40__RAISE("ect?");
 				}
 			}
+			J40__SHOULD(ec->bpp <= st->limits->bpp, "fbpp");
 			J40__RAISE_DELAYED();
 		}
 		im->xyb_encoded = j40__u(st, 1);
@@ -3240,21 +3295,36 @@ typedef union {
 	} leaf;
 } j40__tree_node;
 
-J40_STATIC J40__RETURNS_ERR j40__tree(j40__st *st, j40__tree_node **tree, j40__code_spec *codespec);
+J40_STATIC J40__RETURNS_ERR j40__tree(
+	j40__st *st, int32_t max_tree_size, j40__tree_node **tree, j40__code_spec *codespec
+);
 
 #ifdef J40_IMPLEMENTATION
 
-J40_STATIC J40__RETURNS_ERR j40__tree(j40__st *st, j40__tree_node **tree, j40__code_spec *codespec) {
+J40_STATIC J40__RETURNS_ERR j40__tree(
+	j40__st *st, int32_t max_tree_size, j40__tree_node **tree, j40__code_spec *codespec
+) {
 	j40__code_st code = { .spec = codespec };
 	j40__tree_node *t = NULL;
 	int32_t tree_idx = 0, tree_cap = 8;
 	int32_t ctx_id = 0, nodes_left = 1;
+	int32_t depth = 0, nodes_upto_this_depth = 1;
+
+	J40__ASSERT(max_tree_size <= (1 << 26)); // codestream limit; the actual limit should be smaller
 
 	J40__TRY(j40__read_code_spec(st, 6, codespec));
 	J40__SHOULD(t = j40__malloc(sizeof(j40__tree_node) * (size_t) tree_cap), "!mem");
 	while (nodes_left-- > 0) { // depth-first, left-to-right ordering
 		j40__tree_node *n;
-		int32_t prop = j40__code(st, 1, 0, &code), val, shift;
+		int32_t prop, val, shift;
+
+		// the beginning of new tree depth; all `nodes_left` nodes are in this depth at the moment
+		if (tree_idx == nodes_upto_this_depth) {
+			J40__SHOULD(++depth <= st->limits->tree_depth, "tlim");
+			nodes_upto_this_depth += nodes_left + 1;
+		}
+
+		prop = j40__code(st, 1, 0, &code);
 		J40__TRY_REALLOC32(&t, tree_idx + 1, &tree_cap);
 		n = &t[tree_idx++];
 		if (prop > 0) {
@@ -3272,9 +3342,12 @@ J40_STATIC J40__RETURNS_ERR j40__tree(j40__st *st, j40__tree_node **tree, j40__c
 			J40__SHOULD(((val + 1) >> (31 - shift)) == 0, "tree");
 			n->leaf.multiplier = (val + 1) << shift;
 		}
-		J40__SHOULD(tree_idx + nodes_left <= (1 << 26), "tree");
+
+		J40__SHOULD(tree_idx + nodes_left <= max_tree_size, "tlim");
 	}
+	J40__ASSERT(tree_idx == nodes_upto_this_depth);
 	J40__TRY(j40__finish_and_free_code(st, &code));
+
 	j40__free_code_spec(codespec);
 	memset(codespec, 0, sizeof(*codespec)); // XXX is it required?
 	J40__TRY(j40__read_code_spec(st, ctx_id, codespec));
@@ -3506,6 +3579,7 @@ J40_STATIC J40__RETURNS_ERR j40__modular_header(
 	}
 
 	transform_cap = m->nb_transforms = j40__u32(st, 0, 0, 1, 0, 2, 4, 18, 8);
+	J40__SHOULD(m->nb_transforms <= st->limits->nb_transforms, "xlim");
 	J40__SHOULD(m->transform = j40__malloc(sizeof(j40__transform) * (size_t) transform_cap), "!mem");
 	for (i = 0; i < m->nb_transforms; ++i) {
 		j40__transform *tr = &m->transform[i];
@@ -3584,11 +3658,19 @@ J40_STATIC J40__RETURNS_ERR j40__modular_header(
 		J40__RAISE_DELAYED();
 	}
 
+	J40__SHOULD(num_channels <= st->limits->nb_channels_tr, "xlim");
+
 	if (m->use_global_tree) {
 		m->tree = global_tree;
 		memcpy(&m->codespec, global_codespec, sizeof(j40__code_spec));
 	} else {
-		J40__TRY(j40__tree(st, &m->tree, &m->codespec));
+		int32_t max_tree_size = 1024;
+		for (i = 0; i < num_channels; ++i) {
+			max_tree_size = j40__clamp_add32(max_tree_size,
+				j40__clamp_mul32(channel[i].width, channel[i].height));
+		}
+		max_tree_size = j40__min32(1 << 20, max_tree_size);
+		J40__TRY(j40__tree(st, max_tree_size, &m->tree, &m->codespec));
 	}
 
 	m->channel = channel;
@@ -5019,6 +5101,8 @@ J40_STATIC J40__RETURNS_ERR j40__frame_header(j40__st *st) {
 			}
 			f->width = j40__u32(st, 0, 8, 256, 11, 2304, 14, 18688, 30);
 			f->height = j40__u32(st, 0, 8, 256, 11, 2304, 14, 18688, 30);
+			J40__SHOULD(f->width <= st->limits->width && f->height <= st->limits->height, "slim");
+			J40__SHOULD((int64_t) f->width * f->height <= st->limits->pixels, "slim");
 			full_frame = f->x0 <= 0 && f->y0 <= 0 &&
 				f->width + f->x0 >= im->width && f->height + f->y0 >= im->height;
 		}
@@ -6044,11 +6128,16 @@ J40_STATIC J40__RETURNS_ERR j40__lf_global(j40__st *st) {
 		}
 	}
 
-	if (j40__u(st, 1)) { // global tree present
-		J40__TRY(j40__tree(st, &f->global_tree, &f->global_codespec));
-	}
+	// we need f->gmodular.num_channels for j40__tree
 	J40__TRY(j40__init_modular_for_global(st, f->is_modular, f->do_ycbcr,
 		f->log_upsampling, f->ec_log_upsampling, f->width, f->height, &f->gmodular));
+
+	if (j40__u(st, 1)) { // global tree present
+		int32_t max_tree_size = j40__min32(1 << 22,
+			1024 + j40__clamp_mul32(j40__clamp_mul32(f->width, f->height), f->gmodular.num_channels) / 16);
+		J40__TRY(j40__tree(st, max_tree_size, &f->global_tree, &f->global_codespec));
+	}
+
 	if (f->gmodular.num_channels > 0) {
 		J40__TRY(j40__modular_header(st, f->global_tree, &f->global_codespec, &f->gmodular));
 		J40__TRY(j40__allocate_modular(st, &f->gmodular));
@@ -7735,6 +7824,13 @@ static const struct { char err[4]; const char *msg, *suffix; } J40__ERROR_STRING
 	{ "bigg", "Image dimensions are too large to handle", NULL },
 	{ "flen", "File is too lengthy to handle", NULL },
 	{ "shrt", "Premature end of file", NULL },
+	{ "slim", "Image size limit reached", NULL },
+	{ "elim", "Extra channel number limit reached", NULL },
+	{ "xlim", "Modular transform limit reached", NULL },
+	{ "tlim", "Meta-adaptive tree size or depth limit reached", NULL },
+	{ "fbpp", "Given bits per pixel value is disallowed", NULL }, // "f" stands for "forbidden"
+	{ "fblk", "Black extra channel is disallowed", NULL },
+	{ "fm32", "32-bit buffers for modular encoding are disallowed", NULL },
 	{ "TODO", "Unimplemented feature encountered", NULL }, // TODO remove this when ready
 	{ "TEST", "Testing-only error occurred", NULL },
 };
@@ -7840,6 +7936,7 @@ J40_STATIC void j40__init_state(j40__st *st, j40__inner *inner) {
 	st->buffer = &inner->buffer;
 	st->image = &inner->image;
 	st->frame = &inner->frame;
+	st->limits = &J40__MAIN_LV5_LIMITS;
 }
 
 J40_STATIC void j40__save_state(j40__st *st, j40__inner *inner, j40__origin origin) {
@@ -7884,7 +7981,6 @@ J40_STATIC J40__RETURNS_ERR j40__advance(j40__inner *inner, j40__origin origin/*
 
 		J40__YIELD_AFTER(j40__init_buffer(st, 0, INT64_MAX));
 		J40__YIELD_AFTER(j40__signature(st));
-		J40__YIELD_AFTER(j40__size_header(st, &st->image->width, &st->image->height));
 		J40__YIELD_AFTER(j40__image_metadata(st));
 
 		if (st->image->want_icc) {
