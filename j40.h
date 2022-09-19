@@ -2360,6 +2360,9 @@ typedef struct {
 	uint32_t ans_state; // 0 if uninitialized
 } j40__code_st;
 
+// j40__code dist_mult should be clamped to this value in order to prevent overflow
+#define J40__MAX_DIST_MULT (1 << 21)
+
 J40_STATIC J40__RETURNS_ERR j40__cluster_map(
 	j40__st *st, int32_t num_dist, int32_t max_allowed, int32_t *num_clusters, uint8_t *map
 );
@@ -2631,15 +2634,17 @@ J40_STATIC int32_t j40__entropy_code_cluster(
 
 // aka DecodeHybridVarLenUint
 J40_STATIC int32_t j40__code(j40__st *st, int32_t ctx, int32_t dist_mult, j40__code_st *code) {
+	static const int32_t MASK = 0xfffff;
+
 	const j40__code_spec *spec = code->spec;
 	int32_t token, distance, log_alpha_size;
 	j40__code_cluster *cluster;
 	int use_prefix_code;
 
 	if (code->num_to_copy > 0) {
-continue_lz77:
+		J40__ASSERT(code->window); // because this can't be the initial token and lz77_enabled is true
 		--code->num_to_copy;
-		return code->window[code->num_decoded++ & 0xfffff] = code->window[code->copy_pos++ & 0xfffff];
+		return code->window[code->num_decoded++ & MASK] = code->window[code->copy_pos++ & MASK];
 	}
 
 	J40__ASSERT(ctx < spec->num_dist);
@@ -2671,11 +2676,22 @@ continue_lz77:
 				0xe5, 0x05, 0xf4, 0xd7, 0x17, 0xe6, 0x06, 0xf5, 0xe7, 0x07, 0xf6, 0xf7,
 			};
 			int32_t special = (int32_t) SPECIAL_DISTANCES[distance];
-			distance = ((special >> 4) - 7) + dist_mult * (special & 7);
+			J40__ASSERT(dist_mult <= J40__MAX_DIST_MULT);
+			// TODO spec bug: distance can be as low as -6 when dist_mult = 1 and distance =
+			// dist_mult * 1 - 7; libjxl clamps it to the minimum of 1, so we do the same here
+			distance = j40__max32(1, ((special >> 4) - 7) + dist_mult * (special & 7));
 		}
 		distance = j40__min32(j40__min32(distance, code->num_decoded), 1 << 20);
 		code->copy_pos = code->num_decoded - distance;
-		goto continue_lz77;
+		if (J40_UNLIKELY(distance == 0)) {
+			// TODO spec bug: this is possible when num_decoded == 0 (or a non-positive special
+			// distance, handled above) and libjxl acts as if `window[i]` is initially filled with 0
+			J40__ASSERT(code->num_decoded == 0 && !code->window);
+			code->window = j40__calloc(1u << 20, sizeof(int32_t));
+			if (!code->window) return J40__ERR("!mem"), 0;
+		}
+		--code->num_to_copy;
+		return code->window[code->num_decoded++ & MASK] = code->window[code->copy_pos++ & MASK];
 	}
 
 	token = j40__hybrid_int(st, token, cluster->config);
@@ -2685,7 +2701,7 @@ continue_lz77:
 			code->window = j40__malloc(sizeof(int32_t) << 20);
 			if (!code->window) return J40__ERR("!mem"), 0;
 		}
-		code->window[code->num_decoded++ & 0xfffff] = token;
+		code->window[code->num_decoded++ & MASK] = token;
 	}
 	return token;
 }
@@ -3304,7 +3320,7 @@ typedef struct {
 	j40__code_st code;
 	int32_t num_channels, nb_meta_channels;
 	j40__plane *channel; // should use the same type, either i16 or i32
-	int32_t max_width; // aka dist_multiplier, excludes meta channels
+	int32_t dist_mult; // min(max(non-meta channel width), J40__MAX_DIST_MULT)
 } j40__modular;
 
 J40_STATIC void j40__init_modular_common(j40__modular *m);
@@ -3571,10 +3587,11 @@ J40_STATIC J40__RETURNS_ERR j40__modular_header(
 	m->channel = channel;
 	m->num_channels = num_channels;
 	m->nb_meta_channels = nb_meta_channels;
-	m->max_width = 0;
+	m->dist_mult = 0;
 	for (i = nb_meta_channels; i < num_channels; ++i) {
-		m->max_width = j40__max32(m->max_width, channel[i].width);
+		m->dist_mult = j40__max32(m->dist_mult, channel[i].width);
 	}
+	m->dist_mult = j40__min32(m->dist_mult, J40__MAX_DIST_MULT);
 	return 0;
 
 J40__ON_ERROR:
@@ -3943,7 +3960,7 @@ J40_STATIC J40__RETURNS_ERR j40__(modular_channel,P)(
 				n += val > n->branch.value ? n->branch.leftoff : n->branch.rightoff;
 			}
 
-			val = j40__code(st, n->leaf.ctx, m->max_width, &m->code);
+			val = j40__code(st, n->leaf.ctx, m->dist_mult, &m->code);
 			val = j40__unpack_signed((int32_t) val) * n->leaf.multiplier + n->leaf.offset;
 			val += j40__(predict,2P)(st, n->leaf.predictor, &wp, &p);
 			J40__SHOULD(INT16_MIN <= val && val <= INT16_MAX, "povf");
