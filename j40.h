@@ -978,12 +978,12 @@ J40_STATIC J40__RETURNS_ERR j40__init_plane(
 	out->type = 0;
 	J40__ASSERT(width > 0 && height > 0);
 
-	J40__SHOULD(j40__mul32(width, pixel_size, &stride_bytes), "over");
-	if (flags & J40__PLANE_FORCE_PAD) J40__SHOULD(j40__add32(stride_bytes, 1, &stride_bytes), "over");
+	J40__SHOULD(j40__mul32(width, pixel_size, &stride_bytes), "bigg");
+	if (flags & J40__PLANE_FORCE_PAD) J40__SHOULD(j40__add32(stride_bytes, 1, &stride_bytes), "bigg");
 	J40__SHOULD(
 		j40__mul32(j40__ceil_div32(stride_bytes, J40__PIXELS_ALIGN), J40__PIXELS_ALIGN, &stride_bytes),
-		"over");
-	J40__SHOULD((size_t) stride_bytes <= SIZE_MAX / (uint32_t) height, "over");
+		"bigg");
+	J40__SHOULD((size_t) stride_bytes <= SIZE_MAX / (uint32_t) height, "bigg");
 	total = (size_t) stride_bytes * (size_t) height;
 	J40__SHOULD(pixels = j40__alloc_aligned(total, J40__PIXELS_ALIGN, &misalign), "!mem");
 
@@ -1079,7 +1079,7 @@ J40_STATIC int j40__memory_source_read(uint8_t *buf, int64_t fileoff, size_t max
 J40_STATIC J40__RETURNS_ERR j40__init_memory_source(
 	j40__st *st, uint8_t *buf, size_t size, j40_memory_free_func freefunc, j40__source_st *source
 ) {
-	J40__SHOULD(size <= (uint64_t) INT64_MAX, "over");
+	J40__SHOULD(size <= (uint64_t) INT64_MAX, "flen");
 	source->read_func = j40__memory_source_read;
 	source->seek_func = NULL;
 	source->free_func = freefunc;
@@ -1185,9 +1185,9 @@ J40_STATIC J40__RETURNS_ERR j40__try_read_from_source(
 			J40__RAISE("read");
 		}
 		if (added_size == 0) break; // EOF or blocking condition
-		J40__SHOULD(added_size <= (uint64_t) INT64_MAX, "over");
+		J40__SHOULD(added_size <= (uint64_t) INT64_MAX, "flen");
 		read_size += (int64_t) added_size;
-		J40__SHOULD(j40__add64(source->fileoff, (int64_t) read_size, &source->fileoff), "over");
+		J40__SHOULD(j40__add64(source->fileoff, (int64_t) read_size, &source->fileoff), "flen");
 	}
 
 	J40__SHOULD(read_size >= minsize, "shrt");
@@ -1313,7 +1313,7 @@ J40_STATIC J40__RETURNS_ERR j40__box_header(j40__st *st, uint32_t *type, int64_t
 		J40__TRY(j40__read_from_source(st, buf, 8));
 		size64 = ((uint64_t) j40__u32be(buf) << 32) | (uint64_t) j40__u32be(buf + 4);
 		J40__SHOULD(size64 >= 16, "boxx");
-		J40__SHOULD(size64 <= INT64_MAX, "over");
+		J40__SHOULD(size64 <= INT64_MAX, "flen");
 		*size = (int64_t) size64 - 16;
 	} else {
 		J40__SHOULD(size32 >= 8, "boxx");
@@ -1431,14 +1431,14 @@ J40_STATIC J40__RETURNS_ERR j40__container(j40__st *st, int64_t wanted_codeoff) 
 			// the beginning of the box *contents*.
 			J40__TRY_REALLOC32(&c->map, c->nmap + 1, &c->map_cap);
 			c->map[c->nmap - 1].fileoff = source->fileoff;
-			J40__SHOULD(j40__add64(c->map[c->nmap - 1].codeoff, size, &c->map[c->nmap].codeoff), "over");
+			J40__SHOULD(j40__add64(c->map[c->nmap - 1].codeoff, size, &c->map[c->nmap].codeoff), "flen");
 			// F[nmap] gets updated in the common case.
-			J40__SHOULD(j40__add32(c->nmap, 1, &c->nmap), "over");
+			J40__SHOULD(j40__add32(c->nmap, 1, &c->nmap), "flen");
 		}
 
 		// always maintains F[nmap-1] to be the beginning of the next box (and seek to that point).
 		// we've already read the previous box header, so this should happen even if seek fails.
-		J40__SHOULD(j40__add64(source->fileoff, size, &c->map[c->nmap - 1].fileoff), "over");
+		J40__SHOULD(j40__add64(source->fileoff, size, &c->map[c->nmap - 1].fileoff), "flen");
 		J40__TRY(j40__seek_from_source(st, c->map[c->nmap - 1].fileoff));
 	}
 
@@ -1475,7 +1475,7 @@ J40_STATIC J40__RETURNS_ERR j40__map_codestream_offset(j40__st *st, int64_t code
 		J40__ASSERT(codeoff - map[i].codeoff < map[i+1].fileoff - map[i].fileoff);
 		*fileoff = map[i].fileoff + (codeoff - map[i].codeoff); // thus this never overflows
 	} else if (st->container->flags & J40__IMPLIED_LAST_MAP_ENTRY) {
-		J40__SHOULD(j40__add64(map[nmap-1].fileoff, codeoff - map[nmap-1].codeoff, fileoff), "over");
+		J40__SHOULD(j40__add64(map[nmap-1].fileoff, codeoff - map[nmap-1].codeoff, fileoff), "flen");
 	} else if (st->container->flags & J40__NO_MORE_CODESTREAM_BOX) {
 		// TODO is this valid to do? j40__end_of_frame depends on this.
 		if (codeoff == map[nmap-1].codeoff) {
@@ -1597,7 +1597,7 @@ J40_STATIC J40__RETURNS_ERR j40__refill_buffer(j40__st *st) {
 			readable_size = available;
 			J40__SHOULD(
 				j40__add64(map[i].fileoff, buffer->next_codeoff - map[nmap-1].codeoff, &fileoff),
-				"over");
+				"flen");
 		} else {
 			// we have reached past the last mapped box, but there may be more boxes to map
 			J40__TRY(j40__container(st, wanted_codeoff));
@@ -1613,7 +1613,7 @@ J40_STATIC J40__RETURNS_ERR j40__refill_buffer(j40__st *st) {
 		if (read_size == 0) break; // EOF or blocking condition, can't continue
 
 		buffer->size += read_size;
-		J40__SHOULD(j40__add64(buffer->next_codeoff, read_size, &buffer->next_codeoff), "over");
+		J40__SHOULD(j40__add64(buffer->next_codeoff, read_size, &buffer->next_codeoff), "flen");
 		bits->end = checkpoint->end = buffer->buf + buffer->size;
 		available -= read_size;
 		if (read_size == readable_size) ++i; // try again if read is somehow incomplete
@@ -2919,7 +2919,7 @@ J40_STATIC J40__RETURNS_ERR j40__extensions(j40__st *st) {
 		if (extensions >> i & 1) {
 			uint64_t n = j40__u64(st);
 			J40__RAISE_DELAYED();
-			J40__SHOULD(n <= (uint64_t) INT64_MAX && j40__add64(nbits, (int64_t) n, &nbits), "over");
+			J40__SHOULD(n <= (uint64_t) INT64_MAX && j40__add64(nbits, (int64_t) n, &nbits), "flen");
 		}
 	}
 	return j40__skip(st, nbits);
@@ -5228,7 +5228,7 @@ J40_STATIC J40__RETURNS_ERR j40__read_toc(j40__st *st, j40__toc *toc) {
 	int32_t pass;
 
 	// TODO remove int32_t restrictions
-	J40__SHOULD((uint64_t) nsections <= SIZE_MAX && nsections <= INT32_MAX, "over");
+	J40__SHOULD((uint64_t) nsections <= SIZE_MAX && nsections <= INT32_MAX, "flen");
 
 	if (j40__u(st, 1)) { // permuted
 		J40__TRY(j40__read_code_spec(st, 8, &codespec));
@@ -5246,7 +5246,7 @@ J40_STATIC J40__RETURNS_ERR j40__read_toc(j40__st *st, j40__toc *toc) {
 		toc->lf_global_size = toc->hf_global_size = 0;
 		toc->nsections = toc->nsections_read = 0;
 		toc->sections = NULL;
-		J40__SHOULD(j40__add64(j40__codestream_offset(st), toc->single_size, &toc->end_codeoff), "over");
+		J40__SHOULD(j40__add64(j40__codestream_offset(st), toc->single_size, &toc->end_codeoff), "flen");
 		j40__free(lehmer);
 		return 0;
 	}
@@ -5259,9 +5259,9 @@ J40_STATIC J40__RETURNS_ERR j40__read_toc(j40__st *st, j40__toc *toc) {
 
 	sections[0].codeoff = j40__codestream_offset(st); // all TOC offsets are relative to this point
 	for (i = 1; i < nsections; ++i) {
-		J40__SHOULD(j40__add64(sections[i-1].codeoff, sections[i-1].size, &sections[i].codeoff), "over");
+		J40__SHOULD(j40__add64(sections[i-1].codeoff, sections[i-1].size, &sections[i].codeoff), "flen");
 	}
-	J40__SHOULD(j40__add64(sections[i-1].codeoff, sections[i-1].size, &toc->end_codeoff), "over");
+	J40__SHOULD(j40__add64(sections[i-1].codeoff, sections[i-1].size, &toc->end_codeoff), "flen");
 
 	if (lehmer) {
 		j40__apply_permutation(sections, &temp, sizeof(j40__section), lehmer);
@@ -7480,7 +7480,7 @@ J40_STATIC J40__RETURNS_ERR j40__init_section_state(
 
 	J40__ASSERT(codeoff <= INT64_MAX - size);
 	J40__TRY(j40__map_codestream_offset(st, codeoff, &fileoff));
-	J40__SHOULD(j40__add64(codeoff, size, &codeoff_limit), "over");
+	J40__SHOULD(j40__add64(codeoff, size, &codeoff_limit), "flen");
 
 	J40__TRY(j40__seek_from_source(st, fileoff)); // doesn't alter st->buffer
 
@@ -7655,7 +7655,7 @@ J40_STATIC J40__RETURNS_ERR j40__render_to_u8x4_rgba(j40__st *st, j40__plane *ou
 		}
 	}
 
-	J40__SHOULD(f->width < INT32_MAX / 4, "over");
+	J40__SHOULD(f->width < INT32_MAX / 4, "bigg");
 	J40__TRY(j40__init_plane(st, J40__PLANE_U8, f->width * 4, f->height, J40__PLANE_FORCE_PAD, &rgba));
 
 	maxpixel = (1 << im->bpp) - 1;
@@ -7732,8 +7732,8 @@ static const struct { char err[4]; const char *msg, *suffix; } J40__ERROR_STRING
 	{ "!mem", "Out of memory", NULL },
 	{ "!jxl", "The JPEG XL signature is not found", NULL },
 	{ "open", "Failed to open file", NULL },
-	{ "bigg", "Image is too big to handle", NULL },
-	{ "over", "File is too big to handle", NULL },
+	{ "bigg", "Image dimensions are too large to handle", NULL },
+	{ "flen", "File is too lengthy to handle", NULL },
 	{ "shrt", "Premature end of file", NULL },
 	{ "TODO", "Unimplemented feature encountered", NULL }, // TODO remove this when ready
 	{ "TEST", "Testing-only error occurred", NULL },
