@@ -586,6 +586,33 @@ J40_ALWAYS_INLINE int j40__surely_nonzero(float x) {
 	return isfinite(x) && fabs(x) >= 1e-8f;
 }
 
+#ifdef _MSC_VER // required for j40__floor/ceil_lgN implementations
+
+#include <intrin.h>
+
+#pragma intrinsic(_BitScanReverse)
+J40_ALWAYS_INLINE int j40__clz32(uint32_t x) {
+	unsigned long index;
+	return _BitScanReverse(&index, x) ? 31 - (int) index : 32;
+}
+
+J40_ALWAYS_INLINE int j40__clz16(uint16_t x) { return j40__clz32(x); }
+
+// _BitScanReverse64 is not available at all in x86-32, so we need to detour
+#if defined __ia64__ || defined __x86_64
+#pragma intrinsic(_BitScanReverse64)
+J40_ALWAYS_INLINE int j40__clz64(uint64_t x) {
+	unsigned long index;
+	return _BitScanReverse64(&index, x) ? 63 - (int) index : 64;
+}
+#else
+J40_ALWAYS_INLINE int j40__clz64(uint64_t x) {
+	return x >> 32 ? j40__clz32((uint32_t) (x >> 32)) : 32 + j40__clz32((uint32_t) x);
+}
+#endif // defined __ia64__ || defined __x86_64
+
+#endif // defined _MSC_VER
+
 #endif // defined J40_IMPLEMENTATION
 
 // ----------------------------------------
@@ -710,15 +737,19 @@ J40_ALWAYS_INLINE j40__intN j40__(clamp_mul,N)(j40__intN x, j40__intN y) {
 
 #endif // defined J40_IMPLEMENTATION
 
-#define J40__UINTN_MAX J40__CONCAT3(UINT, J40__N, _MAX)
-#if UINT_MAX == J40__UINTN_MAX
-	#define J40__CLZN __builtin_clz
-#elif ULONG_MAX == J40__UINTN_MAX
-	#define J40__CLZN __builtin_clzl
-#elif ULLONG_MAX == J40__UINTN_MAX
-	#define J40__CLZN __builtin_clzll
-#endif
-#undef J40__UINTN_MAX
+#ifdef _MSC_VER
+	#define J40__CLZN j40__(clz, N)
+#else
+	#define J40__UINTN_MAX J40__CONCAT3(UINT, J40__N, _MAX)
+	#if UINT_MAX == J40__UINTN_MAX
+			#define J40__CLZN __builtin_clz
+	#elif ULONG_MAX == J40__UINTN_MAX
+			#define J40__CLZN __builtin_clzl
+	#elif ULLONG_MAX == J40__UINTN_MAX
+			#define J40__CLZN __builtin_clzll
+	#endif
+	#undef J40__UINTN_MAX
+#endif // !defined _MSC_VER
 #ifdef J40__CLZN
 	J40_ALWAYS_INLINE int j40__(floor_lg,N)(j40__uintN x);
 	J40_ALWAYS_INLINE int j40__(ceil_lg,N)(j40__uintN x);
