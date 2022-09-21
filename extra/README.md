@@ -2,6 +2,8 @@
 
 * `stb_image_write.h` (1.16): A single-file public domain image writer library from [stb](https://github.com/nothings/stb/).
 
+* `j40-fuzz.c`: Fuzzer entry point.
+
 ## Subdirectory `build`
 
 This directory complements `make.cmd` at the repository root which emulates Make in Windows.
