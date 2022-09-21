@@ -1,4 +1,5 @@
-dj40
+dj40*
+.ninja_*
 
 # Prerequisites
 *.d
