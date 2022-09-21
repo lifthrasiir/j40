@@ -1,5 +1,5 @@
 rule cc
-  command = cmd /c extra\build\in-vsenv cl /W4 $cflags "$in" "/Fe:$out" && del /f "$msvc-obj"
+  command = cmd /c extra\build\in-vsenv cl /nologo /W4 $cflags "$in" "/Fe:$out" && del /f "$msvc-obj"
   description = cl $in /Fe:$out
 
 cflags-opt = /O2
