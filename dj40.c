@@ -8,6 +8,8 @@
 	#pragma GCC diagnostic push
 	#pragma GCC diagnostic ignored "-Wsign-conversion"
 	#pragma GCC diagnostic ignored "-Wconversion"
+#elif defined _MSC_VER
+	#pragma warning(disable: 4996) // this also applies to main below, unlike as in GCC
 #endif
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "extra/stb_image_write.h"

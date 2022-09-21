@@ -111,6 +111,12 @@
 	#define J40__RECURSING 0
 #endif
 
+// we don't care about secure CRT, which is only marginally safe and not even compatible with C11
+#ifdef _MSC_VER
+	#pragma warning(push)
+	#pragma warning(disable: 4996)
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -8324,6 +8330,10 @@ J40_API void j40_free(j40_image *image) {
 
 #ifdef __cplusplus
 }
+#endif
+
+#ifdef _MSC_VER
+	#pragma warning(pop)
 #endif
 
 // prevents double `#include`s---we can't really use `#pragma once` or simple `#ifndef` guards...
