@@ -3753,15 +3753,17 @@ J40_STATIC void j40__free_modular(j40__modular *m) {
 		j40__free(m->tree);
 		j40__free_code_spec(&m->codespec);
 	}
-	for (i = 0; i < m->num_channels; ++i) j40__free_plane(&m->channel[i]);
+	if (m->channel) {
+		for (i = 0; i < m->num_channels; ++i) j40__free_plane(&m->channel[i]);
+		j40__free(m->channel);
+		m->channel = NULL;
+	}
 	j40__free(m->transform);
-	j40__free(m->channel);
 	m->use_global_tree = 0;
 	m->tree = NULL;
 	memset(&m->codespec, 0, sizeof(j40__code_spec));
 	m->transform = NULL;
 	m->num_channels = 0;
-	m->channel = NULL;
 }
 
 #endif // defined J40_IMPLEMENTATION
