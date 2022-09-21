@@ -1094,18 +1094,16 @@ typedef struct j40__limits {
 	int64_t zf_pixels; // total # of pixels in a run of zero-duration frames, unlimited if zero
 } j40__limits;
 
-static const j40__limits J40__MAIN_LV5_LIMITS/*, J40__MAIN_LV10_LIMITS*/;
-
 #ifdef J40_IMPLEMENTATION
 
-static const j40__limits J40__MAIN_LV5_LIMITS = {
+J40_STATIC const j40__limits J40__MAIN_LV5_LIMITS = {
 	.pixels = 1 << 28, .width = 1 << 18, .height = 1 << 18, .icc_output_size = 1u << 22,
 	.bpp = 16, .ec_black_allowed = 0, .num_extra_channels = 4, .needs_modular_16bit_buffers = 1,
 	.nb_transforms = 8, .nb_channels_tr = 256, .tree_depth = 64, .zf_pixels = 1 << 28,
 };
 
 /*
-static j40__limits J40__MAIN_LV10_LIMITS = {
+J40_STATIC j40__limits J40__MAIN_LV10_LIMITS = {
 	.pixels = (int64_t) 1 << 40, .width = 1 << 30, .height = 1 << 30, .icc_output_size = 1u << 28,
 	.bpp = 32, .ec_black_allowed = 1, .num_extra_channels = 256, .needs_modular_16bit_buffers = 0,
 	.nb_transforms = 512, .nb_channels_tr = 1 << 16, .tree_depth = 2048, .zf_pixels = 0,
@@ -1113,6 +1111,8 @@ static j40__limits J40__MAIN_LV10_LIMITS = {
 */
 
 #endif // defined J40_IMPLEMENTATION
+
+extern const j40__limits J40__MAIN_LV5_LIMITS/*, J40__MAIN_LV10_LIMITS*/;
 
 ////////////////////////////////////////////////////////////////////////////////
 // input source
@@ -3235,7 +3235,7 @@ J40_STATIC J40__RETURNS_ERR j40__icc(j40__st *st);
 #ifdef J40_IMPLEMENTATION
 
 J40_STATIC J40__RETURNS_ERR j40__icc(j40__st *st) {
-	size_t enc_size, index;
+	uint64_t enc_size, index;
 	j40__code_spec codespec = {0};
 	j40__code_st code = { .spec = &codespec };
 	int32_t byte = 0, prev = 0, pprev = 0, ctx;
@@ -4305,7 +4305,7 @@ J40_STATIC J40__RETURNS_ERR j40__(inverse_palette,P)(
 					idx = (intP_t) (idx - tr->pal.nb_colours);
 					if (idx < 64) { // idx == ..YX in base 4 -> {(X+0.5)/4, (Y+0.5)/4, ...}
 						val = (intP_t) ((i < 3 ? idx >> (2 * i) : 0) * (((int2P_t) 1 << bpp) - 1) / 4 +
-							(1 << j40__max32(0, bpp - 3)));
+							((int2P_t) 1 << j40__max32(0, bpp - 3)));
 					} else { // idx + 64 == ..ZYX in base 5 -> {X/4, Y/4, Z/4, ...}
 						val = (intP_t) (idx - 64);
 						for (j = 0; j < i; ++j) val /= 5;
@@ -6571,7 +6571,7 @@ J40_STATIC J40__RETURNS_ERR j40__lf_group(j40__st *st, j40__lf_group_st *gg) {
 	int64_t sidx0 = 1 + ggidx, sidx1 = 1 + f->num_lf_groups + ggidx, sidx2 = 1 + 2 * f->num_lf_groups + ggidx;
 	j40__plane lfquant[3] = {{0}};
 	j40__modular m = {0};
-	int32_t i, c;
+	int32_t i;
 
 	// TODO factor into j40__init_modular_for_lf_group
 	for (i = f->num_gm_channels; i < f->gmodular.num_channels; ++i) {
@@ -6591,7 +6591,7 @@ J40_STATIC J40__RETURNS_ERR j40__lf_group(j40__st *st, j40__lf_group_st *gg) {
 
 		// LfQuant
 		if (!f->use_lf_frame) {
-			int32_t extra_prec = j40__u(st, 2);
+			int32_t extra_prec = j40__u(st, 2), c;
 			J40__SHOULD(f->jpeg_upsampling == 0, "TODO: subimage w/h depends on jpeg_upsampling");
 			w[0] = w[1] = w[2] = ggw8;
 			h[0] = h[1] = h[2] = ggh8;
@@ -7841,7 +7841,7 @@ static const char *J40__ORIGIN_NAMES[] = {
 	J40__FOREACH_API(J40__ORIGIN_NAME)
 };
 
-static const struct { char err[4]; const char *msg, *suffix; } J40__ERROR_STRINGS[] = {
+static const struct { char err[5]; const char *msg, *suffix; } J40__ERROR_STRINGS[] = {
 	{ "Upt0", "`path` parameter is NULL", NULL },
 	{ "Ubf0", "`buf` parameter is NULL", NULL },
 	{ "Uch?", "Bad `channel` parameter", NULL },
@@ -8088,11 +8088,11 @@ J40_API j40_err j40_error(const j40_image *image) {
 
 J40_API const char *j40_error_string(const j40_image *image) {
 	static char static_errbuf[J40__ERRBUF_LEN];
-	uint32_t origin;
-	j40_err err;
+	uint32_t origin = J40__ORIGIN_NONE;
+	j40_err err = 0;
 	const char *msg, *suffix;
-	char *buf;
-	int saved_errno;
+	char *buf = NULL;
+	int saved_errno = 0;
 	int32_t i, corrupted_image = 0;
 
 	if (!image) {
