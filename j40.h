@@ -1769,7 +1769,6 @@ J40_INLINE int64_t j40__64u32(
 J40_STATIC uint64_t j40__u64(j40__st *st);
 J40_INLINE int32_t j40__enum(j40__st *st);
 J40_INLINE float j40__f16(j40__st *st);
-J40_STATIC uint64_t j40__varint(j40__st *st);
 J40_INLINE int32_t j40__u8(j40__st *st);
 J40_INLINE int32_t j40__at_most(j40__st *st, int32_t max);
 J40_STATIC J40__RETURNS_ERR j40__no_more_bytes(j40__st *st);
@@ -1921,19 +1920,6 @@ J40_INLINE float j40__f16(j40__st *st) {
 	int32_t biased_exp = (bits >> 10) & 0x1f;
 	if (biased_exp == 31) return J40__ERR("!fin"), 0.0f;
 	return (bits >> 15 ? -1 : 1) * ldexpf((float) ((bits & 0x3ff) | (biased_exp > 0 ? 0x400 : 0)), biased_exp - 25);
-}
-
-J40_STATIC uint64_t j40__varint(j40__st *st) { // ICC only
-	uint64_t value = 0;
-	int32_t shift = 0;
-	do {
-		if (st->bits.ptr == st->bits.end) return J40__ERR("shrt"), (uint64_t) 0;
-		int32_t b = j40__u(st, 8);
-		value |= (uint64_t) (b & 0x7f) << shift;
-		if (b < 128) return value;
-		shift += 7;
-	} while (shift < 63);
-	return J40__ERR("vint"), (uint64_t) 0;
 }
 
 J40_INLINE int32_t j40__u8(j40__st *st) { // ANS distribution decoding only
@@ -3236,12 +3222,27 @@ J40_STATIC void j40__free_image_state(j40__image_st *im) {
 ////////////////////////////////////////////////////////////////////////////////
 // ICC
 
+J40_STATIC uint64_t j40__icc_varint(j40__st *st, uint64_t *index, uint64_t size, j40__code_st *code);
 J40_STATIC J40__RETURNS_ERR j40__icc(j40__st *st);
 
 #ifdef J40_IMPLEMENTATION
 
+J40_STATIC uint64_t j40__icc_varint(j40__st *st, uint64_t *index, uint64_t size, j40__code_st *code) {
+	uint64_t value = 0;
+	int32_t shift = 0;
+	do {
+		int32_t b;
+		if ((*index)++ >= size) return J40__ERR("icc?"), 0u;
+		b = j40__code(st, 0, 0, code);
+		value |= (uint64_t) (b & 0x7f) << shift;
+		if (b < 128) return value;
+		shift += 7;
+	} while (shift < 63);
+	return J40__ERR("vint"), 0u;
+}
+
 J40_STATIC J40__RETURNS_ERR j40__icc(j40__st *st) {
-	uint64_t enc_size, index;
+	uint64_t enc_size, output_size, index;
 	j40__code_spec codespec = {0};
 	j40__code_st code = { .spec = &codespec };
 	int32_t byte = 0, prev = 0, pprev = 0, ctx;
@@ -3249,7 +3250,19 @@ J40_STATIC J40__RETURNS_ERR j40__icc(j40__st *st) {
 	enc_size = j40__u64(st);
 	J40__TRY(j40__read_code_spec(st, 41, &codespec));
 
-	for (index = 0; index < enc_size; ++index) {
+	index = 0;
+	output_size = j40__icc_varint(st, &index, enc_size, &code);
+	J40__SHOULD(output_size <= st->limits->icc_output_size, "plim");
+
+	// SPEC it is still possible that enc_size is too large while output_size is within the limit.
+	// the current spec allows for an arbitrarily large enc_size for the fixed output_size, because
+	// some commands can generate zero output bytes, but as libjxl never emits such commands and
+	// already (wrongly) assumes that a single command byte can generate at least one output byte,
+	// J40 instead chose to forbid such commands. with this restriction in place valid enc_size
+	// can never exceed 21 times output_size, so this is what we are checking for.
+	J40__SHOULD(output_size >= enc_size / 21, "icc?");
+
+	for (; index < enc_size; ++index) {
 		pprev = prev;
 		prev = byte;
 		ctx = 0;
@@ -3273,7 +3286,6 @@ J40_STATIC J40__RETURNS_ERR j40__icc(j40__st *st) {
 	J40__TRY(j40__finish_and_free_code(st, &code));
 	j40__free_code_spec(&codespec);
 
-	//size_t output_size = j40__varint(st);
 	//size_t commands_size = j40__varint(st);
 
 	/*
@@ -7867,6 +7879,7 @@ static const struct { char err[5]; const char *msg, *suffix; } J40__ERROR_STRING
 	{ "elim", "Extra channel number limit reached", NULL },
 	{ "xlim", "Modular transform limit reached", NULL },
 	{ "tlim", "Meta-adaptive tree size or depth limit reached", NULL },
+	{ "plim", "ICC profile length limit reached", NULL },
 	{ "fbpp", "Given bits per pixel value is disallowed", NULL }, // "f" stands for "forbidden"
 	{ "fblk", "Black extra channel is disallowed", NULL },
 	{ "fm32", "32-bit buffers for modular encoding are disallowed", NULL },
