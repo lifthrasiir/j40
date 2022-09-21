@@ -451,7 +451,7 @@ typedef struct {
 	#define J40__ASSERT(cond) (J40_UNLIKELY(!(cond)) ? __builtin_unreachable() : (void) 0)
 	#define J40__UNREACHABLE() __builtin_unreachable()
 #else
-	#define J40__ASSERT(cond) ((void) 0)
+	#define J40__ASSERT(cond) ((void) (cond))
 	#define J40__UNREACHABLE() ((void) 0) // TODO also check for MSVC __assume
 #endif
 
@@ -462,7 +462,7 @@ typedef struct {
 #define J40__ERR(s) j40__set_error(st, J40__4(s))
 #define J40__SHOULD(cond, s) do { \
 		if (J40_UNLIKELY(st->err)) goto J40__ON_ERROR; \
-		if (J40_UNLIKELY(!(cond))) { j40__set_error(st, J40__4(s)); goto J40__ON_ERROR; } \
+		if (J40_UNLIKELY((cond) == 0)) { j40__set_error(st, J40__4(s)); goto J40__ON_ERROR; } \
 	} while (0)
 #define J40__RAISE(s) do { j40__set_error(st, J40__4(s)); goto J40__ON_ERROR; } while (0)
 #define J40__RAISE_DELAYED() do { if (J40_UNLIKELY(st->err)) goto J40__ON_ERROR; } while (0)
@@ -4308,7 +4308,7 @@ J40_STATIC J40__RETURNS_ERR j40__(inverse_palette,P)(
 							((int2P_t) 1 << j40__max32(0, bpp - 3)));
 					} else { // idx + 64 == ..ZYX in base 5 -> {X/4, Y/4, Z/4, ...}
 						val = (intP_t) (idx - 64);
-						for (j = 0; j < i; ++j) val /= 5;
+						for (j = 0; j < i; ++j) val = (intP_t) (val / 5);
 						val = (intP_t) ((val % 5) * ((1 << bpp) - 1) / 4);
 					}
 				}
@@ -7112,7 +7112,7 @@ J40_STATIC J40__RETURNS_ERR j40__gaborish(j40__st *st, j40__plane channels[3 /*x
 	j40__frame_st *f = st->frame;
 	int32_t width, height;
 	int32_t c, x, y;
-	float *linebuf, *nline, *line;
+	float *linebuf = NULL, *nline, *line;
 
 	if (!f->gab.enabled) return 0;
 
