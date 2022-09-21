@@ -38,9 +38,24 @@ int main(int argc, char **argv) {
 
 	if (j40_error(&image)) {
 		fprintf(stderr, "Error: %s\n", j40_error_string(&image));
+		j40_free(&image);
 		return 1;
 	}
 
 	j40_free(&image);
 	return 0;
 }
+
+// LeakSanitizer is on by default when AddressSanitizer is on, but this essentially
+// breaks gdb workflow. thus we disable LeakSanitizer unless specifically requested.
+#ifdef J40_DEBUG
+	#if defined(__has_feature)
+		#if __has_feature(address_sanitizer)
+			#define HAS_ASAN
+		#endif
+	#endif
+	#if defined HAS_ASAN || defined __SANITIZE_ADDRESS__
+		const char *__asan_default_options() { return "detect_leaks=0"; }
+	#endif
+#endif
+
