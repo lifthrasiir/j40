@@ -4579,7 +4579,7 @@ J40_STATIC J40__RETURNS_ERR j40__read_dq_matrix(
 		J40__TRY(j40__init_modular(st, 3, w, h, &m));
 		J40__TRY(j40__modular_header(st, global_tree, global_codespec, &m));
 		J40__TRY(j40__allocate_modular(st, &m));
-		for (c = 0; c < 3; ++c) J40__TRY(j40__modular_channel(st, &m, c, raw_sidx));
+		for (c = 0; c < m.num_channels; ++c) J40__TRY(j40__modular_channel(st, &m, c, raw_sidx));
 		J40__TRY(j40__finish_and_free_code(st, &m.code));
 		J40__TRY(j40__inverse_transform(st, &m));
 
@@ -6617,7 +6617,7 @@ J40_STATIC J40__RETURNS_ERR j40__lf_group(j40__st *st, j40__lf_group_st *gg) {
 			J40__TRY(j40__init_modular(st, 3, w, h, &m));
 			J40__TRY(j40__modular_header(st, f->global_tree, &f->global_codespec, &m));
 			J40__TRY(j40__allocate_modular(st, &m));
-			for (c = 0; c < 3; ++c) J40__TRY(j40__modular_channel(st, &m, c, sidx0));
+			for (c = 0; c < m.num_channels; ++c) J40__TRY(j40__modular_channel(st, &m, c, sidx0));
 			J40__TRY(j40__finish_and_free_code(st, &m.code));
 			J40__TRY(j40__inverse_transform(st, &m));
 			// TODO spec issue: this modular image is independent of bpp/float_sample/etc.
@@ -6637,7 +6637,7 @@ J40_STATIC J40__RETURNS_ERR j40__lf_group(j40__st *st, j40__lf_group_st *gg) {
 		J40__TRY(j40__init_modular(st, 4, w, h, &m));
 		J40__TRY(j40__modular_header(st, f->global_tree, &f->global_codespec, &m));
 		J40__TRY(j40__allocate_modular(st, &m));
-		for (i = 0; i < 4; ++i) J40__TRY(j40__modular_channel(st, &m, i, sidx2));
+		for (i = 0; i < m.num_channels; ++i) J40__TRY(j40__modular_channel(st, &m, i, sidx2));
 		J40__TRY(j40__finish_and_free_code(st, &m.code));
 		J40__TRY(j40__inverse_transform(st, &m));
 		J40__TRY(j40__hf_metadata(st, nb_varblocks, &m, lfquant, gg));
