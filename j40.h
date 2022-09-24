@@ -964,6 +964,7 @@ enum {
 	J40__PLANE_U32 = (uint8_t) 0x22,
 	J40__PLANE_I32 = (uint8_t) 0x42,
 	J40__PLANE_F32 = (uint8_t) 0x62,
+	J40__PLANE_EMPTY = (uint8_t) 0xe0, // should have width=0 and height=0
 };
 
 #define J40__PIXELS_ALIGN 32
@@ -1003,9 +1004,11 @@ enum j40__plane_flags {
 J40_STATIC J40__RETURNS_ERR j40__init_plane(
 	j40__st *st, uint8_t type, int32_t width, int32_t height, enum j40__plane_flags flags, j40__plane *out
 );
+J40_STATIC void j40__init_empty_plane(j40__plane *out);
 J40_STATIC int j40__plane_all_equal_sized(const j40__plane *begin, const j40__plane *end);
 // returns that type if all planes have the same type, otherwise returns 0
 J40_STATIC uint8_t j40__plane_all_equal_typed(const j40__plane *begin, const j40__plane *end);
+J40_STATIC uint8_t j40__plane_all_equal_typed_or_empty(const j40__plane *begin, const j40__plane *end);
 J40_STATIC void j40__free_plane(j40__plane *plane);
 
 #ifdef J40_IMPLEMENTATION
@@ -1043,6 +1046,17 @@ J40__ON_ERROR:
 	return st->err;
 }
 
+// an empty plane can arise from inverse modular transform, but it can be a bug as well,
+// hence a separate function and separate type.
+J40_STATIC void j40__init_empty_plane(j40__plane *out) {
+	out->type = J40__PLANE_EMPTY;
+	out->stride_bytes = 0;
+	out->width = out->height = 0;
+	out->vshift = out->hshift = 0;
+	out->misalign = 0;
+	out->pixels = (uintptr_t) (void*) 0;
+}
+
 J40_STATIC int j40__plane_all_equal_sized(const j40__plane *begin, const j40__plane *end) {
 	j40__plane c;
 	int shift_should_match;
@@ -1064,7 +1078,19 @@ J40_STATIC uint8_t j40__plane_all_equal_typed(const j40__plane *begin, const j40
 	if (begin >= end) return 0;
 	type = begin->type;
 	while (++begin < end) {
-		if (type != begin->type) return 0;
+		if (begin->type != type) return 0;
+	}
+	return type;
+}
+
+J40_STATIC uint8_t j40__plane_all_equal_typed_or_empty(const j40__plane *begin, const j40__plane *end) {
+	uint8_t type;
+	if (begin >= end) return 0;
+	type = begin->type;
+	while (++begin < end) {
+		// allow empty plane to pass this test; if all planes are empty, will return J40__PLANE_EMPTY
+		if (type == J40__PLANE_EMPTY) type = begin->type;
+		if (begin->type != J40__PLANE_EMPTY && begin->type != type) return 0;
 	}
 	return type;
 }
@@ -1072,7 +1098,9 @@ J40_STATIC uint8_t j40__plane_all_equal_typed(const j40__plane *begin, const j40
 J40_STATIC void j40__free_plane(j40__plane *plane) {
 	// we don't touch pixels if plane is zero-initialized via memset, because while `plane->type` is
 	// definitely zero in this case `(void*) plane->pixels` might NOT be a null pointer!
-	if (plane->type) j40__free_aligned((void*) plane->pixels, J40__PIXELS_ALIGN, plane->misalign);
+	if (plane->type && plane->type != J40__PLANE_EMPTY) {
+		j40__free_aligned((void*) plane->pixels, J40__PIXELS_ALIGN, plane->misalign);
+	}
 	plane->width = plane->height = plane->stride_bytes = 0;
 	plane->type = 0;
 	plane->vshift = plane->hshift = 0;
@@ -3753,7 +3781,11 @@ J40_STATIC J40__RETURNS_ERR j40__allocate_modular(j40__st *st, j40__modular *m) 
 	int32_t i;
 	for (i = 0; i < m->num_channels; ++i) {
 		j40__plane *c = &m->channel[i];
-		J40__TRY(j40__init_plane(st, pixel_type, c->width, c->height, J40__PLANE_FORCE_PAD, c));
+		if (c->width > 0 && c->height > 0) {
+			J40__TRY(j40__init_plane(st, pixel_type, c->width, c->height, J40__PLANE_FORCE_PAD, c));
+		} else { // possible when, for example, palette with only synthetic colors (nb_colours == 0)
+			j40__init_empty_plane(c);
+		}
 	}
 J40__ON_ERROR:
 	return st->err;
@@ -4021,6 +4053,7 @@ J40_STATIC J40__RETURNS_ERR j40__(modular_channel,P)(
 	j40__(wp,2P) wp = {0};
 
 	J40__ASSERT(m->tree); // caller should set this to the global tree if not given
+	J40__ASSERT(c->type == J40__(PLANE_I,P));
 
 	{ // determine whether to use weighted predictor (expensive)
 		int32_t lasttree = 0, use_wp = 0;
@@ -4138,10 +4171,11 @@ J40__ON_ERROR:
 
 #ifdef J40_IMPLEMENTATION
 J40_STATIC J40__RETURNS_ERR j40__modular_channel(j40__st *st, j40__modular *m, int32_t cidx, int64_t sidx) {
-	if (m->channel[cidx].type == J40__PLANE_I16) {
-		return j40__modular_channel16(st, m, cidx, sidx);
-	} else {
-		return j40__modular_channel32(st, m, cidx, sidx);
+	switch (m->channel[cidx].type) {
+		case J40__PLANE_I16: return j40__modular_channel16(st, m, cidx, sidx);
+		case J40__PLANE_I32: return j40__modular_channel32(st, m, cidx, sidx);
+		case J40__PLANE_EMPTY: return 0;
+		default: J40__UNREACHABLE(); return 0;
 	}
 }
 #endif
@@ -4210,6 +4244,14 @@ J40_STATIC void j40__(inverse_rct,P)(j40__modular *m, const j40__transform *tr) 
 	J40__ASSERT(tr->tr == J40__TR_RCT);
 	for (i = 0; i < 3; ++i) c[i] = m->channel[tr->rct.begin_c + i];
 	J40__ASSERT(j40__plane_all_equal_sized(c, c + 3));
+
+	// it is possible that input planes are empty, in which case we do nothing (not even shuffling)
+	if (c->type == J40__PLANE_EMPTY) {
+		J40__ASSERT(j40__plane_all_equal_typed(c, c + 3) == J40__PLANE_EMPTY);
+		return;
+	} else {
+		J40__ASSERT(j40__plane_all_equal_typed(c, c + 3) == J40__(PLANE_I,P));
+	}
 
 	// TODO detect overflow
 	switch (tr->rct.type % 7) {
@@ -4284,7 +4326,7 @@ J40_STATIC J40__RETURNS_ERR j40__(inverse_palette,P)(
 	// the palette meta channel 0 will be removed at the very end.
 	int32_t first = tr->pal.begin_c + 1, last = tr->pal.begin_c + tr->pal.num_c, bpp = st->image->bpp;
 	int32_t i, j, y, x;
-	j40__plane *idxc = &m->channel[last];
+	j40__plane *idxc;
 	int32_t width = m->channel[first].width, height = m->channel[first].height;
 	int use_pred = tr->pal.nb_deltas > 0, use_wp = use_pred && tr->pal.d_pred == 6;
 	j40__(wp,2P) wp = {0};
@@ -4294,16 +4336,23 @@ J40_STATIC J40__RETURNS_ERR j40__(inverse_palette,P)(
 	// since we never shrink m->channel, we know there is enough capacity for intermediate transform
 	memmove(m->channel + last, m->channel + first, sizeof(j40__plane) * (size_t) (m->num_channels - first));
 	m->num_channels += last - first;
+	idxc = &m->channel[last];
 
 	for (i = first; i < last; ++i) m->channel[i].type = 0;
-	for (i = first; i < last; ++i) {
-		J40__TRY(j40__init_plane(st, J40__(PLANE_I,P), width, height, 0, &m->channel[i]));
+	if (idxc->type == J40__PLANE_EMPTY) {
+		// index channel is empty; all resulting output channels would be empty
+		for (i = first; i < last; ++i) j40__init_empty_plane(&m->channel[i]);
+	} else {
+		for (i = first; i < last; ++i) {
+			J40__TRY(j40__init_plane(st, J40__(PLANE_I,P), width, height, 0, &m->channel[i]));
+		}
 	}
 
 	if (use_wp) J40__TRY(j40__(init_wp,2P)(st, m->wp, width, &wp));
 
 	for (i = 0; i < tr->pal.num_c; ++i) {
-		intP_t *palp = J40__PIXELS(&m->channel[0], i);
+		// palette channel can be also empty
+		intP_t *palp = tr->pal.nb_colours > 0 ? J40__PIXELS(&m->channel[0], i) : NULL;
 		j40__plane *c = &m->channel[first + i];
 		for (y = 0; y < height; ++y) {
 			// SPEC pseudocode accidentally overwrites the index channel
@@ -4375,7 +4424,7 @@ J40_STATIC J40__RETURNS_ERR j40__inverse_transform(j40__st *st, j40__modular *m)
 
 	if (m->num_channels == 0) return 0;
 
-	switch (j40__plane_all_equal_typed(m->channel, m->channel + m->num_channels)) {
+	switch (j40__plane_all_equal_typed_or_empty(m->channel, m->channel + m->num_channels)) {
 	case J40__PLANE_I16:
 		for (i = m->nb_transforms - 1; i >= 0; --i) {
 			const j40__transform *tr = &m->transform[i];
@@ -4400,7 +4449,8 @@ J40_STATIC J40__RETURNS_ERR j40__inverse_transform(j40__st *st, j40__modular *m)
 		}
 		break;
 
-	default: J40__UNREACHABLE();
+	default: // while *some* channels can be empty, it is impossible that all channels are empty
+		J40__UNREACHABLE();
 	}
 
 J40__ON_ERROR:
