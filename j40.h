@@ -2728,7 +2728,7 @@ J40_STATIC int32_t j40__code(j40__st *st, int32_t ctx, int32_t dist_mult, j40__c
 	token = j40__entropy_code_cluster(st, use_prefix_code, log_alpha_size, cluster, &code->ans_state);
 	if (token >= spec->min_symbol) { // this is large enough if lz77_enabled is false
 		j40__code_cluster *lz_cluster = &spec->clusters[spec->cluster_map[spec->num_dist - 1]];
-		code->num_to_copy = j40__hybrid_int(st, token - spec->min_symbol, spec->lz_len_config) + spec->min_length;
+		int32_t num_to_copy = j40__hybrid_int(st, token - spec->min_symbol, spec->lz_len_config) + spec->min_length;
 		token = j40__entropy_code_cluster(st, use_prefix_code, log_alpha_size, lz_cluster, &code->ans_state);
 		distance = j40__hybrid_int(st, token, lz_cluster->config);
 		if (st->err) return 0;
@@ -2764,7 +2764,8 @@ J40_STATIC int32_t j40__code(j40__st *st, int32_t ctx, int32_t dist_mult, j40__c
 			code->window = j40__calloc(1u << 20, sizeof(int32_t));
 			if (!code->window) return J40__ERR("!mem"), 0;
 		}
-		--code->num_to_copy;
+		J40__ASSERT(num_to_copy > 0);
+		code->num_to_copy = num_to_copy - 1;
 		return code->window[code->num_decoded++ & MASK] = code->window[code->copy_pos++ & MASK];
 	}
 
