@@ -4934,9 +4934,9 @@ typedef struct j40__frame_st {
 	int8_t log_ds[J40__MAX_PASSES + 1]; // pass i shift range is [log_ds[i+1], log_ds[i])
 	int32_t lf_level;
 	int32_t x0, y0, width, height;
+	int32_t grows, gcolumns, ggrows, ggcolumns;
 	// there can be at most (2^23 + 146)^2 groups and (2^20 + 29)^2 LF groups in a single frame
-	int64_t num_groups, num_groups_per_row;
-	int64_t num_lf_groups, num_lf_groups_per_row;
+	int64_t num_groups, num_lf_groups;
 	int64_t duration, timecode;
 	j40__blend_info blend_info, *ec_blend_info;
 	int32_t save_as_ref;
@@ -5234,10 +5234,12 @@ J40_STATIC J40__RETURNS_ERR j40__frame_header(j40__st *st) {
 	J40__RAISE_DELAYED();
 
 	if (im->xyb_encoded && im->want_icc) f->save_before_ct = 1; // ignores the decoded bit
-	f->num_groups_per_row = j40__ceil_div32(f->width, 1 << f->group_size_shift);
-	f->num_groups = f->num_groups_per_row * j40__ceil_div32(f->height, 1 << f->group_size_shift);
-	f->num_lf_groups_per_row = j40__ceil_div32(f->width, 8 << f->group_size_shift);
-	f->num_lf_groups = f->num_lf_groups_per_row * j40__ceil_div32(f->height, 8 << f->group_size_shift);
+	f->grows = j40__ceil_div32(f->height, 1 << f->group_size_shift);
+	f->gcolumns = j40__ceil_div32(f->width, 1 << f->group_size_shift);
+	f->num_groups = (int64_t) f->grows * f->gcolumns;
+	f->ggrows = j40__ceil_div32(f->height, 8 << f->group_size_shift);
+	f->ggcolumns = j40__ceil_div32(f->width, 8 << f->group_size_shift);
+	f->num_lf_groups = (int64_t) f->ggrows * f->ggcolumns;
 	return 0;
 
 J40__ON_ERROR:
@@ -5424,28 +5426,25 @@ J40_STATIC J40__RETURNS_ERR j40__read_toc(j40__st *st, j40__toc *toc) {
 
 	// any group section depending on the later LF group section is temporarily moved to relocs
 	{
-		int32_t ggrows = j40__ceil_div32(f->height, 8 << f->group_size_shift);
-		int32_t grows = j40__ceil_div32(f->height, 1 << f->group_size_shift);
-		int32_t ggcolumns = j40__ceil_div32(f->width, 8 << f->group_size_shift);
-		int32_t gcolumns = j40__ceil_div32(f->width, 1 << f->group_size_shift);
 		int32_t ggrow, ggcolumn;
 
 		J40__SHOULD(relocs = j40__calloc((size_t) f->num_lf_groups, sizeof(struct reloc)), "!mem");
 		nrelocs = relocs_cap = f->num_lf_groups;
 
-		for (ggrow = 0; ggrow < ggcolumns; ++ggrow) for (ggcolumn = 0; ggcolumn < ggrows; ++ggcolumn) {
-			int64_t ggidx = (int64_t) ggrow * ggcolumns + ggcolumn, ggsection = 1 + ggidx;
+		for (ggrow = 0; ggrow < f->ggrows; ++ggrow) for (ggcolumn = 0; ggcolumn < f->ggcolumns; ++ggcolumn) {
+			int64_t ggidx = (int64_t) ggrow * f->ggcolumns + ggcolumn, ggsection = 1 + ggidx;
 			int64_t ggcodeoff = sections[ggsection].codeoff;
-			int64_t gsection_base = 1 + f->num_lf_groups + 1 + (int64_t) (ggrow * 8) * gcolumns + (ggcolumn * 8);
-			int32_t grows_in_gg = j40__min32((ggrow + 1) * 8, grows) - ggrow * 8;
-			int32_t gcolumns_in_gg = j40__min32((ggcolumn + 1) * 8, gcolumns) - ggcolumn * 8;
+			int64_t gsection_base =
+				1 + f->num_lf_groups + 1 + (int64_t) (ggrow * 8) * f->gcolumns + (ggcolumn * 8);
+			int32_t grows_in_gg = j40__min32((ggrow + 1) * 8, f->grows) - ggrow * 8;
+			int32_t gcolumns_in_gg = j40__min32((ggcolumn + 1) * 8, f->gcolumns) - ggcolumn * 8;
 			int32_t grow_in_gg, gcolumn_in_gg;
 
 			for (pass = 0; pass < f->num_passes; ++pass) {
 				for (grow_in_gg = 0; grow_in_gg < grows_in_gg; ++grow_in_gg) {
 					for (gcolumn_in_gg = 0; gcolumn_in_gg < gcolumns_in_gg; ++gcolumn_in_gg) {
 						int64_t gsection = gsection_base + pass * f->num_groups + 
-							(grow_in_gg * gcolumns + gcolumn_in_gg);
+							(grow_in_gg * f->gcolumns + gcolumn_in_gg);
 						if (sections[gsection].codeoff > ggcodeoff) continue;
 						if (relocs[ggidx].next) {
 							J40__TRY_REALLOC64(&relocs, nrelocs + 1, &relocs_cap);
@@ -7596,9 +7595,9 @@ J40_ALWAYS_INLINE struct j40__group_info j40__group_info(j40__frame_st *f, int64
 	int32_t shift = f->group_size_shift;
 	int64_t row, column;
 	J40__ASSERT(0 <= gidx && gidx < f->num_groups);
-	row = gidx / f->num_groups_per_row;
-	column = gidx % f->num_groups_per_row;
-	info.ggidx = (row / 8) * f->num_lf_groups_per_row + (column / 8);
+	row = gidx / f->gcolumns;
+	column = gidx % f->gcolumns;
+	info.ggidx = (row / 8) * f->ggcolumns + (column / 8);
 	info.gx_in_gg = (int32_t) (column % 8) << shift;
 	info.gy_in_gg = (int32_t) (row % 8) << shift;
 	info.gw = (int32_t) (j40__min64(f->width, (column + 1) << shift) - (column << shift));
