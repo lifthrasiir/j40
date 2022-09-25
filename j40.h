@@ -2466,7 +2466,7 @@ typedef struct {
 #define J40__MAX_DIST_MULT (1 << 21)
 
 J40_STATIC J40__RETURNS_ERR j40__cluster_map(
-	j40__st *st, int32_t num_dist, int32_t max_allowed, int32_t *num_clusters, uint8_t *map
+	j40__st *st, int32_t num_dist, int32_t max_allowed, int32_t *num_clusters, uint8_t **outmap
 );
 J40_STATIC J40__RETURNS_ERR j40__ans_table(j40__st *st, int32_t log_alpha_size, int16_t **outtable);
 J40_STATIC J40__RETURNS_ERR j40__read_code_spec(j40__st *st, int32_t num_dist, j40__code_spec *spec);
@@ -2482,11 +2482,12 @@ J40_STATIC void j40__free_code_spec(j40__code_spec *spec);
 #ifdef J40_IMPLEMENTATION
 
 J40_STATIC J40__RETURNS_ERR j40__cluster_map(
-	j40__st *st, int32_t num_dist, int32_t max_allowed, int32_t *num_clusters, uint8_t *map
+	j40__st *st, int32_t num_dist, int32_t max_allowed, int32_t *num_clusters, uint8_t **outmap
 ) {
 	j40__code_spec codespec = {0}; // cluster map might be recursively coded
 	j40__code_st code = { .spec = &codespec };
 	uint32_t seen[8] = {0};
+	uint8_t *map = NULL;
 	int32_t i, j;
 
 	J40__ASSERT(num_dist > 0);
@@ -2495,9 +2496,12 @@ J40_STATIC J40__RETURNS_ERR j40__cluster_map(
 
 	if (num_dist == 1) { // SPEC impossible in Brotli but possible (and unspecified) in JPEG XL
 		*num_clusters = 1;
-		map[0] = 0;
+		J40__SHOULD(*outmap = j40__calloc(sizeof(uint8_t), 1), "!mem");
 		return 0;
 	}
+
+	*outmap = NULL;
+	J40__SHOULD(map = j40__malloc(sizeof(uint8_t) * (size_t) num_dist), "!mem");
 
 	if (j40__u(st, 1)) { // is_simple (# clusters < 8)
 		int32_t nbits = j40__u(st, 2);
@@ -2541,9 +2545,11 @@ J40_STATIC J40__RETURNS_ERR j40__cluster_map(
 	J40__SHOULD(i == 256, "clst"); // no more set position beyond num_clusters
 	J40__ASSERT(*num_clusters > 0);
 
+	*outmap = map;
 	return 0;
 
 J40__ON_ERROR:
+	j40__free(map);
 	j40__free_code(&code);
 	j40__free_code_spec(&codespec);
 	return st->err;
@@ -2683,8 +2689,7 @@ J40_STATIC J40__RETURNS_ERR j40__read_code_spec(j40__st *st, int32_t num_dist, j
 	}
 
 	// cluster_map: a mapping from context IDs to actual distributions
-	J40__SHOULD(spec->cluster_map = j40__malloc(sizeof(uint8_t) * (size_t) num_dist), "!mem");
-	J40__TRY(j40__cluster_map(st, num_dist, 256, &spec->num_clusters, spec->cluster_map));
+	J40__TRY(j40__cluster_map(st, num_dist, 256, &spec->num_clusters, &spec->cluster_map));
 
 	J40__SHOULD(spec->clusters = j40__calloc((size_t) spec->num_clusters, sizeof(j40__code_cluster)), "!mem");
 
@@ -6226,8 +6231,7 @@ J40_STATIC J40__RETURNS_ERR j40__lf_global(j40__st *st) {
 			f->block_ctx_size *= f->nb_qf_thr + 1; // SPEC is off by one
 			// block_ctx_size <= 39*15^4 and never overflows
 			J40__SHOULD(f->block_ctx_size <= 39 * 64, "hfbc"); // SPEC limit is not 21*64
-			J40__SHOULD(f->block_ctx_map = j40__malloc(sizeof(uint8_t) * (size_t) f->block_ctx_size), "!mem");
-			J40__TRY(j40__cluster_map(st, f->block_ctx_size, 16, &f->nb_block_ctx, f->block_ctx_map));
+			J40__TRY(j40__cluster_map(st, f->block_ctx_size, 16, &f->nb_block_ctx, &f->block_ctx_map));
 		}
 
 		if (!j40__u(st, 1)) { // LfChannelCorrelation.all_default
