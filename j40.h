@@ -2508,8 +2508,11 @@ J40_STATIC J40__RETURNS_ERR j40__cluster_map(
 	} else {
 		int use_mtf = j40__u(st, 1);
 
-		// num_dist=1 prevents further recursion
-		J40__TRY(j40__read_code_spec(st, 1, &codespec));
+		// TODO while num_dist is limited to 1, there is still a possibility of unbounded recursion
+		// when each code spec introduces its own LZ77 distribution; libjxl doesn't allow LZ77
+		// when cluster map is reading only two entries, which is technically incorrect but
+		// easier to adopt in the current structure of J40 as well.
+		J40__TRY(j40__read_code_spec(st, num_dist <= 2 ? -1 : 1, &codespec));
 		for (i = 0; i < num_dist; ++i) {
 			int32_t index = j40__code(st, 0, 0, &code); // SPEC context (always 0) is missing
 			J40__SHOULD(index < max_allowed, "clst");
@@ -2655,8 +2658,14 @@ J40__ON_ERROR:
 	return st->err;
 }
 
+// num_dist can be negative (and its absolute value is used) when a further use of LZ77 is disallowed
 J40_STATIC J40__RETURNS_ERR j40__read_code_spec(j40__st *st, int32_t num_dist, j40__code_spec *spec) {
 	int32_t i;
+	int allow_lz77;
+
+	J40__ASSERT(num_dist != 0);
+	allow_lz77 = (num_dist > 0);
+	num_dist = j40__abs32(num_dist);
 
 	spec->cluster_map = NULL;
 	spec->clusters = NULL;
@@ -2664,6 +2673,7 @@ J40_STATIC J40__RETURNS_ERR j40__read_code_spec(j40__st *st, int32_t num_dist, j
 	// LZ77Params
 	spec->lz77_enabled = j40__u(st, 1);
 	if (spec->lz77_enabled) {
+		J40__SHOULD(allow_lz77, "lz77");
 		spec->min_symbol = j40__u32(st, 224, 0, 512, 0, 4096, 0, 8, 15);
 		spec->min_length = j40__u32(st, 3, 0, 4, 0, 5, 2, 9, 8);
 		J40__TRY(j40__read_hybrid_int_config(st, 8, &spec->lz_len_config));
