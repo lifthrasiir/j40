@@ -8,57 +8,57 @@
 //
 // The following is a simple but complete converter from JPEG XL to Portable Arbitrary Map format:
 //
-// --------------------------------------------------------------------------------
-// #define J40_IMPLEMENTATION // only a SINGLE file should have this
-// #include "j40.h" // you also need to define a macro for experimental versions; follow the error.
-// #include <stdio.h>
-// #include <stdarg.h> // for va_*
-// 
-// static int oops(const char *fmt, ...) {
-//     va_list args;
-//     va_start(args, fmt);
-//     vfprintf(stderr, fmt, args);
-//     va_end(args);
-//     return 1;
-// }
-// 
-// int main(int argc, char **argv) {
-//     if (argc < 3) return oops("Usage: %s input.jxl output.pam\n", argv[0]);
-// 
-//     FILE *out = fopen(argv[2], "wb");
-//     if (!out) return oops("Error: Cannot open an output file.\n");
-// 
-//     j40_image image;
-//     j40_from_file(&image, argv[1]); // or: j40_from_memory(&image, buf, bufsize, freefunc);
-//     j40_output_format(&image, J40_RGBA, J40_U8X4);
-//
-//     // JPEG XL supports animation, so `j40_next_frame` calls can be called multiple times
-//     if (j40_next_frame(&image)) {
-//         j40_frame frame = j40_current_frame(&image);
-//         j40_pixels_u8x4 pixels = j40_frame_pixels_u8x4(&frame, J40_RGBA);
-//         fprintf(out,
-//             "P7\n"
-//             "WIDTH %d\n"
-//             "HEIGHT %d\n"
-//             "DEPTH 4\n"
-//             "MAXVAL 255\n"
-//             "TUPLTYPE RGB_ALPHA\n"
-//             "ENDHDR\n",
-//             pixels.width, pixels.height);
-//         for (int y = 0; y < height; ++y) {
-//             fwrite(j40_row_u8x4(pixels, y), 4, pixels.width, out);
-//         }
-//     }
-// 
-//     // J40 stops once the first error is encountered; its error can be checked at the very end
-//     if (j40_error(&image)) return oops("Error: %s\n", j40_error_string(&image));
-//     if (ferror(out)) return oops("Error: Cannot fully write to the output file.\n");
-// 
-//     j40_free(&image); // also frees all memory associated to j40_frame etc.
-//     fclose(out);
-//     return 0;
-// }
-// --------------------------------------------------------------------------------
+/* -------------------------------------------------------------------------------- //
+#define J40_IMPLEMENTATION // only a SINGLE file should have this
+#include "j40.h" // you also need to define a macro for experimental versions; follow the error.
+#include <stdio.h>
+#include <stdarg.h> // for va_*
+
+static int oops(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+    return 1;
+}
+
+int main(int argc, char **argv) {
+    if (argc < 3) return oops("Usage: %s input.jxl output.pam\n", argv[0]);
+
+    FILE *out = fopen(argv[2], "wb");
+    if (!out) return oops("Error: Cannot open an output file.\n");
+
+    j40_image image;
+    j40_from_file(&image, argv[1]); // or: j40_from_memory(&image, buf, bufsize, freefunc);
+    j40_output_format(&image, J40_RGBA, J40_U8X4);
+
+    // JPEG XL supports animation, so `j40_next_frame` calls can be called multiple times
+    if (j40_next_frame(&image)) {
+        j40_frame frame = j40_current_frame(&image);
+        j40_pixels_u8x4 pixels = j40_frame_pixels_u8x4(&frame, J40_RGBA);
+        fprintf(out,
+            "P7\n"
+            "WIDTH %d\n"
+            "HEIGHT %d\n"
+            "DEPTH 4\n"
+            "MAXVAL 255\n"
+            "TUPLTYPE RGB_ALPHA\n"
+            "ENDHDR\n",
+            pixels.width, pixels.height);
+        for (int y = 0; y < height; ++y) {
+            fwrite(j40_row_u8x4(pixels, y), 4, pixels.width, out);
+        }
+    }
+
+    // J40 stops once the first error is encountered; its error can be checked at the very end
+    if (j40_error(&image)) return oops("Error: %s\n", j40_error_string(&image));
+    if (ferror(out)) return oops("Error: Cannot fully write to the output file.\n");
+
+    j40_free(&image); // also frees all memory associated to j40_frame etc.
+    fclose(out);
+    return 0;
+}
+// -------------------------------------------------------------------------------- */
 
 ////////////////////////////////////////////////////////////////////////////////
 // preamble (only reachable via the user `#include`)
