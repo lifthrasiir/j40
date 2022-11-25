@@ -1353,28 +1353,29 @@ J40_STATIC void j40__free_source(j40__source_st *source) {
 
 typedef struct { int64_t codeoff, fileoff; } j40__map;
 
+enum j40__container_flags {
+	// if set, initial jxl & ftyp boxes have been read
+	J40__CONTAINER_CONFIRMED = 1 << 0,
+
+	// currently seen box types, as they have a cardinality and positional requirement
+	J40__SEEN_JXLL = 1 << 1, // at most once, before jxlc/jxlp
+	J40__SEEN_JXLI = 1 << 2, // at most once
+	J40__SEEN_JXLC = 1 << 3, // precludes jxlp, at most once
+	J40__SEEN_JXLP = 1 << 4, // precludes jxlc
+
+	// if set, no more jxlc/jxlp boxes are allowed (and map no longer changes)
+	J40__NO_MORE_CODESTREAM_BOX = 1 << 5,
+
+	// if set, there is an implied entry for `map[nmap]`. this is required when the last
+	// codestream box has an unknown length and thus it extends to the (unknown) end of file.
+	J40__IMPLIED_LAST_MAP_ENTRY = 1 << 6,
+
+	// if set, there is no more box past `map[nmap-1]` (or an implied `map[nmap]` if any)
+	J40__NO_MORE_BOX = 1 << 7,
+};
+
 typedef struct j40__container_st {
-	enum {
-		// if set, initial jxl & ftyp boxes have been read
-		J40__CONTAINER_CONFIRMED = 1 << 0,
-
-		// currently seen box types, as they have a cardinality and positional requirement
-		J40__SEEN_JXLL = 1 << 1, // at most once, before jxlc/jxlp
-		J40__SEEN_JXLI = 1 << 2, // at most once
-		J40__SEEN_JXLC = 1 << 3, // precludes jxlp, at most once
-		J40__SEEN_JXLP = 1 << 4, // precludes jxlc
-
-		// if set, no more jxlc/jxlp boxes are allowed (and map no longer changes)
-		J40__NO_MORE_CODESTREAM_BOX = 1 << 5,
-
-		// if set, there is an implied entry for `map[nmap]`. this is required when the last
-		// codestream box has an unknown length and thus it extends to the (unknown) end of file.
-		J40__IMPLIED_LAST_MAP_ENTRY = 1 << 6,
-
-		// if set, there is no more box past `map[nmap-1]` (or an implied `map[nmap]` if any)
-		J40__NO_MORE_BOX = 1 << 7,
-	} flags;
-
+	enum j40__container_flags flags;
 	// map[0..nmap) encodes two arrays C[i] = map[i].codeoff and F[i] = map[i].fileoff,
 	// so that codestream offsets [C[k], C[k+1]) map to file offsets [F[k], F[k] + (C[k+1] - C[k])).
 	// all codestream offsets less than the largest C[i] are 1-to-1 mapped to file offsets.
@@ -2873,12 +2874,14 @@ enum {
 	J40__CHROMA_GREEN = 2, J40__CHROMA_BLUE = 3,
 };
 
+enum j40__ec_type {
+	J40__EC_ALPHA = 0, J40__EC_DEPTH = 1, J40__EC_SPOT_COLOUR = 2,
+	J40__EC_SELECTION_MASK = 3, J40__EC_BLACK = 4, J40__EC_CFA = 5,
+	J40__EC_THERMAL = 6, J40__EC_NON_OPTIONAL = 15, J40__EC_OPTIONAL = 16,
+};
+
 typedef struct {
-	enum j40__ec_type {
-		J40__EC_ALPHA = 0, J40__EC_DEPTH = 1, J40__EC_SPOT_COLOUR = 2,
-		J40__EC_SELECTION_MASK = 3, J40__EC_BLACK = 4, J40__EC_CFA = 5,
-		J40__EC_THERMAL = 6, J40__EC_NON_OPTIONAL = 15, J40__EC_OPTIONAL = 16,
-	} type;
+	enum j40__ec_type type;
 	int32_t bpp, exp_bits, dim_shift, name_len;
 	char *name;
 	union {
@@ -2888,12 +2891,28 @@ typedef struct {
 	} data;
 } j40__ec_info;
 
+enum j40__orientation {
+	J40__ORIENT_TL = 1, J40__ORIENT_TR = 2, J40__ORIENT_BR = 3, J40__ORIENT_BL = 4,
+	J40__ORIENT_LT = 5, J40__ORIENT_RT = 6, J40__ORIENT_RB = 7, J40__ORIENT_LB = 8,
+};
+
+enum j40__cspace {
+	J40__CS_CHROMA = 'c', J40__CS_GREY = 'g', J40__CS_XYB = 'x',
+};
+
+enum { // for `j40__image_st.gamma_or_tf`
+	J40__TF_709 = -1, J40__TF_UNKNOWN = -2, J40__TF_LINEAR = -8, J40__TF_SRGB = -13,
+	J40__TF_PQ = -16, J40__TF_DCI = -17, J40__TF_HLG = -18,
+	J40__GAMMA_MAX = 10000000,
+};
+
+enum j40__render_intent {
+	J40__INTENT_PERC = 0, J40__INTENT_REL = 1, J40__INTENT_SAT = 2, J40__INTENT_ABS = 3
+};
+
 typedef struct j40__image_st {
 	int32_t width, height;
-	enum j40__orientation {
-		J40__ORIENT_TL = 1, J40__ORIENT_TR = 2, J40__ORIENT_BR = 3, J40__ORIENT_BL = 4,
-		J40__ORIENT_LT = 5, J40__ORIENT_RT = 6, J40__ORIENT_RB = 7, J40__ORIENT_LB = 8,
-	} orientation;
+	enum j40__orientation orientation;
 	int32_t intr_width, intr_height; // 0 if not specified
 	int bpp, exp_bits;
 
@@ -2903,16 +2922,10 @@ typedef struct j40__image_st {
 
 	char *icc;
 	size_t iccsize;
-	enum { J40__CS_CHROMA = 'c', J40__CS_GREY = 'g', J40__CS_XYB = 'x' } cspace;
+	enum j40__cspace cspace;
 	float cpoints[4 /*J40__CHROMA_xxx*/][2 /*x=0, y=1*/]; // only for J40__CS_CHROMA
-	enum {
-		J40__TF_709 = -1, J40__TF_UNKNOWN = -2, J40__TF_LINEAR = -8, J40__TF_SRGB = -13,
-		J40__TF_PQ = -16, J40__TF_DCI = -17, J40__TF_HLG = -18,
-		J40__GAMMA_MAX = 10000000,
-	} gamma_or_tf; // gamma if > 0, transfer function if <= 0
-	enum j40__render_intent {
-		J40__INTENT_PERC = 0, J40__INTENT_REL = 1, J40__INTENT_SAT = 2, J40__INTENT_ABS = 3
-	} render_intent;
+	int32_t gamma_or_tf; // gamma if > 0, transfer function if <= 0
+	enum j40__render_intent render_intent;
 	float intensity_target, min_nits; // 0 < min_nits <= intensity_target
 	float linear_below; // absolute (nits) if >= 0; a negated ratio of max display brightness if [-1,0]
 
@@ -3147,11 +3160,11 @@ J40_STATIC J40__RETURNS_ERR j40__image_metadata(j40__st *st) {
 		}
 		im->xyb_encoded = j40__u(st, 1);
 		if (!j40__u(st, 1)) { // ColourEncoding.all_default
-			enum j40__cspace { CS_RGB = 0, CS_GREY = 1, CS_XYB = 2, CS_UNKNOWN = 3 } cspace;
+			enum cspace { CS_RGB = 0, CS_GREY = 1, CS_XYB = 2, CS_UNKNOWN = 3 } cspace;
 			enum { WP_D65 = 1, WP_CUSTOM = 2, WP_E = 10, WP_DCI = 11 };
 			enum { PR_SRGB = 1, PR_CUSTOM = 2, PR_2100 = 9, PR_P3 = 11 };
 			im->want_icc = j40__u(st, 1);
-			cspace = (enum j40__cspace) j40__enum(st);
+			cspace = (enum cspace) j40__enum(st);
 			switch (cspace) {
 			case CS_RGB: case CS_UNKNOWN: im->cspace = J40__CS_CHROMA; break;
 			case CS_GREY: im->cspace = J40__CS_GREY; break;
@@ -3459,10 +3472,12 @@ J40__ON_ERROR:
 ////////////////////////////////////////////////////////////////////////////////
 // modular header
 
+enum j40__transform_id {
+	J40__TR_RCT = 0, J40__TR_PALETTE = 1, J40__TR_SQUEEZE = 2
+};
+
 typedef union {
-	enum j40__transform_id {
-		J40__TR_RCT = 0, J40__TR_PALETTE = 1, J40__TR_SQUEEZE = 2
-	} tr;
+	enum j40__transform_id tr;
 	struct {
 		enum j40__transform_id tr; // = J40__TR_RCT
 		int32_t begin_c, type;
@@ -3792,7 +3807,7 @@ J40__ON_ERROR:
 }
 
 J40_STATIC J40__RETURNS_ERR j40__allocate_modular(j40__st *st, j40__modular *m) {
-	uint8_t pixel_type = st->image->modular_16bit_buffers ? J40__PLANE_I16 : J40__PLANE_I32;
+	uint8_t pixel_type = (uint8_t) (st->image->modular_16bit_buffers ? J40__PLANE_I16 : J40__PLANE_I32);
 	int32_t i;
 	for (i = 0; i < m->num_channels; ++i) {
 		j40__plane *c = &m->channel[i];
@@ -4482,19 +4497,21 @@ enum {
 	J40__NUM_ORDERS = 13, // the number of distinct varblock dimensions & orders, after transposition
 };
 
+enum j40__dq_matrix_mode { // the number of params per channel follows:
+	J40__DQ_ENC_LIBRARY = 0, // 0
+	J40__DQ_ENC_HORNUSS = 1, // 3 (params)
+	J40__DQ_ENC_DCT2 = 2, // 6 (params)
+	J40__DQ_ENC_DCT4 = 3, // 2 (params) + n (dct_params)
+	// TODO DCT4x8 uses an undefined name "parameters" (should be "params")
+	J40__DQ_ENC_DCT4X8 = 4, // 1 (params) + n (dct_params)
+	J40__DQ_ENC_AFV = 5, // 9 (params) + n (dct_params) + m (dct4x4_params)
+	J40__DQ_ENC_DCT = 6, // n (params)
+	// all other modes eventually decode to:
+	J40__DQ_ENC_RAW = 7, // n rows * m columns, with the top-left 1/8 by 1/8 unused
+};
+
 typedef struct {
-	enum j40__dq_matrix_mode { // the number of params per channel follows:
-		J40__DQ_ENC_LIBRARY = 0, // 0
-		J40__DQ_ENC_HORNUSS = 1, // 3 (params)
-		J40__DQ_ENC_DCT2 = 2, // 6 (params)
-		J40__DQ_ENC_DCT4 = 3, // 2 (params) + n (dct_params)
-		// TODO spec issue: DCT4x8 uses an undefined name "parameters" (should be "params")
-		J40__DQ_ENC_DCT4X8 = 4, // 1 (params) + n (dct_params)
-		J40__DQ_ENC_AFV = 5, // 9 (params) + n (dct_params) + m (dct4x4_params)
-		J40__DQ_ENC_DCT = 6, // n (params)
-		// all other modes eventually decode to:
-		J40__DQ_ENC_RAW = 7, // n rows * m columns, with the top-left 1/8 by 1/8 unused
-	} mode;
+	enum j40__dq_matrix_mode mode;
 	int16_t n, m;
 	float (*params)[4]; // the last element per each row is unused
 } j40__dq_matrix;
@@ -4983,11 +5000,13 @@ typedef struct {
 	int8_t mode, alpha_chan, clamp, src_ref_frame;
 } j40__blend_info;
 
+enum j40__frame_type {
+	J40__FRAME_REGULAR = 0, J40__FRAME_LF = 1, J40__FRAME_REFONLY = 2, J40__FRAME_REGULAR_SKIPPROG = 3
+};
+
 typedef struct j40__frame_st {
 	int is_last;
-	enum j40__frame_type {
-		J40__FRAME_REGULAR = 0, J40__FRAME_LF = 1, J40__FRAME_REFONLY = 2, J40__FRAME_REGULAR_SKIPPROG = 3
-	} type;
+	enum j40__frame_type type;
 	int is_modular; // VarDCT if false
 	int has_noise, has_patches, has_splines, use_lf_frame, skip_adapt_lf_smooth;
 	int do_ycbcr;
