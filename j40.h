@@ -8108,6 +8108,7 @@ J40_STATIC void j40__save_state(j40__st *st, j40__inner *inner, j40__origin orig
 J40__STATIC_RETURNS_ERR j40__advance(j40__inner *inner, j40__origin origin/*, int32_t until*/) {
 	j40__st stbuf, *st = &stbuf;
 	j40__frame_st *f;
+	j40_err err;
 
 	j40__init_state(st, inner);
 
@@ -8121,7 +8122,7 @@ J40__STATIC_RETURNS_ERR j40__advance(j40__inner *inner, j40__origin origin/*, in
 	// for the same reason, this block can't contain any variable declaration or assignment.
 	#define J40__YIELD_AFTER(expr) \
 		do { \
-			j40_err err = (expr); \
+			err = (expr); \
 			j40__save_state(st, inner, origin); \
 			if (err) return err; \
 			inner->state = __LINE__; /* thus each line can have at most one J40__YIELD() call */ \
