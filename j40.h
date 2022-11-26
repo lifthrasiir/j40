@@ -246,7 +246,7 @@ J40_API j40_frame j40_current_frame(j40_image *image);
 typedef uint8_t /*j40_u8x3[3],*/ j40_u8x4[4];
 //typedef uint16_t j40_u16x3[3], j40_u16x4[4];
 //typedef uint32_t j40_u32x3[3], j40_u32x4[4];
-//typedef float j40_f32x3[3], j40_f32x4[4];
+typedef float /*j40_f32x3[3],*/ j40_f32x4[4]; // TODO temporary, API will be available later
 
 //J40__DEFINE_PIXELS(uint8_t, u8);      // j40_pixels_u8, j40_frame_pixels_u8, j40_row_u8
 //J40__DEFINE_PIXELS(uint16_t, u16);    // j40_pixels_u16, j40_frame_pixels_u16, j40_row_u16
@@ -4515,19 +4515,19 @@ enum j40__dq_matrix_mode { // the number of params per channel follows:
 typedef struct {
 	enum j40__dq_matrix_mode mode;
 	int16_t n, m;
-	float (*params)[4]; // the last element per each row is unused
+	j40_f32x4 *params; // the last element per each row is unused
 } j40__dq_matrix;
 
 J40__STATIC_RETURNS_ERR j40__read_dq_matrix(
 	j40__st *st, int32_t rows, int32_t columns, int64_t raw_sidx,
 	j40__tree_node *global_tree, const j40__code_spec *global_codespec, j40__dq_matrix *dqmat
 );
-J40_INLINE float j40__interpolate(float pos, int32_t c, const float (*bands)[4], int32_t len);
+J40_INLINE float j40__interpolate(float pos, int32_t c, const j40_f32x4 *bands, int32_t len);
 J40__STATIC_RETURNS_ERR j40__interpolation_bands(
-	j40__st *st, const float (*params)[4], int32_t nparams, float (*out)[4]
+	j40__st *st, const j40_f32x4 *params, int32_t nparams, j40_f32x4 *out
 );
 J40_STATIC void j40__dct_quant_weights(
-	int32_t rows, int32_t columns, const float (*bands)[4], int32_t len, float (*out)[4]
+	int32_t rows, int32_t columns, const j40_f32x4 *bands, int32_t len, j40_f32x4 *out
 );
 J40__STATIC_RETURNS_ERR j40__load_dq_matrix(j40__st *st, int32_t idx, j40__dq_matrix *dqmat);
 J40_STATIC void j40__free_dq_matrix(j40__dq_matrix *dqmat);
@@ -4668,7 +4668,7 @@ J40__STATIC_RETURNS_ERR j40__read_dq_matrix(
 		J40__TRY(j40__finish_and_free_code(st, &m.code));
 		J40__TRY(j40__inverse_transform(st, &m));
 
-		J40__SHOULD(dqmat->params = j40__malloc(sizeof(float[4]) * (size_t) (rows * columns)), "!mem");
+		J40__SHOULD(dqmat->params = j40__malloc(sizeof(j40_f32x4) * (size_t) (rows * columns)), "!mem");
 		for (c = 0; c < 3; ++c) {
 			if (m.channel[c].type == J40__PLANE_I16) {
 				for (y = 0; y < rows; ++y) {
@@ -4701,7 +4701,7 @@ J40__STATIC_RETURNS_ERR j40__read_dq_matrix(
 		int32_t paramsize = how.nparams + how.ndctparams * 16, paramidx = how.nparams;
 		if (how.requires8x8) J40__SHOULD(rows == 8 && columns == 8, "dqm?");
 		if (paramsize) {
-			J40__SHOULD(dqmat->params = j40__malloc(sizeof(float[4]) * (size_t) paramsize), "!mem");
+			J40__SHOULD(dqmat->params = j40__malloc(sizeof(j40_f32x4) * (size_t) paramsize), "!mem");
 			for (c = 0; c < 3; ++c) for (j = 0; j < how.nparams; ++j) {
 				dqmat->params[j][c] = j40__f16(st) * (j < how.nscaled ? 64.0f : 1.0f);
 			}
@@ -4725,7 +4725,7 @@ J40__ON_ERROR:
 }
 
 // piecewise exponential interpolation where pos is in [0,1], mapping pos = k/(len-1) to bands[k]
-J40_INLINE float j40__interpolate(float pos, int32_t c, const float (*bands)[4], int32_t len) {
+J40_INLINE float j40__interpolate(float pos, int32_t c, const j40_f32x4 *bands, int32_t len) {
 	float scaled_pos, frac_idx, a, b;
 	int32_t scaled_idx;
 	if (len == 1) return bands[0][c];
@@ -4738,7 +4738,7 @@ J40_INLINE float j40__interpolate(float pos, int32_t c, const float (*bands)[4],
 }
 
 J40__STATIC_RETURNS_ERR j40__interpolation_bands(
-	j40__st *st, const float (*params)[4], int32_t nparams, float (*out)[4]
+	j40__st *st, const j40_f32x4 *params, int32_t nparams, j40_f32x4 *out
 ) {
 	int32_t i, c;
 	for (c = 0; c < 3; ++c) {
@@ -4757,7 +4757,7 @@ J40__ON_ERROR:
 }
 
 J40_STATIC void j40__dct_quant_weights(
-	int32_t rows, int32_t columns, const float (*bands)[4], int32_t len, float (*out)[4]
+	int32_t rows, int32_t columns, const j40_f32x4 *bands, int32_t len, j40_f32x4 *out
 ) {
 	float inv_rows_m1 = 1.0f / (float) (rows - 1), inv_columns_m1 = 1.0f / (float) (columns - 1);
 	int32_t x, y, c;
@@ -4778,8 +4778,8 @@ J40__STATIC_RETURNS_ERR j40__load_dq_matrix(j40__st *st, int32_t idx, j40__dq_ma
 	const struct j40__dct_params dct = J40__DCT_PARAMS[idx];
 	enum j40__dq_matrix_mode mode;
 	int32_t rows, columns, n, m;
-	const float (*params)[4];
-	float (*raw)[4] = NULL, bands[MAX_BANDS][4], scratch[64][4];
+	const j40_f32x4 *params;
+	j40_f32x4 *raw = NULL, bands[MAX_BANDS], scratch[64];
 	int32_t x, y, i, c;
 
 	mode = dqmat->mode;
@@ -4798,7 +4798,7 @@ J40__STATIC_RETURNS_ERR j40__load_dq_matrix(j40__st *st, int32_t idx, j40__dq_ma
 
 	rows = 1 << dct.log_rows;
 	columns = 1 << dct.log_columns;
-	J40__SHOULD(raw = j40__malloc(sizeof(float[4]) * (size_t) (rows * columns)), "!mem");
+	J40__SHOULD(raw = j40__malloc(sizeof(j40_f32x4) * (size_t) (rows * columns)), "!mem");
 
 	switch (mode) {
 	case J40__DQ_ENC_DCT:
