@@ -1144,12 +1144,15 @@ typedef struct j40__limits {
 	int64_t pixels; // <= 2^61
 	int32_t width; // <= 2^31
 	int32_t height; // <= 2^30
+
 	uint64_t icc_output_size; // < 2^63
 	int32_t bpp; // <= 64
 	int ec_black_allowed;
+
 	int32_t num_extra_channels; // <= 4096
 	int needs_modular_16bit_buffers;
 	int32_t nb_transforms; // <= 273
+
 	int32_t nb_channels_tr; // # of modular channels after transform
 	int32_t tree_depth; // distance between root and leaf nodes
 	int64_t zf_pixels; // total # of pixels in a run of zero-duration frames, unlimited if zero
@@ -1158,18 +1161,20 @@ typedef struct j40__limits {
 #ifdef J40_IMPLEMENTATION
 
 J40_STATIC const j40__limits J40__MAIN_LV5_LIMITS = {
-	.pixels = 1 << 28, .width = 1 << 18, .height = 1 << 18, .icc_output_size = 1u << 22,
-	.bpp = 16, .ec_black_allowed = 0, .num_extra_channels = 4, .needs_modular_16bit_buffers = 1,
-	.nb_transforms = 8, .nb_channels_tr = 256, .tree_depth = 64, .zf_pixels = 1 << 28,
+	/*.pixels =*/ 1 << 28, /*.width =*/ 1 << 18, /*.height =*/ 1 << 18,
+	/*.icc_output_size =*/ 1u << 22, /*.bpp =*/ 16, /*.ec_black_allowed =*/ 0,
+	/*.num_extra_channels =*/ 4, /*.needs_modular_16bit_buffers =*/ 1, /*.nb_transforms =*/ 8,
+	/*.nb_channels_tr =*/ 256, /*.tree_depth =*/ 64, /*.zf_pixels =*/ 1 << 28,
 };
 
-/*
+#if 0
 J40_STATIC j40__limits J40__MAIN_LV10_LIMITS = {
-	.pixels = (int64_t) 1 << 40, .width = 1 << 30, .height = 1 << 30, .icc_output_size = 1u << 28,
-	.bpp = 32, .ec_black_allowed = 1, .num_extra_channels = 256, .needs_modular_16bit_buffers = 0,
-	.nb_transforms = 512, .nb_channels_tr = 1 << 16, .tree_depth = 2048, .zf_pixels = 0,
+	/*.pixels =*/ (int64_t) 1 << 40, /*.width =*/ 1 << 30, /*.height =*/ 1 << 30,
+	/*.icc_output_size =*/ 1u << 28, /*.bpp =*/ 32, /*.ec_black_allowed =*/ 1,
+	/*.num_extra_channels =*/ 256, /*.needs_modular_16bit_buffers =*/ 0, /*.nb_transforms =*/ 512,
+	/*.nb_channels_tr =*/ 1 << 16, /*.tree_depth =*/ 2048, /*.zf_pixels =*/ 0,
 };
-*/
+#endif
 
 #endif // defined J40_IMPLEMENTATION
 

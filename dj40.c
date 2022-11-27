@@ -8,6 +8,7 @@
 	#pragma GCC diagnostic push
 	#pragma GCC diagnostic ignored "-Wsign-conversion"
 	#pragma GCC diagnostic ignored "-Wconversion"
+	#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
 #elif defined _MSC_VER
 	#pragma warning(disable: 4996) // this also applies to main below, unlike as in GCC
 #endif
