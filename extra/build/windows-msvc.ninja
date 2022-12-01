@@ -3,7 +3,7 @@ rule cc
   description = cl $in /Fe:$out
 
 cflags-opt = /O2
-cflags-noopt = /O0
+cflags-noopt = /Od
 cflags-dbg = /DJ40_DEBUG
 conlyflags = /TC
 cxxonlyflags = /TP
