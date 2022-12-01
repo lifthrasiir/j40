@@ -350,6 +350,13 @@ J40_API void j40_free(j40_image *image);
 	#endif
 #endif // !defined J40_RESTRICT
 
+// most structs in J40 are designed to be zero-initialized, and this avoids useless warnings
+#if defined __cplusplus /*|| __STDC_VERSION__ >= 2023xxL*/
+	#define J40__INIT {}
+#else
+	#define J40__INIT {0}
+#endif
+
 #ifndef J40_NODISCARD
 	#if __cplusplus >= 201703L /*|| __STDC_VERSION__ >= 2023xxL */
 		#define J40_NODISCARD [[nodiscard]] // since C++17 and C23
@@ -2506,7 +2513,7 @@ J40_STATIC void j40__free_code_spec(j40__code_spec *spec);
 J40__STATIC_RETURNS_ERR j40__cluster_map(
 	j40__st *st, int32_t num_dist, int32_t max_allowed, int32_t *num_clusters, uint8_t **outmap
 ) {
-	j40__code_spec codespec = {0}; // cluster map might be recursively coded
+	j40__code_spec codespec = J40__INIT; // cluster map might be recursively coded
 	j40__code_st code = { .spec = &codespec };
 	uint32_t seen[8] = {0};
 	uint8_t *map = NULL;
@@ -3321,7 +3328,7 @@ J40_STATIC uint64_t j40__icc_varint(j40__st *st, uint64_t *index, uint64_t size,
 
 J40__STATIC_RETURNS_ERR j40__icc(j40__st *st) {
 	uint64_t enc_size, output_size, index;
-	j40__code_spec codespec = {0};
+	j40__code_spec codespec = J40__INIT;
 	j40__code_st code = { .spec = &codespec };
 	int32_t byte = 0, prev = 0, pprev = 0, ctx;
 
@@ -4102,7 +4109,7 @@ J40__STATIC_RETURNS_ERR j40__(modular_channel,P)(
 	int32_t width = c->width, height = c->height;
 	int32_t y, x, i;
 	int32_t nrefcmap, *refcmap = NULL; // refcmap[i] is a channel index for properties (16..19)+4*i
-	j40__(wp,2P) wp = {0};
+	j40__(wp,2P) wp = J40__INIT;
 
 	J40__ASSERT(m->tree); // caller should set this to the global tree if not given
 	J40__ASSERT(c->type == J40__(PLANE_I,P));
@@ -4381,7 +4388,7 @@ J40__STATIC_RETURNS_ERR j40__(inverse_palette,P)(
 	j40__plane *idxc;
 	int32_t width = m->channel[first].width, height = m->channel[first].height;
 	int use_pred = tr->pal.nb_deltas > 0, use_wp = use_pred && tr->pal.d_pred == 6;
-	j40__(wp,2P) wp = {0};
+	j40__(wp,2P) wp = J40__INIT;
 
 	J40__ASSERT(tr->tr == J40__TR_PALETTE);
 
@@ -4665,7 +4672,7 @@ J40__STATIC_RETURNS_ERR j40__read_dq_matrix(
 	j40__st *st, int32_t rows, int32_t columns, int64_t raw_sidx,
 	j40__tree_node *global_tree, const j40__code_spec *global_codespec, j40__dq_matrix *dqmat
 ) {
-	j40__modular m = {0};
+	j40__modular m = J40__INIT;
 	int32_t c, i, j;
 
 	dqmat->mode = (enum j40__dq_matrix_mode) j40__u(st, 3);
@@ -5462,7 +5469,7 @@ J40__STATIC_RETURNS_ERR j40__read_toc(j40__st *st, j40__toc *toc) {
 	int64_t nrelocs, relocs_cap;
 
 	int32_t *lehmer = NULL;
-	j40__code_spec codespec = {0};
+	j40__code_spec codespec = J40__INIT;
 	j40__code_st code = { .spec = &codespec };
 	int64_t i, nremoved;
 	int32_t pass;
@@ -6515,7 +6522,7 @@ J40__STATIC_RETURNS_ERR j40__lf_quant(
 
 	j40__frame_st *f = st->frame;
 	int32_t ggw8 = gg->width8, ggh8 = gg->height8;
-	j40__plane *channel[3], lfquant[3] = {{0}}, lfindices = {0};
+	j40__plane *channel[3], lfquant[3] = {J40__INIT}, lfindices = J40__INIT;
 	int32_t c;
 
 	J40__ASSERT(j40__plane_all_equal_sized(m->channel, m->channel + 3));
@@ -6554,7 +6561,7 @@ J40__STATIC_RETURNS_ERR j40__hf_metadata(
 	j40__modular *m, const j40__plane lfquant[3], j40__lf_group_st *gg
 ) {
 	j40__frame_st *f = st->frame;
-	j40__plane blocks = {0};
+	j40__plane blocks = J40__INIT;
 	j40__varblock *varblocks = NULL;
 	float *coeffs[3 /*xyb*/] = {NULL}, *llfcoeffs[3 /*xyb*/] = {NULL};
 	size_t coeffs_misalign[3] = {0};
@@ -6690,8 +6697,8 @@ J40__STATIC_RETURNS_ERR j40__lf_group(j40__st *st, j40__lf_group_st *gg) {
 	j40__frame_st *f = st->frame;
 	int64_t ggidx = gg->idx;
 	int64_t sidx0 = 1 + ggidx, sidx1 = 1 + f->num_lf_groups + ggidx, sidx2 = 1 + 2 * f->num_lf_groups + ggidx;
-	j40__plane lfquant[3] = {{0}};
-	j40__modular m = {0};
+	j40__plane lfquant[3] = {J40__INIT};
+	j40__modular m = J40__INIT;
 	int32_t i;
 
 	// TODO factor into j40__init_modular_for_lf_group
@@ -6786,7 +6793,7 @@ J40__STATIC_RETURNS_ERR j40__hf_global(j40__st *st);
 J40__STATIC_RETURNS_ERR j40__hf_global(j40__st *st) {
 	j40__frame_st *f = st->frame;
 	int64_t sidx_base = 1 + 3 * f->num_lf_groups;
-	j40__code_spec codespec = {0};
+	j40__code_spec codespec = J40__INIT;
 	j40__code_st code = { .spec = &codespec };
 	int32_t i, j, c;
 
@@ -6973,7 +6980,7 @@ J40__STATIC_RETURNS_ERR j40__pass_group(
 	j40__frame_st *f = st->frame;
 	// SPEC "the number of tables" is fixed, no matter how many RAW quant tables are there
 	int64_t sidx = 1 + 3 * f->num_lf_groups + J40__NUM_DCT_PARAMS + pass * f->num_groups + gidx;
-	j40__modular m = {0};
+	j40__modular m = J40__INIT;
 	int32_t i;
 
 	if (!f->is_modular) {
@@ -7456,7 +7463,7 @@ J40__STATIC_RETURNS_ERR j40__epf_step(
 		float *outline[3];
 		float *recip_sigma_row =
 			recip_sigmas ? J40__F32_PIXELS(recip_sigmas, y / 8) : recip_sigmas_for_modular;
-		float *distance_rows[NKERNELS][3][3] = {0}; // [kernel_idx][dy+1][c]
+		float *distance_rows[NKERNELS][3][3] = {{{0}}}; // [kernel_idx][dy+1][c]
 
 		for (c = 0; c < 3; ++c) {
 			float *temp = lines[0][c];
@@ -7545,8 +7552,8 @@ J40__STATIC_RETURNS_ERR j40__epf(j40__st *st, j40__plane channels[3], const j40_
 	};
 
 	j40__frame_st *f = st->frame;
-	j40__plane recip_sigmas_ = {0}, *recip_sigmas;
-	j40__plane distances[12][3] = {0};
+	j40__plane recip_sigmas_ = J40__INIT, *recip_sigmas;
+	j40__plane distances[12][3] = J40__INIT;
 	int32_t k, c, maxnkernels = 0;
 
 	if (f->epf.iters <= 0) return 0;
@@ -7714,7 +7721,7 @@ J40_ALWAYS_INLINE struct j40__group_info j40__group_info(j40__frame_st *f, int64
 J40__STATIC_RETURNS_ERR j40__init_section_state(
 	j40__st **stptr, j40__section_st *sst, int64_t codeoff, int32_t size
 ) {
-	static const j40__buffer_st BUFFER_INIT = {0};
+	static const j40__buffer_st BUFFER_INIT = J40__INIT;
 	j40__st *st = *stptr;
 	int64_t fileoff, codeoff_limit;
 
@@ -7772,7 +7779,7 @@ J40__ON_ERROR:
 }
 
 J40__STATIC_RETURNS_ERR j40__lf_global_in_section(j40__st *st, const j40__toc *toc) {
-	j40__section_st sst = {0};
+	j40__section_st sst = J40__INIT;
 	if (!toc->single_size) {
 		J40__TRY(j40__init_section_state(&st, &sst, toc->lf_global_codeoff, toc->lf_global_size));
 	}
@@ -7782,7 +7789,7 @@ J40__ON_ERROR:
 }
 
 J40__STATIC_RETURNS_ERR j40__hf_global_in_section(j40__st *st, const j40__toc *toc) {
-	j40__section_st sst = {0};
+	j40__section_st sst = J40__INIT;
 	if (st->frame->is_modular) {
 		J40__SHOULD(toc->hf_global_size == 0, "excs");
 	} else {
@@ -7797,7 +7804,7 @@ J40__ON_ERROR:
 
 J40__STATIC_RETURNS_ERR j40__lf_or_pass_group_in_section(j40__st *st, j40__toc *toc, j40__lf_group_st *ggs) {
 	j40__section section = toc->sections[toc->nsections_read];
-	j40__section_st sst = {0};
+	j40__section_st sst = J40__INIT;
 
 	if (section.pass < 0) { // LF group
 		j40__lf_group_st *gg = &ggs[section.idx];
@@ -7872,7 +7879,7 @@ J40__STATIC_RETURNS_ERR j40__render_to_u8x4_rgba(j40__st *st, j40__plane *out);
 J40__STATIC_RETURNS_ERR j40__render_to_u8x4_rgba(j40__st *st, j40__plane *out) {
 	j40__image_st *im = st->image;
 	j40__frame_st *f = st->frame;
-	j40__plane *c[4], rgba = {0};
+	j40__plane *c[4], rgba = J40__INIT;
 	int32_t maxpixel, maxpixel2;
 	int32_t i, x, y;
 
