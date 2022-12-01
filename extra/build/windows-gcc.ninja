@@ -5,6 +5,8 @@ rule cc
 cflags-opt = -O3
 cflags-noopt = -O0
 cflags-dbg = -g -DJ40_DEBUG
+conlyflags = -Wc++-compat
+cxxonlyflags = -xc++
 
 self = extra\build\windows-gcc.ninja
 include extra\build\windows_common.ninja

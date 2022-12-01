@@ -7,11 +7,15 @@ build clean: clean
 #------------------------------------------------------------
 
 build dj40.exe: cc dj40.c | j40.h extra\stb_image_write.h
-  cflags = $cflags-opt
+  cflags = $conlyflags $cflags-opt
+  msvc-obj = dj40.obj
+
+build dj40-cxx.exe: cc dj40.c | j40.h extra\stb_image_write.h
+  cflags = $cxxonlyflags $cflags-opt
   msvc-obj = dj40.obj
 
 build dj40-o0g.exe: cc dj40.c | j40.h extra\stb_image_write.h
-  cflags = $cflags-noopt $cflags-dbg
+  cflags = $conlyflags $cflags-noopt $cflags-dbg
   msvc-obj = dj40.obj
 
 default dj40.exe

@@ -5,6 +5,8 @@ rule cc
 cflags-opt = /O2
 cflags-noopt = /O0
 cflags-dbg = /DJ40_DEBUG
+conlyflags = /TC
+cxxonlyflags = /TP
 
 self = extra\build\windows-msvc.ninja
 include extra\build\windows_common.ninja
