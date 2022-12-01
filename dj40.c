@@ -3,6 +3,7 @@
 #define J40_CONFIRM_THAT_THIS_IS_EXPERIMENTAL_AND_POTENTIALLY_UNSAFE
 #define J40_IMPLEMENTATION
 #include "j40.h"
+#include "j40.h"
 
 #ifdef __GNUC__ // stb_image_write issues too many warnings
 	#pragma GCC diagnostic push

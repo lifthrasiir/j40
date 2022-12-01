@@ -92,6 +92,7 @@ int main(int argc, char **argv) {
 #include <stdlib.h>
 
 #ifdef J40_IMPLEMENTATION
+	#define J40__IMPLEMENTATION_INCLUDED
 	#include <string.h>
 	#include <math.h>
 	#include <limits.h>
@@ -122,6 +123,12 @@ extern "C" {
 #endif
 
 #endif // !defined J40__RECURSING
+
+#if J40__RECURSING == 9999 // enabled only when the header file is included the second time or more
+	#if !defined J40__IMPLEMENTATION_INCLUDED && defined J40_IMPLEMENTATION
+		#error "J40 is included with J40_IMPLEMENTATION defined, but it was already included without it so it would have been ignored!"
+	#endif
+#endif
 
 ////////////////////////////////////////////////////////////////////////////////
 // public platform macros
