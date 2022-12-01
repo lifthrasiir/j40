@@ -2499,6 +2499,7 @@ J40__STATIC_RETURNS_ERR j40__cluster_map(
 );
 J40__STATIC_RETURNS_ERR j40__ans_table(j40__st *st, int32_t log_alpha_size, int16_t **outtable);
 J40__STATIC_RETURNS_ERR j40__read_code_spec(j40__st *st, int32_t num_dist, j40__code_spec *spec);
+J40_STATIC void j40__init_code(j40__code_st *code, const j40__code_spec *spec);
 J40_STATIC int32_t j40__entropy_code_cluster(
 	j40__st *st, int use_prefix_code, int32_t log_alpha_size,
 	j40__code_cluster *cluster, uint32_t *ans_state
@@ -2514,7 +2515,7 @@ J40__STATIC_RETURNS_ERR j40__cluster_map(
 	j40__st *st, int32_t num_dist, int32_t max_allowed, int32_t *num_clusters, uint8_t **outmap
 ) {
 	j40__code_spec codespec = J40__INIT; // cluster map might be recursively coded
-	j40__code_st code = { .spec = &codespec };
+	j40__code_st code = J40__INIT;
 	uint32_t seen[8] = {0};
 	uint8_t *map = NULL;
 	int32_t i, j;
@@ -2546,6 +2547,7 @@ J40__STATIC_RETURNS_ERR j40__cluster_map(
 		// when cluster map is reading only two entries, which is technically incorrect but
 		// easier to adopt in the current structure of J40 as well.
 		J40__TRY(j40__read_code_spec(st, num_dist <= 2 ? -1 : 1, &codespec));
+		j40__init_code(&code, &codespec);
 		for (i = 0; i < num_dist; ++i) {
 			int32_t index = j40__code(st, 0, 0, &code); // SPEC context (always 0) is missing
 			J40__SHOULD(index < max_allowed, "clst");
@@ -2765,6 +2767,14 @@ J40__STATIC_RETURNS_ERR j40__read_code_spec(j40__st *st, int32_t num_dist, j40__
 J40__ON_ERROR:
 	j40__free_code_spec(spec);
 	return st->err;
+}
+
+J40_STATIC void j40__init_code(j40__code_st *code, const j40__code_spec *spec) {
+	code->spec = spec;
+	code->num_to_copy = code->copy_pos = code->num_decoded = 0;
+	code->window_cap = 0;
+	code->window = 0;
+	code->ans_state = 0;
 }
 
 J40_STATIC int32_t j40__entropy_code_cluster(
@@ -3329,11 +3339,12 @@ J40_STATIC uint64_t j40__icc_varint(j40__st *st, uint64_t *index, uint64_t size,
 J40__STATIC_RETURNS_ERR j40__icc(j40__st *st) {
 	uint64_t enc_size, output_size, index;
 	j40__code_spec codespec = J40__INIT;
-	j40__code_st code = { .spec = &codespec };
+	j40__code_st code = J40__INIT;
 	int32_t byte = 0, prev = 0, pprev = 0, ctx;
 
 	enc_size = j40__u64(st);
 	J40__TRY(j40__read_code_spec(st, 41, &codespec));
+	j40__init_code(&code, &codespec);
 
 	index = 0;
 	output_size = j40__icc_varint(st, &index, enc_size, &code);
@@ -3438,7 +3449,7 @@ J40__STATIC_RETURNS_ERR j40__tree(
 J40__STATIC_RETURNS_ERR j40__tree(
 	j40__st *st, int32_t max_tree_size, j40__tree_node **tree, j40__code_spec *codespec
 ) {
-	j40__code_st code = { .spec = codespec };
+	j40__code_st code = J40__INIT;
 	j40__tree_node *t = NULL;
 	int32_t tree_idx = 0, tree_cap = 8;
 	int32_t ctx_id = 0, nodes_left = 1;
@@ -3447,6 +3458,7 @@ J40__STATIC_RETURNS_ERR j40__tree(
 	J40__ASSERT(max_tree_size <= (1 << 26)); // codestream limit; the actual limit should be smaller
 
 	J40__TRY(j40__read_code_spec(st, 6, codespec));
+	j40__init_code(&code, codespec);
 	J40__TRY_MALLOC(j40__tree_node, &t, (size_t) tree_cap);
 	while (nodes_left-- > 0) { // depth-first, left-to-right ordering
 		j40__tree_node *n;
@@ -3808,6 +3820,7 @@ J40__STATIC_RETURNS_ERR j40__modular_header(
 		max_tree_size = j40__min32(1 << 20, max_tree_size);
 		J40__TRY(j40__tree(st, max_tree_size, &m->tree, &m->codespec));
 	}
+	j40__init_code(&m->code, &m->codespec);
 
 	m->channel = channel;
 	m->num_channels = num_channels;
@@ -5470,7 +5483,7 @@ J40__STATIC_RETURNS_ERR j40__read_toc(j40__st *st, j40__toc *toc) {
 
 	int32_t *lehmer = NULL;
 	j40__code_spec codespec = J40__INIT;
-	j40__code_st code = { .spec = &codespec };
+	j40__code_st code = J40__INIT;
 	int64_t i, nremoved;
 	int32_t pass;
 
@@ -5479,6 +5492,7 @@ J40__STATIC_RETURNS_ERR j40__read_toc(j40__st *st, j40__toc *toc) {
 
 	if (j40__u(st, 1)) { // permuted
 		J40__TRY(j40__read_code_spec(st, 8, &codespec));
+		j40__init_code(&code, &codespec);
 		J40__TRY(j40__permutation(st, &code, (int32_t) nsections, 0, &lehmer));
 		J40__TRY(j40__finish_and_free_code(st, &code));
 		j40__free_code_spec(&codespec);
@@ -6794,7 +6808,7 @@ J40__STATIC_RETURNS_ERR j40__hf_global(j40__st *st) {
 	j40__frame_st *f = st->frame;
 	int64_t sidx_base = 1 + 3 * f->num_lf_groups;
 	j40__code_spec codespec = J40__INIT;
-	j40__code_st code = { .spec = &codespec };
+	j40__code_st code = J40__INIT;
 	int32_t i, j, c;
 
 	J40__ASSERT(!f->is_modular);
@@ -6817,7 +6831,10 @@ J40__STATIC_RETURNS_ERR j40__hf_global(j40__st *st) {
 	// HfPass
 	for (i = 0; i < f->num_passes; ++i) {
 		int32_t used_orders = j40__u32(st, 0x5f, 0, 0x13, 0, 0, 0, 0, 13);
-		if (used_orders > 0) J40__TRY(j40__read_code_spec(st, 8, &codespec));
+		if (used_orders > 0) {
+			J40__TRY(j40__read_code_spec(st, 8, &codespec));
+			j40__init_code(&code, &codespec);
+		}
 		for (j = 0; j < J40__NUM_ORDERS; ++j) {
 			if (used_orders >> j & 1) {
 				int32_t size = 1 << (J40__LOG_ORDER_SIZE[j][0] + J40__LOG_ORDER_SIZE[j][1]);
@@ -6864,11 +6881,13 @@ J40__STATIC_RETURNS_ERR j40__hf_coeffs(
 	const j40__frame_st *f = st->frame;
 	int32_t gw8 = j40__ceil_div32(gw, 8), gh8 = j40__ceil_div32(gh, 8);
 	int8_t (*nonzeros)[3] = NULL;
-	j40__code_st code = { .spec = &f->coeff_codespec[pass] };
+	j40__code_st code = J40__INIT;
 	int32_t lfidx_size = (f->nb_lf_thr[0] + 1) * (f->nb_lf_thr[1] + 1) * (f->nb_lf_thr[2] + 1);
 	int32_t x8, y8, i, j, c_yxb;
 
 	J40__ASSERT(gx_in_gg % 8 == 0 && gy_in_gg % 8 == 0);
+
+	j40__init_code(&code, &f->coeff_codespec[pass]);
 
 	// TODO spec bug: there are *three* NonZeros for each channel
 	J40__TRY_MALLOC(j40_i8x3, &nonzeros, (size_t) (gw8 * gh8));
