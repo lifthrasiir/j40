@@ -61,7 +61,7 @@ int main(int argc, char **argv) {
             "TUPLTYPE RGB_ALPHA\n"
             "ENDHDR\n",
             pixels.width, pixels.height);
-        for (int y = 0; y < height; ++y) {
+        for (int y = 0; y < pixels.height; ++y) {
             fwrite(j40_row_u8x4(pixels, y), 4, pixels.width, out);
         }
     }
