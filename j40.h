@@ -2073,7 +2073,7 @@ J40__STATIC_RETURNS_ERR j40__prefix_code_tree(
 	int32_t total, code, hskip, fast_len, i, j;
 
 	J40__ASSERT(l2size > 0 && l2size <= 0x8000);
-	if (l2size == 1) { // SPEC missing this case
+	if (l2size == 1) {
 		*out_fast_len = *out_max_len = 0;
 		J40__TRY_MALLOC(int32_t, out_table, 1);
 		(*out_table)[0] = 0;
@@ -2499,7 +2499,6 @@ typedef struct {
 	// LZ77 states
 	int32_t num_to_copy, copy_pos, num_decoded;
 	int32_t window_cap, *window;
-	// ANS state (SPEC there is a single such state throughout the whole ANS stream)
 	uint32_t ans_state; // 0 if uninitialized
 } j40__code_st;
 
@@ -2536,7 +2535,7 @@ J40__STATIC_RETURNS_ERR j40__cluster_map(
 	J40__ASSERT(max_allowed >= 1 && max_allowed <= 256);
 	if (max_allowed > num_dist) max_allowed = num_dist;
 
-	if (num_dist == 1) { // SPEC impossible in Brotli but possible (and unspecified) in JPEG XL
+	if (num_dist == 1) {
 		*num_clusters = 1;
 		J40__TRY_CALLOC(uint8_t, outmap, 1);
 		return 0;
@@ -2561,7 +2560,7 @@ J40__STATIC_RETURNS_ERR j40__cluster_map(
 		J40__TRY(j40__read_code_spec(st, num_dist <= 2 ? -1 : 1, &codespec));
 		j40__init_code(&code, &codespec);
 		for (i = 0; i < num_dist; ++i) {
-			int32_t index = j40__code(st, 0, 0, &code); // SPEC context (always 0) is missing
+			int32_t index = j40__code(st, 0, 0, &code);
 			J40__SHOULD(index < max_allowed, "clst");
 			map[i] = (uint8_t) index;
 		}
@@ -2738,7 +2737,7 @@ J40__STATIC_RETURNS_ERR j40__read_code_spec(j40__st *st, int32_t num_dist, j40__
 
 	spec->use_prefix_code = j40__u(st, 1);
 	if (spec->use_prefix_code) {
-		for (i = 0; i < spec->num_clusters; ++i) { // SPEC the count is off by one
+		for (i = 0; i < spec->num_clusters; ++i) {
 			J40__TRY(j40__read_hybrid_int_config(st, 15, &spec->clusters[i].config));
 		}
 
@@ -2752,7 +2751,6 @@ J40__STATIC_RETURNS_ERR j40__read_code_spec(j40__st *st, int32_t num_dist, j40__
 			}
 		}
 
-		// SPEC this should happen after reading *all* count[i]
 		for (i = 0; i < spec->num_clusters; ++i) {
 			j40__code_cluster *c = &spec->clusters[i];
 			int32_t fast_len, max_len;
@@ -2762,7 +2760,7 @@ J40__STATIC_RETURNS_ERR j40__read_code_spec(j40__st *st, int32_t num_dist, j40__
 		}
 	} else {
 		spec->log_alpha_size = 5 + j40__u(st, 2);
-		for (i = 0; i < spec->num_clusters; ++i) { // SPEC the count is off by one
+		for (i = 0; i < spec->num_clusters; ++i) {
 			J40__TRY(j40__read_hybrid_int_config(st, spec->log_alpha_size, &spec->clusters[i].config));
 		}
 
@@ -2845,15 +2843,11 @@ J40_STATIC int32_t j40__code(j40__st *st, int32_t ctx, int32_t dist_mult, j40__c
 			};
 			int32_t special = (int32_t) SPECIAL_DISTANCES[distance];
 			J40__ASSERT(dist_mult <= J40__MAX_DIST_MULT);
-			// TODO spec bug: distance can be as low as -6 when dist_mult = 1 and distance =
-			// dist_mult * 1 - 7; libjxl clamps it to the minimum of 1, so we do the same here
 			distance = j40__max32(1, ((special >> 4) - 7) + dist_mult * (special & 7));
 		}
 		distance = j40__min32(j40__min32(distance, code->num_decoded), 1 << 20);
 		code->copy_pos = code->num_decoded - distance;
 		if (J40_UNLIKELY(distance == 0)) {
-			// TODO spec bug: this is possible when num_decoded == 0 (or a non-positive special
-			// distance, handled above) and libjxl acts as if `window[i]` is initially filled with 0
 			J40__ASSERT(code->num_decoded == 0 && !code->window);
 			code->window = (int32_t*) j40__calloc(1u << 20, sizeof(int32_t));
 			if (!code->window) return J40__ERR("!mem"), 0;
@@ -3626,7 +3620,7 @@ J40__STATIC_RETURNS_ERR j40__init_modular_for_global(
 
 	j40__init_modular_common(m);
 	m->num_channels = im->num_extra_channels;
-	if (frame_is_modular) { // SPEC the condition is negated
+	if (frame_is_modular) {
 		m->num_channels += (!frame_do_ycbcr && !im->xyb_encoded && im->cspace == J40__CS_GREY ? 1 : 3);
 	}
 	if (m->num_channels == 0) return 0;
@@ -3783,7 +3777,7 @@ J40__STATIC_RETURNS_ERR j40__modular_header(
 			memmove(channel + begin_c + 2, channel + end_c, sizeof(*channel) * (size_t) (num_channels - end_c));
 			channel[0].width = nb_colours;
 			channel[0].height = num_c;
-			channel[0].hshift = 0; // SPEC missing
+			channel[0].hshift = -1;
 			channel[0].vshift = -1;
 			channel[begin_c + 1] = input;
 			num_channels += 2 - num_c;
@@ -4027,8 +4021,6 @@ J40_STATIC void j40__(wp_before_predict_internal,2P)(
 	err = wp->errors + (y & 1 ? wp->width : 0);
 	nerr = wp->errors + (y & 1 ? 0 : wp->width);
 
-	// SPEC edge cases are handled differently from the spec, in particular some pixels are
-	// added twice to err_sum and requires a special care (errw2 below)
 	errw = x > 0 ? err[x - 1] : ZERO;
 	errn = y > 0 ? nerr[x] : ZERO;
 	errnw = x > 0 && y > 0 ? nerr[x - 1] : errn;
@@ -4036,7 +4028,6 @@ J40_STATIC void j40__(wp_before_predict_internal,2P)(
 	errww = x > 1 ? err[x - 2] : ZERO;
 	errw2 = x + 1 < wp->width ? ZERO : errw;
 
-	// SPEC again, edge cases are handled differently
 	wp->trueerrw = x > 0 ? err[x - 1][4] : 0;
 	wp->trueerrn = y > 0 ? nerr[x][4] : 0;
 	wp->trueerrnw = x > 0 && y > 0 ? nerr[x - 1][4] : wp->trueerrn;
@@ -4046,14 +4037,13 @@ J40_STATIC void j40__(wp_before_predict_internal,2P)(
 	wp->pred[0] = (pw + pne - pn) * 8;
 	wp->pred[1] = pn * 8 - (((wp->trueerrw + wp->trueerrn + wp->trueerrne) * wp->params.p1) >> 5);
 	wp->pred[2] = pw * 8 - (((wp->trueerrw + wp->trueerrn + wp->trueerrnw) * wp->params.p2) >> 5);
-	wp->pred[3] = pn * 8 - // SPEC negated (was `+`)
+	wp->pred[3] = pn * 8 -
 		((wp->trueerrnw * wp->params.p3[0] + wp->trueerrn * wp->params.p3[1] +
 		  wp->trueerrne * wp->params.p3[2] + (pnn - pn) * 8 * wp->params.p3[3] +
 		  (pnw - pw) * 8 * wp->params.p3[4]) >> 5);
 	for (i = 0; i < 4; ++i) {
 		int2P_t errsum = errn[i] + errw[i] + errnw[i] + errww[i] + errne[i] + errw2[i];
 		int32_t shift = j40__max32(j40__(floor_lg,2P)((uint2P_t) errsum + 1) - 5, 0);
-		// SPEC missing the final `>> shift`
 		w[i] = (int2P_t) (4 + ((int64_t) wp->params.w[i] * J40__24DIVP1[errsum >> shift] >> shift));
 	}
 	logw = j40__(floor_lg,2P)((uint2P_t) (w[0] + w[1] + w[2] + w[3])) - 4;
@@ -4062,10 +4052,9 @@ J40_STATIC void j40__(wp_before_predict_internal,2P)(
 		wsum += w[i] >>= logw;
 		sum += wp->pred[i] * w[i];
 	}
-	// SPEC missing `- 1` before scaling
 	wp->pred[4] = (int2P_t) (((int64_t) sum + (wsum >> 1) - 1) * J40__24DIVP1[wsum - 1] >> 24);
 	if (((wp->trueerrn ^ wp->trueerrw) | (wp->trueerrn ^ wp->trueerrnw)) <= 0) {
-		int2P_t lo = j40__(min,2P)(pw, j40__(min,2P)(pn, pne)) * 8; // SPEC missing shifts
+		int2P_t lo = j40__(min,2P)(pw, j40__(min,2P)(pn, pne)) * 8;
 		int2P_t hi = j40__(max,2P)(pw, j40__(max,2P)(pn, pne)) * 8;
 		wp->pred[4] = j40__(min,2P)(j40__(max,2P)(lo, wp->pred[4]), hi);
 	}
@@ -4104,9 +4093,8 @@ J40_INLINE void j40__(wp_after_predict,2P)(j40__(wp,2P) *wp, int32_t x, int32_t 
 	if (wp->errors) {
 		j40__int2P *err = wp->errors[(y & 1 ? wp->width : 0) + x];
 		int32_t i;
-		// SPEC approximated differently from the spec
 		for (i = 0; i < 4; ++i) err[i] = (j40__(abs,2P)(wp->pred[i] - val * 8) + 3) >> 3;
-		err[4] = wp->pred[4] - val * 8; // SPEC this is a *signed* difference
+		err[4] = wp->pred[4] - val * 8;
 	}
 }
 
@@ -4154,7 +4142,6 @@ J40__STATIC_RETURNS_ERR j40__(modular_channel,P)(
 	}
 
 	// compute indices for additional "previous channel" properties
-	// SPEC incompatible channels are skipped and never result in unusable but numbered properties
 	J40__TRY_MALLOC(int32_t, &refcmap, (size_t) cidx);
 	nrefcmap = 0;
 	for (i = cidx - 1; i >= 0; --i) {
@@ -4319,7 +4306,6 @@ J40_STATIC void j40__(inverse_rct,P)(j40__modular *m, const j40__transform *tr) 
 	typedef j40__intP intP_t;
 	typedef j40__int2P int2P_t;
 
-	// SPEC permutation psuedocode is missing parentheses; better done with a LUT anyway
 	static const uint8_t PERMUTATIONS[6][3] = {{0,1,2},{1,2,0},{2,0,1},{0,2,1},{1,0,2},{2,1,0}};
 
 	j40__plane c[3];
@@ -4439,7 +4425,6 @@ J40__STATIC_RETURNS_ERR j40__(inverse_palette,P)(
 		intP_t *palp = tr->pal.nb_colours > 0 ? J40__PIXELS(&m->channel[0], i) : NULL;
 		j40__plane *c = &m->channel[first + i];
 		for (y = 0; y < height; ++y) {
-			// SPEC pseudocode accidentally overwrites the index channel
 			intP_t *idxline = J40__PIXELS(idxc, y);
 			intP_t *line = J40__PIXELS(c, y);
 			for (x = 0; x < width; ++x) {
@@ -4556,7 +4541,6 @@ enum j40__dq_matrix_mode { // the number of params per channel follows:
 	J40__DQ_ENC_HORNUSS = 1, // 3 (params)
 	J40__DQ_ENC_DCT2 = 2, // 6 (params)
 	J40__DQ_ENC_DCT4 = 3, // 2 (params) + n (dct_params)
-	// TODO DCT4x8 uses an undefined name "parameters" (should be "params")
 	J40__DQ_ENC_DCT4X8 = 4, // 1 (params) + n (dct_params)
 	J40__DQ_ENC_AFV = 5, // 9 (params) + n (dct_params) + m (dct4x4_params)
 	J40__DQ_ENC_DCT = 6, // n (params)
@@ -4628,7 +4612,7 @@ static const struct j40__dct_params {
 	{-0.20819395464f, -0.33699592683512467f, -0.7f}, {-0.421064f, -0.30180866526242109f, -0.4f}, \
 	{-0.32733845535848671f, -0.27321683125358037f, -0.5f} // (8)
 static const float J40__LIBRARY_DCT_PARAMS[129][4] = {
-	// DCT33 dct_params (n=6) (SPEC some values are incorrect)
+	// DCT33 dct_params (n=6)
 	{3150.0f, 560.0f, 512.0f}, {0.0f, 0.0f, -2.0f}, {-0.4f, -0.3f, -1.0f},
 	{-0.4f, -0.3f, 0.0f}, {-0.4f, -0.3f, -1.0f}, {-2.0f, -0.3f, -2.0f},
 	// Hornuss params (3)
@@ -4636,7 +4620,7 @@ static const float J40__LIBRARY_DCT_PARAMS[129][4] = {
 	// DCT11 params (6)
 	{3840.0f, 960.0f, 640.0f}, {2560.0f, 640.0f, 320.0f}, {1280.0f, 320.0f, 128.0f},
 	{640.0f, 180.0f, 64.0f}, {480.0f, 140.0f, 32.0f}, {300.0f, 120.0f, 16.0f},
-	// DCT22 params (2) + dct_params (n=4) (TODO spec bug: some values are incorrect)
+	// DCT22 params (2) + dct_params (n=4)
 	{1.0f, 1.0f, 1.0f}, {1.0f, 1.0f, 1.0f}, J40__DCT4X4_DCT_PARAMS,
 	// DCT44 dct_params (n=7)
 	{8996.8725711814115328f, 3191.48366296844234752f, 1157.50408145487200256f},
@@ -4675,7 +4659,6 @@ static const float J40__LIBRARY_DCT_PARAMS[129][4] = {
 	// DCT23 params (1) + dct_params (n=4)
 	{1.0f, 1.0f, 1.0f}, J40__DCT4X8_DCT_PARAMS,
 	// AFV params (9) + dct_params (n=4) + dct4x4_params (m=4)
-	// (SPEC params & dct_params are swapped; TODO spec bug: dct4x4_params are also incorrect)
 	{3072.0f, 1024.0f, 384.0f}, {3072.0f, 1024.0f, 384.0f}, {256.0f, 50.0f, 12.0f},
 	{256.0f, 50.0f, 12.0f}, {256.0f, 50.0f, 12.0f}, {414.0f, 58.0f, 22.0f},
 	{0.0f, 0.0f, -0.25f}, {0.0f, 0.0f, -0.25f}, {0.0f, 0.0f, -0.25f},
@@ -4707,7 +4690,6 @@ J40__STATIC_RETURNS_ERR j40__read_dq_matrix(
 		int32_t w[3], h[3], x, y;
 
 		denom = j40__f16(st);
-		// TODO spec bug: ZeroPadToByte isn't required at this point
 		J40__SHOULD(j40__surely_nonzero(denom), "dqm0");
 		inv_denom = 1.0f / denom;
 
@@ -4794,8 +4776,6 @@ J40__STATIC_RETURNS_ERR j40__interpolation_bands(
 ) {
 	int32_t i, c;
 	for (c = 0; c < 3; ++c) {
-		// TODO spec bug: loops for x & y are independent of the loop for i (bands)
-		// TODO spec bug: `bands(i)` for i >= 0 (not i > 0) should be larger (not no less) than 0
 		out[0][c] = params[0][c];
 		J40__SHOULD(out[0][c] > 0, "band");
 		for (i = 1; i < nparams; ++i) {
@@ -4817,7 +4797,6 @@ J40_STATIC void j40__dct_quant_weights(
 		for (y = 0; y < rows; ++y) for (x = 0; x < columns; ++x) {
 			static const float INV_SQRT2 = 1.0f / 1.414214562373095f; // 1/(sqrt(2) + 1e-6)
 			float d = hypotf((float) x * inv_columns_m1, (float) y * inv_rows_m1);
-			// TODO spec issue: num_bands doesn't exist (probably len)
 			out[y * columns + x][c] = j40__interpolate(d * INV_SQRT2, c, bands, len);
 		}
 	}
@@ -4906,8 +4885,6 @@ J40__STATIC_RETURNS_ERR j40__load_dq_matrix(j40__st *st, int32_t idx, j40__dq_ma
 		J40__ASSERT(rows == 8 && columns == 8);
 		J40__ASSERT(n <= MAX_BANDS);
 		J40__TRY(j40__interpolation_bands(st, params + 1, n, bands));
-		// TODO spec bug: 4 rows by 8 columns, not 8 rows by 4 columns (compare with AFV weights4x8)
-		// the position (x, y Idiv 2) is also confusing, since it's using the (x, y) notation
 		j40__dct_quant_weights(4, 8, bands, n, scratch);
 		for (c = 0; c < 3; ++c) {
 			for (y = 0; y < 8; ++y) for (x = 0; x < 8; ++x) {
@@ -4926,8 +4903,6 @@ J40__STATIC_RETURNS_ERR j40__load_dq_matrix(j40__st *st, int32_t idx, j40__dq_ma
 		j40__dct_quant_weights(4, 4, bands, m, scratch + 32);
 		J40__TRY(j40__interpolation_bands(st, params + 5, 4, bands));
 		for (c = 0; c < 3; ++c) {
-			// TODO spec bug: this value can never be 1 because it will result in an out-of-bound
-			// access in j40__interpolate; libjxl avoids this by adding 1e-6 to the denominator
 			static const float FREQS[12] = { // precomputed values of (freqs[i] - lo) / (hi - lo + 1e-6)
 				0.000000000f, 0.373436417f, 0.320380100f, 0.379332596f, 0.066671353f, 0.259756761f,
 				0.530035651f, 0.789731061f, 0.149436598f, 0.559318823f, 0.669198646f, 0.999999917f,
@@ -4939,7 +4914,6 @@ J40__STATIC_RETURNS_ERR j40__load_dq_matrix(j40__st *st, int32_t idx, j40__dq_ma
 			for (i = 0; i < 3; ++i) scratch[i + 61][c] = params[i + 2][c];
 		}
 		for (c = 0; c < 3; ++c) {
-			// TODO spec bug: `weight(...)` uses multiple conflicting notations
 			static const int8_t MAP[64] = {
 				// 1..31 from weights4x8, 33..47 from weights4x4, 48..59 interpolated,
 				// 0/32/61..63 directly from parameters, 60 fixed to 1.0
@@ -5091,7 +5065,6 @@ typedef struct j40__frame_st {
 		float sharp_lut[8], channel_scale[3];
 		float quant_mul, pass0_sigma_scale, pass2_sigma_scale, border_sad_mul, sigma_for_modular;
 	} epf;
-	// TODO spec bug: m_*_lf_unscaled are wildly incorrect, both in default values and scaling
 	float m_lf_scaled[3 /*xyb*/];
 	j40__tree_node *global_tree;
 	j40__code_spec global_codespec;
@@ -5206,7 +5179,6 @@ J40__STATIC_RETURNS_ERR j40__frame_header(j40__st *st) {
 	f->epf.pass2_sigma_scale = 6.5f;
 	f->epf.border_sad_mul = 2.0f / 3.0f;
 	f->epf.sigma_for_modular = 1.0f;
-	// TODO spec bug: default values for m_*_lf_unscaled should be reciprocals of the listed values
 	f->m_lf_scaled[0] = 1.0f / 4096.0f;
 	f->m_lf_scaled[1] = 1.0f / 512.0f;
 	f->m_lf_scaled[2] = 1.0f / 256.0f;
@@ -5283,7 +5255,7 @@ J40__STATIC_RETURNS_ERR j40__frame_header(j40__st *st) {
 		if (f->type == J40__FRAME_LF) {
 			f->lf_level = j40__u(st, 2) + 1;
 		} else if (j40__u(st, 1)) { // have_crop
-			if (f->type != J40__FRAME_REFONLY) { // SPEC missing UnpackSigned
+			if (f->type != J40__FRAME_REFONLY) {
 				f->x0 = j40__unpack_signed(j40__u32(st, 0, 8, 256, 11, 2304, 14, 18688, 30));
 				f->y0 = j40__unpack_signed(j40__u32(st, 0, 8, 256, 11, 2304, 14, 18688, 30));
 			}
@@ -5322,7 +5294,6 @@ J40__STATIC_RETURNS_ERR j40__frame_header(j40__st *st) {
 			f->is_last = 0;
 		}
 		if (f->type != J40__FRAME_LF && !f->is_last) f->save_as_ref = j40__u(st, 2);
-		// SPEC this condition is essentially swapped with the default value in the spec
 		if (f->type == J40__FRAME_REFONLY || (
 			full_frame &&
 			(f->type == J40__FRAME_REGULAR || f->type == J40__FRAME_REGULAR_SKIPPROG) &&
@@ -5433,9 +5404,8 @@ J40__STATIC_RETURNS_ERR j40__permutation(
 
 	J40__ASSERT(code->spec->num_dist == 8 + !!code->spec->lz77_enabled);
 
-	// SPEC this is the number of integers to read, not the last offset to read (can differ when skip > 0)
 	end = j40__code(st, j40__min32(7, j40__ceil_lg32((uint32_t) size + 1)), 0, code);
-	J40__SHOULD(end <= size - skip, "perm"); // SPEC missing
+	J40__SHOULD(end <= size - skip, "perm");
 	if (end == 0) {
 		*out = NULL;
 		return 0;
@@ -5445,7 +5415,7 @@ J40__STATIC_RETURNS_ERR j40__permutation(
 	prev = 0;
 	for (i = 0; i < end; ++i) {
 		prev = arr[i] = j40__code(st, j40__min32(7, j40__ceil_lg32((uint32_t) prev + 1)), 0, code);
-		J40__SHOULD(prev < size - (skip + i), "perm"); // SPEC missing
+		J40__SHOULD(prev < size - (skip + i), "perm");
 	}
 	arr[end] = -1; // sentinel
 	*out = arr;
@@ -5729,10 +5699,9 @@ J40_STATIC const float J40__HALF_SECANTS[256] = {
 	5.44016622f, 6.27490841f, 7.41356676f, 9.05875145f, 11.6446273f, 16.3000231f, 27.1639777f, 81.4878422f,
 };
 
-// TODO spec bug: ScaleF doesn't match with the current libjxl! it turns out that this is actually
-// a set of factors for the Arai, Agui, Nakajima DCT & IDCT algorithm, which was only used in
-// older versions of libjxl (both the current libjxl and J40 currently uses Perera-Liu) and
-// not even a resampling algorithm to begin with.
+// ScaleF in the spec are factors for the Arai, Agui, Nakajima DCT & IDCT algorithm, which was only
+// used in older versions of libjxl (both the current libjxl and J40 currently uses Perera-Liu)
+// and not even a resampling algorithm to begin with.
 //
 // [(1<<N) + k] = 1 / (cos(k/2^(4+N) pi) * cos(k/2^(3+N) pi) * cos(k/2^(2+N) pi) * 2^N)
 //                for N >= 1 and 0 <= k < 2^N
@@ -6003,7 +5972,6 @@ J40_STATIC void j40__inverse_dct11(float *buf) {
 	float scratch[64];
 	int32_t x, y;
 
-	// TODO spec issue: only the "top-left" SxS cells, not "top"
 	j40__aux_inverse_dct11(buf, buf, 0, 0, 1); // updates buf[(0..1)*8+(0..1)]
 	// updates scratch[(0..3)*8+(0..3)], copying other elements from buf in verbatim
 	memcpy(scratch, buf, sizeof(float) * 64);
@@ -6031,7 +5999,6 @@ J40_STATIC void j40__inverse_dct22(float *buf) {
 	// m1 m2 n1 n2 o1 o2 p1 p2      d1 d3 h1 h3 l1 l3 p1 p3      c3 g3 k3 o3 c4 g4 k4 o4
 	// m3 m4 n3 n4 o3 o4 p3 p4      d2 d4 h2 h4 l2 l4 p2 p4      d3 k3 l3 p3 d4 k4 l4 p4
 	//
-	// TODO spec issue: notationally `sample` is a *4-dimensional* array, which is not very clear
 	j40__inverse_dct(scratch, buf, 2, 16); // columnar IDCT for a#-m#, b#-n#, c#-o# and d#-p#
 	for (y = 0; y < 8; ++y) for (x = 0; x < 8; ++x) buf[x * 8 + y] = scratch[y * 8 + x];
 	j40__inverse_dct(scratch, buf, 2, 16); // columnar IDCT for a#-d#, e#-h#, i#-l# and m#-p#
@@ -6195,7 +6162,7 @@ J40_STATIC void j40__inverse_afv(float *buf, int flipx, int flipy) {
 	// all three corresponding DC coefficients are in the top-left block and handled specially.
 	// AFV22 samples are then flipped so that the top-left cell is moved to the corner (dots above).
 	//
-	// TODO spec issue: identifiers have `*` in place of `x`
+
 
 	float scratch[64];
 	// buf23/buf32 etc. refer to the same memory region; numbers refer to the supposed dimensions
@@ -6214,8 +6181,8 @@ J40_STATIC void j40__inverse_afv(float *buf, int flipx, int flipy) {
 		scratch32[x * 4 + (y / 2)] = buf[y * 8 + x];
 	}
 	scratchafv[0] = (buf[0] + buf[1] + buf[8]) * 4.0f;
-	scratch22[0] = buf[0] - buf[1] + buf[8]; // TODO spec bug: x and y are swapped
-	scratch32[0] = buf[0] - buf[8]; // TODO spec bug: x and y are swapped
+	scratch22[0] = buf[0] - buf[1] + buf[8];
+	scratch32[0] = buf[0] - buf[8];
 
 	j40__inverse_afv22(bufafv, scratchafv);
 	j40__inverse_dct(buf22, scratch22, 2, 4);
@@ -6240,7 +6207,6 @@ J40_STATIC void j40__inverse_afv(float *buf, int flipx, int flipy) {
 		int32_t dct23pos = (!flipy * 4 + y) * 8;
 		for (x = 0; x < 4; ++x) buf[afv22pos + FLIP_FOR_AFV[flipx][x]] = scratchafv[y * 4 + x];
 		for (x = 0; x < 4; ++x) buf[dct22pos + x] = scratch22[y * 4 + x];
-		// TODO spec issue: samples_4x4 should be samples_4x8
 		for (x = 0; x < 8; ++x) buf[dct23pos + x] = scratch23[y * 8 + x];
 	}
 }
@@ -6264,7 +6230,6 @@ J40__STATIC_RETURNS_ERR j40__lf_global(j40__st *st) {
 	if (f->has_noise) J40__RAISE("TODO: noise");
 
 	if (!j40__u(st, 1)) { // LfChannelDequantization.all_default
-		// TODO spec bug: missing division by 128
 		for (i = 0; i < 3; ++i) f->m_lf_scaled[i] = j40__f16(st) / 128.0f;
 	}
 
@@ -6282,25 +6247,24 @@ J40__STATIC_RETURNS_ERR j40__lf_global(j40__st *st) {
 			f->block_ctx_size = sizeof(DEFAULT_BLKCTX) / sizeof(*DEFAULT_BLKCTX);
 			J40__TRY_MALLOC(uint8_t, &f->block_ctx_map, sizeof(DEFAULT_BLKCTX));
 			memcpy(f->block_ctx_map, DEFAULT_BLKCTX, sizeof(DEFAULT_BLKCTX));
-			f->nb_qf_thr = f->nb_lf_thr[0] = f->nb_lf_thr[1] = f->nb_lf_thr[2] = 0; // SPEC is implicit
+			f->nb_qf_thr = f->nb_lf_thr[0] = f->nb_lf_thr[1] = f->nb_lf_thr[2] = 0;
 			f->nb_block_ctx = 15;
 		} else {
 			J40__RAISE_DELAYED();
-			f->block_ctx_size = 39; // SPEC not 27
+			f->block_ctx_size = 39;
 			for (i = 0; i < 3; ++i) {
 				f->nb_lf_thr[i] = j40__u(st, 4);
 				// TODO spec question: should this be sorted? (current code is okay with that)
 				for (j = 0; j < f->nb_lf_thr[i]; ++j) {
 					f->lf_thr[i][j] = (int32_t) j40__unpack_signed64(j40__64u32(st, 0, 4, 16, 8, 272, 16, 65808, 32));
 				}
-				f->block_ctx_size *= f->nb_lf_thr[i] + 1; // SPEC is off by one
+				f->block_ctx_size *= f->nb_lf_thr[i] + 1;
 			}
 			f->nb_qf_thr = j40__u(st, 4);
-			// TODO spec bug: both qf_thr[i] and HfMul should be incremented
 			for (i = 0; i < f->nb_qf_thr; ++i) f->qf_thr[i] = j40__u32(st, 0, 2, 4, 3, 12, 5, 44, 8) + 1;
-			f->block_ctx_size *= f->nb_qf_thr + 1; // SPEC is off by one
+			f->block_ctx_size *= f->nb_qf_thr + 1;
 			// block_ctx_size <= 39*15^4 and never overflows
-			J40__SHOULD(f->block_ctx_size <= 39 * 64, "hfbc"); // SPEC limit is not 21*64
+			J40__SHOULD(f->block_ctx_size <= 39 * 64, "hfbc");
 			J40__TRY(j40__cluster_map(st, f->block_ctx_size, 16, &f->nb_block_ctx, &f->block_ctx_map));
 		}
 
@@ -6499,7 +6463,6 @@ J40__STATIC_RETURNS_ERR j40__smooth_lf(j40__st *st, j40__lf_group_st *gg, j40__p
 	int32_t x, y, c;
 
 	for (c = 0; c < 3; ++c) {
-		// TODO spec bug: missing 2^16 scaling
 		inv_m_lf[c] = (float) (f->global_scale * f->quant_lf) / f->m_lf_scaled[c] / 65536.0f;
 	}
 
@@ -6531,7 +6494,6 @@ J40__STATIC_RETURNS_ERR j40__smooth_lf(j40__st *st, j40__lf_group_st *gg, j40__p
 				if (gap < diff[c]) gap = diff[c];
 			}
 			gap = j40__maxf(0.0f, 3.0f - 4.0f * gap);
-			// TODO spec bug: s (sample) and wa (weighted average) are swapped in the final formula
 			for (c = 0; c < 3; ++c) outline[c][x] = (wa[c] - line[c][x]) * gap + line[c][x];
 		}
 	}
@@ -6544,7 +6506,7 @@ J40__ON_ERROR:
 J40__STATIC_RETURNS_ERR j40__lf_quant(
 	j40__st *st, int32_t extra_prec, j40__modular *m, j40__lf_group_st *gg, j40__plane outlfquant[3]
 ) {
-	static const int32_t YXB2XYB[3] = {1, 0, 2}; // TODO spec bug: this reordering is missing
+	static const int32_t YXB2XYB[3] = {1, 0, 2};
 
 	j40__frame_st *f = st->frame;
 	int32_t ggw8 = gg->width8, ggh8 = gg->height8;
@@ -6558,7 +6520,6 @@ J40__STATIC_RETURNS_ERR j40__lf_quant(
 
 	// extract LfQuant from m and populate lfindices
 	for (c = 0; c < 3; ++c) {
-		// TODO spec bug: missing 2^16 scaling
 		float mult_lf = f->m_lf_scaled[c] / (float) (f->global_scale * f->quant_lf) * (float) (65536 >> extra_prec);
 		channel[c] = &m->channel[YXB2XYB[c]];
 		j40__dequant_lf(channel[c], mult_lf, &lfquant[c]);
@@ -6654,7 +6615,7 @@ J40__STATIC_RETURNS_ERR j40__hf_metadata(
 		vh8 = 1 << (log_vh - 3);
 		x1 = x0 + vw8 - 1;
 		y1 = y0 + vh8 - 1;
-		// SPEC the first available block in raster order SHOULD be the top-left corner of
+		// the first available block in raster order should be the top-left corner of
 		// the next varblock, otherwise it's an error (no retry required)
 		J40__SHOULD(x1 < ggw8 && (x0 >> log_gsize8) == (x1 >> log_gsize8), "vblk");
 		J40__SHOULD(y1 < ggh8 && (y0 >> log_gsize8) == (y1 >> log_gsize8), "vblk");
@@ -6676,7 +6637,6 @@ J40__STATIC_RETURNS_ERR j40__hf_metadata(
 					float *lfquantrow = J40__F32_PIXELS(&lfquant[c], y0 + i);
 					for (j = 0; j < vw8; ++j) llfcoeffs_c[i * vw8 + j] = lfquantrow[x0 + j];
 				}
-				// TODO spec bug: DctSelect type IDENTIFY [sic] no longer exists
 				// TODO spec issue: DCT8x8 doesn't need this
 				j40__forward_dct2d_scaled_for_llf(llfcoeffs_c, scratch, log_vh - 3, log_vw - 3);
 			}
@@ -6764,7 +6724,6 @@ J40__STATIC_RETURNS_ERR j40__lf_group(j40__st *st, j40__lf_group_st *gg) {
 		}
 
 		// HF metadata
-		// SPEC nb_block is off by one
 		nb_varblocks = j40__u(st, j40__ceil_lg32((uint32_t) (ggw8 * ggh8))) + 1; // at most 2^20
 		w[0] = w[1] = ggw64; h[0] = h[1] = ggh64; // XFromY, BFromY
 		w[2] = nb_varblocks; h[2] = 2; // BlockInfo
@@ -6815,7 +6774,7 @@ J40__STATIC_RETURNS_ERR j40__hf_global(j40__st *st);
 
 #ifdef J40_IMPLEMENTATION
 
-// reads both HfGlobal and HfPass (SPEC they form a single group)
+// reads both HfGlobal and HfPass
 J40__STATIC_RETURNS_ERR j40__hf_global(j40__st *st) {
 	j40__frame_st *f = st->frame;
 	int64_t sidx_base = 1 + 3 * f->num_lf_groups;
@@ -6828,7 +6787,7 @@ J40__STATIC_RETURNS_ERR j40__hf_global(j40__st *st) {
 	// dequantization matrices
 	if (!j40__u(st, 1)) {
 		// TODO spec improvement: encoding mode 1..5 are only valid for 0-3/9-10 since it requires 8x8 matrix, explicitly note this
-		for (i = 0; i < J40__NUM_DCT_PARAMS; ++i) { // SPEC not 11, should be 17
+		for (i = 0; i < J40__NUM_DCT_PARAMS; ++i) {
 			const struct j40__dct_params dct = J40__DCT_PARAMS[i];
 			int32_t rows = 1 << (int32_t) dct.log_rows, columns = 1 << (int32_t) dct.log_columns;
 			J40__TRY(j40__read_dq_matrix(st, rows, columns, sidx_base + i,
@@ -6850,7 +6809,7 @@ J40__STATIC_RETURNS_ERR j40__hf_global(j40__st *st) {
 		for (j = 0; j < J40__NUM_ORDERS; ++j) {
 			if (used_orders >> j & 1) {
 				int32_t size = 1 << (J40__LOG_ORDER_SIZE[j][0] + J40__LOG_ORDER_SIZE[j][1]);
-				for (c = 0; c < 3; ++c) { // SPEC this loop is omitted
+				for (c = 0; c < 3; ++c) {
 					J40__TRY(j40__permutation(st, &code, size, size / 64, &f->orders[i][j][c]));
 				}
 			}
@@ -6901,7 +6860,6 @@ J40__STATIC_RETURNS_ERR j40__hf_coeffs(
 
 	j40__init_code(&code, &f->coeff_codespec[pass]);
 
-	// TODO spec bug: there are *three* NonZeros for each channel
 	J40__TRY_MALLOC(j40_i8x3, &nonzeros, (size_t) (gw8 * gh8));
 
 	for (y8 = 0; y8 < gh8; ++y8) for (x8 = 0; x8 < gw8; ++x8) {
@@ -6938,7 +6896,6 @@ J40__STATIC_RETURNS_ERR j40__hf_coeffs(
 				46, 46, 46, 46, 48, 48, 48, 48, 50, 50, 50, 50, 52, 52, 52, 52,
 				54, 54, 54, 54, 56, 56, 56, 56, 58, 58, 58, 58, 60, 60, 60, 60,
 			};
-			// TODO spec bug: CoeffNumNonzeroContext[9] should be 123, not 23
 			static const int16_t TWICE_COEFF_NNZ_CTX[64] = { // pre-multiplied by 2
 				  0,   0,  62, 124, 124, 186, 186, 186, 186, 246, 246, 246, 246, 304, 304, 304,
 				304, 304, 304, 304, 304, 360, 360, 360, 360, 360, 360, 360, 360, 360, 360, 360,
@@ -6976,8 +6933,7 @@ J40__STATIC_RETURNS_ERR j40__hf_coeffs(
 			}
 			cctx = ctxoff + 458 * bctx + 37 * f->nb_block_ctx;
 
-			prev = (nz <= (1 << (log_size - 4))); // TODO spec bug: swapped condition
-			// TODO spec issue: missing size (probably W*H)
+			prev = (nz <= (1 << (log_size - 4)));
 			for (i = 1 << (log_size - 6); nz > 0 && i < (1 << log_size); ++i) {
 				int32_t ctx = cctx +
 					TWICE_COEFF_NNZ_CTX[j40__ceil_div32(nz, 1 << (log_size - 6))] +
@@ -7009,14 +6965,12 @@ J40__STATIC_RETURNS_ERR j40__pass_group(
 	j40__lf_group_st *gg
 ) {
 	j40__frame_st *f = st->frame;
-	// SPEC "the number of tables" is fixed, no matter how many RAW quant tables are there
 	int64_t sidx = 1 + 3 * f->num_lf_groups + J40__NUM_DCT_PARAMS + pass * f->num_groups + gidx;
 	j40__modular m = J40__INIT;
 	int32_t i;
 
 	if (!f->is_modular) {
 		int32_t ctxoff;
-		// TODO spec issue: this offset is later referred so should be monospaced
 		ctxoff = 495 * f->nb_block_ctx * j40__u(st, j40__ceil_lg32((uint32_t) f->num_hf_presets));
 		J40__TRY(j40__hf_coeffs(st, ctxoff, pass, gx_in_gg, gy_in_gg, gw, gh, gg));
 	}
@@ -7074,7 +7028,6 @@ J40_STATIC void j40__dequant_hf(j40__st *st, j40__lf_group_st *gg) {
 		voff &= 0xfffff;
 		dct = &J40__DCT_SELECT[dctsel - 2];
 		size = 1 << (dct->log_rows + dct->log_columns);
-		// TODO spec bug: spec says mult[1] = HfMul, should be 2^16 / (global_scale * HfMul)
 		mult[1] = 65536.0f / (float) f->global_scale * gg->varblocks[voff].hfmul.inv;
 		mult[0] = mult[1] * x_qm_scale;
 		mult[2] = mult[1] * b_qm_scale;
@@ -7345,9 +7298,6 @@ J40_STATIC void j40__epf_distance(const j40__plane *in, int32_t dx, int32_t dy, 
 
 	xlo = (dx > 0 ? 0 : -dx);
 	xhi = (dx < 0 ? width : width - dx);
-
-	// TODO spec issue: `[[(ix, iy) in coords]]` should be normative comments
-	// TODO spec issue: `ix` and `iy` not defined in DistanceStep2, should be 0
 
 	for (y = -1; y <= height; ++y) {
 		int32_t refy = j40__mirror1d(y, height), offy = j40__mirror1d(y + dy, height);
