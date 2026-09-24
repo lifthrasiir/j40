@@ -2815,7 +2815,8 @@ J40_STATIC int32_t j40__code(j40__st *st, int32_t ctx, int32_t dist_mult, j40__c
 		return code->window[code->num_decoded++ & MASK] = code->window[code->copy_pos++ & MASK];
 	}
 
-	J40__ASSERT(ctx < spec->num_dist);
+	if (!(ctx >= 0 && ctx < spec->num_dist))
+		return J40__ERR("ctx!"), 0;
 	use_prefix_code = spec->use_prefix_code;
 	log_alpha_size = spec->log_alpha_size;
 	cluster = &spec->clusters[spec->cluster_map[ctx]];
@@ -7016,8 +7017,11 @@ J40__STATIC_RETURNS_ERR j40__pass_group(
 
 	if (!f->is_modular) {
 		int32_t ctxoff;
+		int32_t preset;
 		// TODO spec issue: this offset is later referred so should be monospaced
-		ctxoff = 495 * f->nb_block_ctx * j40__u(st, j40__ceil_lg32((uint32_t) f->num_hf_presets));
+		preset = j40__u(st, j40__ceil_lg32((uint32_t) f->num_hf_presets));
+		J40__SHOULD(preset < f->num_hf_presets, "hfpr");
+		ctxoff = 495 * f->nb_block_ctx * preset;
 		J40__TRY(j40__hf_coeffs(st, ctxoff, pass, gx_in_gg, gy_in_gg, gw, gh, gg));
 	}
 
