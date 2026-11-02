@@ -101,7 +101,7 @@ As of version 2270, J40 can decode:
     * No lossless JPEG transcoding in use (can be disabled with `-j`)
     * No floating point samples
 
-[fjxl]: https://github.com/libjxl/libjxl/tree/main/experimental/fast_lossless
+[fjxl]: https://github.com/libjxl/libjxl/tree/main/tools/fast_lossless
 
 There are some known cases where J40 and libjxl can significantly diverge:
 
